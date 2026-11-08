@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  The Android 11 form of the rules in `data_extraction_rules.xml`, which is
+  where the reasoning lives.
+
+  This is the file Android 11 (API 30) reads, and the only one it reads.
+  `android:fullBackupContent` is consulted up to Android 11 and
+  `android:dataExtractionRules` from Android 12 (API 31) onwards, so a device on
+  30 takes this file and one on 31 or later takes the other and ignores this
+  one. `minSdk` is 30, which is what makes both live.
+
+  What it stands between: on 30 `android:dataExtractionRules` is ignored, and an
+  app with no `android:fullBackupContent` gets *unrestricted* full backup: the
+  passphrase-less SSH key and the server's connection token included, off the
+  device and into the cloud. Nothing would fail, nothing would be logged, and the
+  cause would be a manifest edit from months earlier.
+
+  Keep it identical to the `<cloud-backup>` section of
+  `data_extraction_rules.xml`; the two disagreeing is the only way this
+  arrangement can quietly go wrong, and `BackupRulesParityTest` compares them.
+-->
+<full-backup-content>
+    <include domain="file" path="home/.vscodroid/data/Machine" />
+</full-backup-content>

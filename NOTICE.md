@@ -1,0 +1,229 @@
+# Third-Party Software Attribution
+
+VSCodroid includes and/or distributes the following third-party software. We are grateful to the authors and communities behind these projects.
+
+Versions are deliberately not listed unless pinned in this repository: most components come from the Termux or Alpine package index at build time, so the version a given release shipped is recorded by that release's build, not by this file.
+
+## Core Components
+
+| Software | License | Source |
+|----------|---------|--------|
+| Code - OSS (VS Code Server + Web) | MIT; `LICENSE.txt` and `ThirdPartyNotices.txt` ship inside the server tree | Built from https://github.com/microsoft/vscode at the commit pinned in `VSCODE_COMMIT`, with the patches in `patches/` and the branding in `branding/` applied before the build |
+| GitHub Copilot Chat extension | See the license files inside `extensions/copilot/` in the server tree; its `@github/copilot` SDK dependency carries GitHub, Inc.'s own `LICENSE.md` | Produced by the same Code - OSS build |
+| VS Code Language Packs (vscode-loc) | MIT; the generated bundles carry no notice of their own, so the copyright and permission text is in `docs/LEGAL_NOTICES.md` | https://github.com/microsoft/vscode-loc at the commit pinned in `VSCODE_LOC_COMMIT`; `scripts/build-nls-bundles.py` merges its translations into the editor's message array and writes `assets/nls/<locale>.json` |
+| Node.js | MIT | Termux build of `nodejs-lts`, https://github.com/nodejs/node |
+| npm | Artistic License 2.0 | https://github.com/npm/cli |
+| Python | PSF License | Termux build, https://www.python.org |
+| pip | MIT | Shipped in Python's `site-packages`; its own `LICENSE.txt` and `AUTHORS.txt` travel with it in `pip-*.dist-info/licenses/` |
+| Git | GPL v2 | Termux build, https://git-scm.com |
+| Bash | GPL v3 | Termux build, https://www.gnu.org/software/bash |
+| ripgrep | MIT / Unlicense (dual) | Bundled by the Code - OSS build (`@vscode/ripgrep-universal`), https://github.com/BurntSushi/ripgrep |
+| tmux | ISC | Termux build, https://github.com/tmux/tmux |
+| GNU Make | GPL v3 | Termux build, https://www.gnu.org/software/make |
+| OpenSSH | BSD | Termux build, https://www.openssh.com |
+| node-pty | MIT | https://github.com/microsoft/node-pty, native addon rebuilt for Android/Bionic |
+| @parcel/watcher | MIT | https://github.com/parcel-bundler/watcher, native addon rebuilt for Android/Bionic |
+| @vscode/sqlite3 | BSD-3-Clause (SQLite itself is public domain) | https://github.com/microsoft/vscode-node-sqlite3, native addon rebuilt for Android/Bionic |
+| zeromq.js | MIT; the libzmq linked into it statically is LGPL-3.0-or-later with libzmq's static linking exception; node-addon-api (MIT) is compiled in | https://github.com/zeromq/zeromq.js and https://github.com/zeromq/libzmq, native addon built for Android/Bionic for the Jupyter extension, which is not bundled. Source offer in `docs/LEGAL_NOTICES.md` |
+| @vscode/native-watchdog | MIT | https://github.com/microsoft/node-native-watchdog, bundled by the Code - OSS build |
+| @vscode/deviceid | MIT | https://github.com/microsoft/vscode-deviceid, bundled by the Code - OSS build |
+| @vscode/sandbox-runtime | Apache-2.0 | https://github.com/anthropic-experimental/sandbox-runtime, bundled by the Code - OSS build |
+| @vscode/spdlog | MIT | https://github.com/microsoft/node-spdlog, bundled by the Code - OSS build. Its native addon does not ship: `scripts/build-native-addons.sh` deletes it and replaces `index.js` with a JavaScript logger from this repository |
+| kerberos (Node addon) | Apache-2.0 | https://github.com/mongodb-js/kerberos. The npm addon, not the MIT Kerberos 5 C libraries listed below |
+| @microsoft/mxc-sdk | MIT | https://www.npmjs.com/package/@microsoft/mxc-sdk, bundled by the Code - OSS build |
+| js-debug | MIT | https://github.com/microsoft/vscode-js-debug, the built-in JavaScript debugger produced by the Code - OSS build |
+| vscode-js-profile-visualizer | MIT | https://github.com/microsoft/vscode-js-profile-visualizer, the built-in profile viewer produced by the Code - OSS build. Its tables are WebAssembly |
+| @vscode/tree-sitter-wasm | MIT | https://github.com/microsoft/vscode-tree-sitter-wasm, bundled by the Code - OSS build. WebAssembly builds of tree-sitter (https://github.com/tree-sitter/tree-sitter) and its grammars |
+| web-tree-sitter | MIT | https://github.com/tree-sitter/tree-sitter, the WebAssembly binding, bundled by the Copilot Chat extension |
+| vscode-oniguruma | MIT | https://github.com/microsoft/vscode-oniguruma, bundled by the Code - OSS build. The regex engine it compiles to WebAssembly is Oniguruma (BSD-2-Clause, https://github.com/kkos/oniguruma) and its notice ships in the package |
+| @github/blackbird-external-ingest-utils | MIT | https://www.npmjs.com/package/@github/blackbird-external-ingest-utils, a WebAssembly dependency of the Copilot Chat extension |
+| PSReadLine | BSD-2-Clause | https://github.com/PowerShell/PSReadLine. Prebuilt .NET assemblies carried by the terminal's PowerShell shell integration; they have no use on Android and are listed because they are redistributed |
+| distlib | PSF-2.0 | https://github.com/pypa/distlib, vendored inside the bundled pip. Ships six prebuilt Windows launchers, redistributed unused |
+| @github/copilot (GitHub Copilot CLI) | GitHub Copilot CLI License, proprietary | Redistributed under GitHub, Inc.'s own terms as a dependency of the Copilot extension. The full text ships in the server tree; the reasoning is in `docs/LEGAL_NOTICES.md` |
+| musl (dynamic loader) | MIT | Alpine Linux package, https://musl.libc.org, bundled so the Claude Code CLI can run; the CLI itself is installed by the user and is not redistributed here |
+
+## Bundled Native Components
+
+Licences here are Termux's own `TERMUX_PKG_LICENSE` for the package each binary
+comes from, and the "Linked by" column is read out of the shipped ELF headers
+rather than written by hand. Three rows arrive from somewhere else and carry
+their own source's licence: musl's loader is an Alpine package
+(`scripts/download-musl-loader.sh`), `libripgrep.so` is the `rg` the Code - OSS
+server tree ships, copied into `jniLibs` by `scripts/fetch-vscode-oss.sh`, and
+`libtermux-exec.so` is compiled here from termux-exec's own repositories
+(`scripts/build-termux-exec.sh`).
+`scripts/check-library-attribution.py` fails the build
+when a shipped binary is attributed nowhere in this file, when it is missing from
+`docs/LEGAL_NOTICES.md`, when a copyleft component is missing from the source
+offer that file carries, or when a component's own notice is not among the bytes
+that reach a device. Both documents are read on every run, so a component has
+to be named in each.
+
+That the licences here are Termux's own is checked rather than asserted,
+wherever Termux states one and upstream can be read.
+`scripts/check-termux-licenses.py` reads `TERMUX_PKG_LICENSE` back from Termux
+for each package, reports where the two disagree, and names the entries no Termux
+package accounts for. It fails on one difference
+only: a component recorded permissive where Termux declares copyleft, which is
+what would leave a binary shipping with no offer of source.
+
+This table covers the Termux libraries and executables at the top level of
+`assets/usr/lib` and `jniLibs/arm64-v8a`. The binaries that sit deeper in the
+asset tree are attributed under **Core Components** above, and the gate holds
+them to the same rules: it walks the tree to its leaves, recognising a binary by
+its magic number (ELF, WebAssembly, PE or Mach-O) or a `.node` extension. The
+formats this device cannot execute are counted too. A Windows launcher or a .NET
+assembly is redistributed inside the APK on its own terms whether or not
+anything here can run it.
+
+Excluded as first-party: `libglibc-shim.so` and its companion stubs, which carry
+glibc's soname but are built from this repository's own source, and
+`libexec-trampoline.so`, built from `scripts/exec-trampoline.c` here.
+
+Naming a project is not the notice. MIT, the BSD family, ISC, NCSA, the ICU
+licence and Apache-2.0 section 4 all ask for the copyright and permission text to
+be handed over with the binary, so every component below ships its own upstream
+notice beside it, almost all of them under `usr/share/doc/<termux package>`.
+Termux's `libicu` and Alpine's `musl` carry no usable notice of their own, so
+`licenses/LICENSE.ICU` and `licenses/COPYRIGHT.musl` are placed in their stead,
+and ripgrep's travels inside the npm package the server tree brings it in.
+`docs/LEGAL_NOTICES.md` records why for each.
+
+The copyleft rows need a licence text as well. GPL-2.0 section 1, GPL-3.0
+section 4, LGPL-2.1 section 1 and LGPL-3.0 section 4 each require a copy of the
+licence to reach whoever receives the binary, so the four texts are in
+`licenses/` and ship in the app at **About > Licenses > License Texts**,
+verbatim; `docs/LEGAL_NOTICES.md` records which text covers which component.
+
+| Component | License | Linked by |
+|---|---|---|
+| Bash | GPL-3.0 | bundled tool in its own right |
+| bzip2 | bzip2-1.0.6 | Python |
+| c-ares | MIT | Node.js |
+| Expat | MIT | Git, Python |
+| gdbm | GPL-3.0 | Python, gdbm |
+| Git | GPL-2.0 | bundled tool in its own right |
+| GNU Make | GPL-3.0 | bundled tool in its own right |
+| ICU | ICU | ICU, Node.js |
+| Kerberos 5 | MIT | Kerberos 5, OpenSSH |
+| ldns | BSD-3-Clause | OpenSSH |
+| libandroid-glob | BSD-3-Clause | Kerberos 5, tmux |
+| libandroid-posix-semaphore | MIT | Python |
+| libandroid-support | Apache-2.0, MIT | Bash, Kerberos 5, OpenSSH, Python, readline, tmux |
+| libc++ | NCSA | ICU, Node.js, and the on-demand C/C++ toolchain |
+| libcrypt | BSD-2-Clause | bundled tool in its own right |
+| libcurl | MIT | Git |
+| libedit | BSD-3-Clause | bundled tool in its own right |
+| libevent | BSD-3-Clause | tmux |
+| libffi | MIT | Python, and the on-demand C/C++ toolchain |
+| libiconv | LGPL-2.1, GPL-3.0 | Bash, Git, and the on-demand C/C++ toolchain through libxml2 |
+| libresolv-wrapper | BSD-3-Clause | Kerberos 5 |
+| libssh2 | BSD-3-Clause | libcurl |
+| musl libc | MIT | bundled tool in its own right |
+| ncurses | MIT | Python, libedit, ncurses, readline, tmux |
+| nghttp2 | MIT | libcurl |
+| nghttp3 | MIT | libcurl |
+| ngtcp2 | MIT | libcurl, ngtcp2 |
+| Node.js | MIT | bundled tool in its own right |
+| OpenSSH | BSD | bundled tool in its own right |
+| OpenSSL | Apache-2.0 | Git, Node.js, OpenSSH, OpenSSL, Python, ldns, libcrypt, libcurl, libssh2, ngtcp2 |
+| PCRE2 | BSD-3-Clause | Git |
+| Python | PSF-2.0 | Python |
+| readline | GPL-3.0 | Bash, Python |
+| ripgrep | MIT | bundled tool in its own right |
+| SQLite | Public Domain | Node.js, Python |
+| termux-exec | Apache-2.0, MIT, BSD-3-Clause, GPL-2.0-only WITH Classpath-exception-2.0 | preloaded into every terminal; built here from upstream source, https://github.com/termux/termux-exec-package |
+| tmux | ISC | bundled tool in its own right |
+| utf8proc | MIT | tmux |
+| xz / liblzma | LGPL-2.1, GPL-2.0, GPL-3.0 | Python |
+| zlib | Zlib | Git, Node.js, OpenSSH, Python, SQLite, libcurl, libssh2, and the on-demand Java, Ruby and C/C++ toolchains |
+| Zstandard | GPL-2.0 | Python, and the on-demand C/C++ toolchain |
+
+## Toolchain Libraries
+
+Shipped inside the on-demand toolchain packs rather than the base app, so they
+reach only devices where that toolchain was installed. Listed separately because
+`scripts/check-library-attribution.py` reads the toolchain manifests for these,
+and the base APK for the table above.
+
+| Component | License | Shipped with |
+|---|---|---|
+| [GMP](https://gmplib.org) | LGPL-3.0 | Ruby |
+| [libyaml](https://pyyaml.org/wiki/LibYAML) | MIT | Ruby |
+| [libruby](https://www.ruby-lang.org) | BSD-2-Clause | Ruby |
+| [libandroid-execinfo](https://github.com/termux/libandroid-execinfo) | BSD-2-Clause | Ruby |
+| [libandroid-shmem](https://github.com/termux/libandroid-shmem) | BSD-3-Clause | Java |
+| [libandroid-spawn](https://github.com/termux/libandroid-spawn) | BSD-2-Clause | Java |
+| [LLVM](https://llvm.org) | Apache-2.0 WITH LLVM-exception, NCSA | C/C++ |
+| [libxml2](https://gitlab.gnome.org/GNOME/libxml2) | MIT | C/C++ |
+| [ndk-sysroot](https://github.com/termux/termux-packages/tree/master/packages/ndk-sysroot) | NCSA, with BSD, Apache-2.0, MIT and GPL-2.0 WITH Linux-syscall-note in the headers | C/C++ |
+
+GMP is copyleft; its source offer is in `docs/LEGAL_NOTICES.md` beside the rest,
+and the LGPL-3.0 text it requires ships in the base app, which is the only
+licences screen a device installing the Ruby pack has.
+
+LLVM is libLLVM.so and libclang-cpp.so, and the clang driver, lld, the llvm-*
+tools, the compiler-rt builtins archive and the libc++ headers come from the
+same source tree. ndk-sysroot is the bionic and kernel headers, the libc++
+headers and the crt objects, and its three `.so` files are one-line linker
+scripts. The kernel's interface headers are GPL-2.0 WITH Linux-syscall-note and
+are installed as plain files, so their source offer is the files themselves and
+sits in `docs/LEGAL_NOTICES.md` under **GPL Source Code Availability**. The
+C/C++ pack also carries Python's C headers (PSF-2.0), whose licence text is the
+base app's `usr/share/doc/python/LICENSE`.
+
+## On-Demand Toolchains
+
+| Software | License | URL |
+|----------|---------|-----|
+| Ruby | BSD 2-Clause | https://www.ruby-lang.org |
+| OpenJDK | GPL v2 + Classpath | https://openjdk.org |
+| LLVM (clang, lld) | Apache 2.0 with LLVM Exceptions | https://llvm.org |
+
+OpenJDK's own licence and third-party notice files ship inside the Java pack at `usr/lib/jvm/java-21-openjdk/legal`; Ruby's per-gem licence files likewise ship inside the Ruby pack. LLVM's `LICENSE.TXT` ships inside the C/C++ pack at `usr/share/doc/libllvm`.
+
+## Mirrored Python Wheels
+
+Prebuilt Android wheels that VSCodroid re-hosts on its own releases, pinned in `wheelhouse.json`. They are not bundled in the APK; pip downloads one only when a user installs that package. Each wheel carries its own notices, and pandas' vendored ones ship beside it on the release. The detail is in `docs/LEGAL_NOTICES.md`.
+
+| Software | License | Built by |
+|----------|---------|---------|
+| numpy | BSD 2-Clause, with OpenBLAS and LAPACK | Termux User Repository |
+| pandas | BSD 3-Clause, with vendored components | Termux User Repository |
+| pydantic-core | MIT, with statically linked Rust crates | Termux User Repository |
+| psutil | BSD 3-Clause | Termux, repacked into a wheel |
+
+## Extension Marketplace
+
+| Service | License | URL |
+|---------|---------|-----|
+| Open VSX Registry | EPL v2 | https://open-vsx.org |
+
+## Bundled VS Code Extensions
+
+Downloaded from Open VSX at build time (`scripts/download-extensions.sh`):
+
+| Extension | ID | License |
+|-----------|----|---------|
+| Prettier | esbenp.prettier-vscode | MIT |
+| Python | ms-python.python | MIT |
+| ESLint | dbaeumer.vscode-eslint | MIT |
+| Tailwind CSS IntelliSense | bradlc.vscode-tailwindcss | MIT |
+
+The ID column is what `scripts/check-bundled-extensions.py` matches this table
+against the download script's list on, so a bundled extension cannot lose its
+row here and a row cannot outlive the extension it describes.
+
+VSCodroid's own bundled extensions (`vscodroid.*`) are covered by this repository's MIT `LICENSE`.
+
+## Termux Project
+
+Many bundled binaries and shared libraries are compiled by the [Termux](https://github.com/termux/termux-packages) project. Termux packages are built from upstream sources and maintain their original licenses. VSCodroid uses Termux's ARM64 builds as a convenience; we do not modify the Termux packaging system itself.
+
+## Android NDK
+
+The `libc++_shared.so` C++ standard library is distributed under the Apache 2.0 / MIT dual license as part of the [Android NDK](https://developer.android.com/ndk).
+
+---
+
+This file is provided for attribution purposes. For exact license texts, refer to the `LICENSE` files in each software's source repository. If you believe any attribution is missing or incorrect, please open an issue at https://github.com/rmyndharis/VSCodroid/issues.

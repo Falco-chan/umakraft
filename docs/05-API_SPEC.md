@@ -1,0 +1,1261 @@
+# API & Interface Specification
+
+**Project**: VSCodroid
+**Version**: 1.0-draft
+**Date**: 2026-02-10
+
+---
+
+## 1. Internal APIs Overview
+
+VSCodroid has three interface boundaries:
+
+```mermaid
+flowchart TD
+  K["Kotlin Native Shell"] <--> |"A: Android Bridge (JavascriptInterface)"| W["WebView (vscode-web)"]
+  W <--> |"B: VS Code Remote Protocol<br/>HTTP + WebSocket"| G["EditorGateway<br/>app-owned loopback endpoint"]
+  G <--> |"Private filesystem socket"| N["Node.js Process (VS Code Server, vscode-reh)"]
+  K <--> |"C: Process Management<br/>stdout"| N
+  K <--> |"C: HTTP readiness and ownership checks"| G
+```
+
+Boundary C is one-way for the pipe: `ProcessManager` closes the child's stdin immediately after spawn and only reads stdout. If closing stdin fails, it stops the new process before reporting failure. Nothing is written to the process; the server has no command reader on that pipe. Kotlin
+asks the server things over HTTP on the app-owned loopback port, which the gateway relays to the private backend socket, and learns of its death from `Process.waitFor()`. The public port remains bound across editor stops and restarts for the app process lifetime.
+
+---
+
+## 2. (A) Android Bridge API
+
+### 2.1 Bridge Registration
+
+```kotlin
+// In MainActivity.initBridge(), once per WebView (recreateWebView clears the guard)
+wv.addJavascriptInterface(bridge, "AndroidBridge")
+```
+
+The injected name is `AndroidBridge` and that part was always right. The construction
+was not: `AndroidBridge(this)` does not compile. Five constructor arguments are
+required; the remaining callbacks and executor have defaults:
+
+```kotlin
+AndroidBridge(
+    context, security, clipboard,          // required
+    onBackPressed, onMinimize,             // required callbacks
+    onOpenFolderPicker = {}, onOpenRecentFolder = {},
+    onShowAbout = {}, onToggleExtraKeyRow = { false },
+    safManager = null,                     // defaulted
+    onDownloadNamed = { _, _ -> }, onDownloadChunk = { _, _ -> false },
+    onDownloadComplete = { _, _ -> },
+    onListMirrors = { "[]" }, onReclaimMirror = { _, _ -> "..." },
+    onAsyncAnswer = { _, _, _ -> },        // posts a late answer by replyId
+    diskWork = <single daemon executor>,   // the one thread the four walks run on
+    onWorkspaceRoots = { _, _ -> false },  // generation and current workspace paths
+)
+```
+
+`onAsyncAnswer` and `diskWork` support commands that answer by `replyId` and are
+defaulted so that a test can supply its own: `onAsyncAnswer` posts the value back into
+the page under the id the caller sent, and `diskWork` is the single thread every disk
+walk runs on. See §2.4.
+
+And `security` being one of them is the point of the next section rather than a
+detail. A one-argument sketch shows a bridge built without the `SecurityManager` that
+every one of these methods validates against, which is the opposite of what the
+code does.
+
+### 2.2 Bridge Security Model
+
+Bridge exposure is controlled by a per-session capability token. There is no origin-based
+control, and there cannot be one on this transport: `@JavascriptInterface` does not carry
+the caller's origin, so a bridge method has nothing to compare.
+
+**What the token does not separate is one web extension from another, and it never did.**
+`product.json` carries no `webEndpointUrlTemplate`, so the workbench starts the web
+extension host in a same-origin iframe and logs a warning saying so. The BroadcastChannel
+relay of §2.4 is scoped by origin, so every installed Open VSX web extension shares that
+one channel, and the relay reads the token out of `window.__vscodroid` on the same origin,
+which anything posting to the channel can read too. The token therefore bounds the page
+against other origins, not one caller on the page against another; the relay's KDoc in
+`MainActivity.injectBridgeRelay` works that consequence through command by command, and it
+is why `listSshKeys` no longer answers with a key's comment and why a forced
+`reclaimSafMirror` now asks the user itself.
+
+1. **Per-session token**: `SecurityManager` generates 32 random bytes at construction
+   (`SecurityManager.generateToken`, in `bridge/`, not a `security/` package).
+   `MainActivity.injectBridgeToken()` writes it to `window.__vscodroid.authToken`
+   after the page loads.
+2. **Every method, not a chosen subset**: all `@JavascriptInterface` methods take the
+   token and validate it before doing anything, returning without acting on refusal
+   (§2.4 records the six whose refusal value is not an empty one).
+   `BridgeTokenUniformityTest` enumerates them by reflection and fails the build
+   if one is added without the check, and a second test asserts a refused call touches
+   nothing -- so the rule holds for the class, not for a list that was correct when it was
+   written. Note what that test checks: it calls each method with a token that will be
+   refused and verifies the method *consulted* `validateToken`. It deliberately does not
+   check the signature, because a `String` first parameter proves nothing about whether the
+   method reads it.
+   **The token is not always the first parameter.** Five methods take it last:
+   `registerAuthCallback(requestId, nonce, documentId, pageGeneration, authToken)`, `openExternalUrl(url, authToken)`, `installToolchain(name, authToken)`,
+   `removeToolchain(name, authToken)` and `cancelToolchainInstall(name, authToken)`.
+   Read the signature before calling; the position is not a convention you can rely on.
+3. **No URL filtering beyond one address.** `openExternalUrl()` refuses this app's
+   own `vscodroid://callback` before arming anything (§2.4) and hands every other
+   URL to the platform: any scheme, any host, including one that is wrong. This is
+   a development tool, and a developer opening `http://192.168.1.5:3000`, a custom
+   scheme, or a typo is doing something ordinary; the app is not the right place to
+   have an opinion about it. Android decides whether an app exists to handle the
+   link, and the method answers with the empty string when one did and with the
+   reason otherwise. There is no scheme list and no host list to keep in step with
+   anything.
+
+   Citations in this section name symbols rather than line numbers on purpose. All
+   three used to carry ranges and all three had rotted; one of them pointed into a
+   file that is not even at the path it named. `file:line` does not survive a day in
+   this repository; a symbol you can grep for does.
+
+### 2.3 Kotlin → JavaScript Methods
+
+These methods are called from Kotlin via `evaluateJavascript()`:
+
+#### Key Injection
+
+There is no `window.__vscodroid.injectKey`, and this block described one until it
+was checked. The page is not asked to inject anything: `KeyInjector.injectKey` is
+Kotlin, and it delivers the press itself, by one of three routes.
+
+A printable ASCII character pressed with no Ctrl, Alt or Meta is **typed**, as
+real Android `KeyEvent`s dispatched through `webView.dispatchKeyEvent`. A
+`KeyboardEvent` built in the page is untrusted, so the browser runs the listeners
+and performs no default action: that is why `{` announced as a DOM event inserted
+nothing at all. Text has to enter through the browser's own input path, and a real
+key press is the only way into it from Kotlin.
+
+The trackpad's Left and Right, `Home`, `End`, `PageUp` and `PageDown` are
+**pressed** the same way, as real `KeyEvent`s listed in `NAVIGATION_KEYS`, with
+any latched modifier as meta state, so they move the caret in text boxes, except
+an unmodified Left or Right in a number or email box, and reach extension
+webviews.
+
+Everything else is **announced**: a key spelled out rather than typed (`Tab`,
+`Escape`, `F7`, the trackpad's Up and Down), and any character held with Ctrl,
+Alt or Meta, becomes the `KeyboardEvent` below, because that is what the
+workbench resolves its bindings from. `isTextEntry` and `NAVIGATION_KEYS`, both
+in `TextEntry.kt` in the `keyboard` package, decide which route a press takes;
+the first route is `typeCharacter`, a private member of `KeyInjector`.
+
+Nothing needs to be defined on the page for any route to work, and defining a
+hook by that name (which is what following the old text led to) leaves a function
+nothing ever calls.
+
+```javascript
+// What Kotlin evaluates on the announce route, in outline. A typed character
+// never reaches this. KeyInjector.kt is the source of truth.
+var target = document.activeElement || document.body;
+target.dispatchEvent(new KeyboardEvent('keydown', eventInit));
+target.dispatchEvent(new KeyboardEvent('keyup', eventInit));
+releaseModifiers(target, eventInit);  // a keyup for each modifier it carried
+```
+
+`eventInit` carries the fields a `KeyboardEvent` takes: `key`, `code`,
+`keyCode`, and the `ctrlKey`/`altKey`/`shiftKey`/`metaKey` modifiers. They are
+the DOM's own names, not an interface this project defines. `releaseModifiers`
+is defined inside the same script, not on the page.
+
+#### Memory Pressure Notification
+
+```typescript
+// Fired from MainActivity.onTrimMemory
+window.__vscodroid.onLowMemory(level: number); // Android trim-memory level
+```
+
+It is one of three hooks Kotlin calls on the page, and each consumer is one
+`MainActivity` injects rather than one the workbench provides; this one comes from
+`injectMemoryPressureHandler`. The other two are
+`window.__vscodroidBridgeReply(id, ok, payload)`, defined by `injectBridgeRelay` and
+called by `answerBridgeCommand` to post a late answer against its `replyId` (§2.4),
+and `window.__vscodroidDownload.send` and `.release`, defined by
+`injectDownloadCapture` and called from `DownloadHost.requestBytes` and
+`releaseBytes` to ask the page for a download's bytes or to have it let go of one
+(Saving a Download).
+
+There is no `onServerReady`, `onServerRestarting`, `onOAuthCallback` or
+`onOAuthError` on this object. Server readiness is a Kotlin-side callback on
+`NodeService`; the page learns about it by being navigated, not by being called,
+and is left alone when the server ready again is the editor server it is still
+connected to (`ProcessManager.continuesAnnouncedServer`).
+The OAuth pair described a flow this app does not implement; see §2.5.
+
+### 2.4 JavaScript → Kotlin Methods
+
+Exposed via `@JavascriptInterface`:
+
+Every method takes the session token and validates it before doing anything; a call
+with a token that does not match is refused before the method acts. Most then
+return an empty value: `false`, `null`, `""`, `"{}"`, `"[]"`,
+`0`, or nothing. **Six do not, and each is truthy on refusal.**
+`generateSshKey` returns `{"success":false,"error":"unauthorized"}`, so a caller
+testing `if (!result)` reads a refusal as success; test its `success` field.
+`openExternalUrl`, `reclaimSafMirror`, `getStorageBreakdown`, `clearCaches` and
+`listSafMirrors` return the refusal sentence itself,
+because for those five the EMPTY string is the success value, so the polarity is
+reversed and a truthiness test reads backwards in the other direction. Empty is not falsy
+for five methods either: `getDeviceInfo` refuses with `"{}"`, and
+`getRecentFolders`, `listSshKeys`, `getAvailableToolchains` and `getInstalledToolchains`
+with `"[]"`, and both are non-empty strings, so truthy until parsed. Read the token from
+`window.__vscodroid.authToken`, which MainActivity sets once the bridge is installed.
+`BridgeTokenUniformityTest` enumerates the methods by reflection and fails if one is
+added without the check, so this holds for the class rather than for the list below.
+
+**Registered is not the same as reachable, and the difference decides what an extension
+can do.** All bridge methods below live on the `AndroidBridge` object injected into the
+workbench page, so anything running in that page's own realm can call them directly. An
+extension cannot: it runs in the web extension host, which does not see objects added by
+`addJavascriptInterface`. Extensions reach the bridge over the BroadcastChannel relay
+that `MainActivity.injectBridgeRelay` opens, and that relay dispatches a hand-written
+list of **17** command names. Grep `d.cmd ===` in `MainActivity.kt` for the current set:
+
+> `clearCaches`, `generateBugReport`, `generateSshKey`, `getRecentFolders`,
+> `getSshPublicKey`, `getStorageBreakdown`, `getUiScale`, `listSafMirrors`,
+> `listSshKeys`, `openExternalUrl`, `openFolderPicker`, `openRecentFolder`,
+> `openToolchainSettings`, `reclaimSafMirror`, `setUiScale`, `showAboutDialog`,
+> `toggleExtraKeyRow`
+
+Two of them reach no bridge method. `getUiScale` and `setUiScale` are answered by the
+page itself, since the UI scale is the page's own viewport kept in its localStorage:
+the document-start script `addUiScaleScript` registers leaves the hook they call, and
+**VSCodroid: UI Scale** sends both.
+
+A method absent from that list is unreachable from any extension however correctly it is
+registered, which is why the toolchain install, removal and cancel calls have no callers.
+`openToolchainSettings` is on the list and now has a sender as well: the bundled
+saf-bridge extension contributes **VSCodroid: Manage Toolchains**, so the Toolchains
+screen has a route from inside the editor and the launcher long-press shortcut is one of
+two ways in rather than the only one. `generateBugReport` has one too:
+**VSCodroid: Copy Bug Report** opens its answer in an untitled editor and copies what that
+editor holds when the user chooses Copy.
+
+Adding a method to `AndroidBridge` does not publish it; the relay branch is a second,
+separate edit. Forgetting it is now reported rather than silent: the chain's final branch
+answers an unrecognised command with `ok:false` and the text
+`VSCodroid does not know the command <name>`. Before that, the caller's promise died on
+its own deadline and blamed the platform with "Bridge timeout: is the app running on
+Android?", after five seconds, or after two minutes for a storage command.
+
+**A bridge call blocks the page's main thread for as long as the method runs, so the four
+that run for as long as the disk is big do not answer where the caller waits.** A call
+made through `addJavascriptInterface` does not return to JavaScript until the Kotlin
+method has finished, and the relay makes its calls from the workbench page's own main
+frame, so the thread it holds is the one the editor renders and takes input on.
+`getStorageBreakdown`, `listSafMirrors`, `reclaimSafMirror` and `clearCaches` all walk
+directory trees before they can answer, and the app's own extracted tree is around 800 MB
+before a project is opened (`BuildConfig.EXTRACTED_ASSET_BYTES`, computed at build time
+from `assets/`, so measure it rather than quoting this figure); answered inline they froze
+the workbench for the length of the walk, and no `WebViewRenderProcessClient` is installed
+anywhere, so nothing detected it.
+
+**Those four therefore take a `replyId` and answer against it.** Each returns at once,
+and what it returns is not the value asked for: the EMPTY string means the work has
+started and the answer will follow, and anything else is a refusal decided before any
+work began. The value itself is posted later, into the same BroadcastChannel and under
+the id the caller sent, so a caller that routes replies by id (which the relay protocol
+already requires) needs no other change. A caller must not read the return as the answer.
+
+There are two refusals, not one. A stale session token is the first. The second is a full
+queue: all four run on one thread, and at most four may be outstanding at once
+(`MAX_QUEUED_DISK_COMMANDS`), because the relay is shared by every script on the
+workbench's origin and an unbounded queue let one of them pin the disk and the battery for
+as long as it liked. A refused call is one the caller may simply retry.
+
+The deadline a caller puts on the promise is therefore no longer a bound on the walk; it
+bounds a relay that is not there at all. The bundled bridge extension still declares two,
+`BRIDGE_TIMEOUT_MS` and `DISK_WALK_TIMEOUT_MS`, and the longer one still belongs to these
+four, because a walk that has started still has to finish before its answer is posted.
+Read the values out of its `extension.js` rather than from here, because a copy of a
+number in a document is how the two drift. An answer that arrives after its deadline is
+discarded rather than resolving anything, and an answer that arrives after the page has
+navigated is dropped on the Android side, since the relay it would post into is gone.
+
+#### Clipboard
+
+```kotlin
+@JavascriptInterface
+fun copyToClipboard(authToken: String, text: String): Boolean
+// Copies text to Android system clipboard
+// Returns: true if successful
+
+@JavascriptInterface
+fun readFromClipboard(authToken: String): String?
+// Reads text from Android system clipboard
+// Returns: clipboard text or null
+
+@JavascriptInterface
+fun hasClipboardText(authToken: String): Boolean
+// Checks if clipboard has text content
+```
+
+#### Navigation
+
+```kotlin
+@JavascriptInterface
+fun isAuthPageCurrent(authToken: String, pageGeneration: Long): Boolean
+// Checks the native document generation before bootstrap metadata is written.
+// Returns false for a stale session or generation; unavailable through the extension relay.
+
+@JavascriptInterface
+fun registerAuthCallback(requestId: String, nonce: String, documentId: String, pageGeneration: Long, authToken: String): Boolean
+// Registers the request and immutable document identity minted by the callback provider.
+// Returns false for a stale generation, invalid identity, conflicting nonce or full record.
+// Called directly by the workbench; unavailable through the extension command relay.
+
+@JavascriptInterface
+fun openExternalUrl(url: String, authToken: String): String  // note: token LAST
+// Hands the URL to a browser: a Chrome Custom Tab for https to any host but
+// 127.0.0.1 and localhost, and a plain VIEW intent for the rest, loopback https
+// included, which is what a dev server on this device needs.
+// Used by: every http(s) URL the workbench opens outside itself, extension
+// sign-ins included, and the bundled "VSCodroid: Open in Browser" command
+// through the relay. The workbench's default external opener calls
+// window.open, and MainActivity.injectWindowOpenOverride routes that call here.
+//
+// Returns the empty string when it opened, and otherwise the reason it did not,
+// which the relay forwards to the user unchanged. Three reasons exist: the
+// session token was stale, no installed app took the intent, or Android refused
+// the launch outright, which is what a `file://` URL gets. One destination is
+// judged before anything else happens: this app's own `vscodroid://callback`
+// (`isExtensionCallback`) is refused, with the third sentence naming its
+// scheme, and refused before any request id is armed. Its VIEW filter is
+// exported, so launching it would deliver a sign-in payload of the caller's
+// choosing straight into `MainActivity.onNewIntent`; the WebView's own
+// navigation route in `VSCodroidWebViewClient.shouldOverrideUrlLoading` refuses
+// it the same way. Nothing else is filtered by scheme or host, so a LAN address,
+// a custom scheme and a typo are all simply handed to Android.
+//
+// CALLERS MUST COMPARE AGAINST THE EMPTY STRING. Success is the falsy value, so
+// a truthiness test reads backwards and claims every click it failed to open.
+//
+// It returned Unit until the fix that first gave it an answer, so a refusal was
+// indistinguishable from a launch. The relay reported ok:true because there was
+// nothing else it could report, and "Open in Browser" closed its input box and
+// did nothing for every LAN address pasted into it, with the extension's own
+// error handler unreachable behind a promise that always resolved. It then
+// returned a boolean, which said that something had failed without saying what,
+// and the relay filled the gap with one fixed sentence blaming a missing app.
+
+@JavascriptInterface
+fun onBackPressed(authToken: String): Boolean
+// RESERVED, and it has no caller on either side.
+// It answers whatever the `onBackPressed` constructor lambda answers, which
+// MainActivity passes as `{ false }`, and nothing installs a page-side handler
+// that could answer anything else. Back is decided natively now:
+// setupBackNavigation calls moveTaskToBack(true) directly, so not even the
+// evaluateJavascript round trip that used to reach this method is left.
+// Documented rather than dropped because deleting it is an API break the
+// bridge/spec gate holds both sides to; a page must not read a `false` here as
+// "VS Code declined to handle back".
+
+@JavascriptInterface
+fun minimizeApp(authToken: String)
+// Moves app to background (moveTaskToBack)
+```
+
+There is no `startGitHubOAuth`. Sign-in is started by the extension that wants it,
+which hands its authorisation URL to `openExternalUrl` like any other link; the
+Custom Tab and the return trip are described in §2.5.
+
+#### File System
+
+```kotlin
+@JavascriptInterface
+fun openFolderPicker(authToken: String)
+// Opens the Android SAF folder picker.
+// Returns NOTHING. The picked folder does not come back through this call:
+// MainActivity receives the activity result, syncs the folder to its mirror
+// and reloads the workbench on the new path.
+```
+
+There is no `openFilePicker` and no `requestStoragePermission`. Individual files are
+not opened through a picker at all: a `content://` URI has no POSIX path and the
+server only ever sees POSIX paths. And there is no `MANAGE_EXTERNAL_STORAGE` in the
+manifest to request: external storage is reached through SAF, one user-granted folder
+at a time.
+
+#### Saving a Download
+
+These three are not called by extensions. They are called by the capture script
+`MainActivity.injectDownloadCapture()` injects into the workbench page, and they exist
+because the bytes of a download live in the page and cannot be reached from Kotlin.
+The editor hands the platform a `blob:` URL for any file it could read into memory,
+revokes that URL on the next task, and a blob has no name. So the page reports the
+name at click time and streams the bytes back afterwards.
+
+```kotlin
+@JavascriptInterface
+fun noteDownloadName(authToken: String, url: String, fileName: String)
+// Reports the name the page is about to download `url` under, taken from the
+// anchor's `download` attribute.
+// Returns NOTHING. Called before the platform has decided the click is a
+// download at all; a bridge call blocks the page until it returns, so the name
+// is on the Android side before the download hook fires.
+
+@JavascriptInterface
+fun writeDownloadChunk(authToken: String, requestId: String, base64: String): Boolean
+// One piece of the download named by `requestId`, base64 because the bridge
+// carries text. Each piece is decoded on its own, so each must be encoded on
+// its own.
+// Returns: true when it was written. On false the page must STOP reading -- the
+// write failed, the user has already been told why, and the rest of the file
+// has nowhere to go.
+
+@JavascriptInterface
+fun finishDownload(authToken: String, requestId: String, error: String)
+// Ends the download named by `requestId`.
+// `error` is the EMPTY STRING on success and a reason otherwise. Empty rather
+// than null because the value is written by JavaScript, where the absent case
+// is easy to send by accident.
+// Returns NOTHING. Whether the file survived is reported to the user by the
+// Android side, not back to the page.
+```
+
+A `requestId` that is not the download currently in flight is ignored, in both methods.
+Chunks belonging to a download that has since been cancelled or displaced would otherwise
+be written into the file the user is waiting for now.
+
+#### Storage Management
+
+```kotlin
+@JavascriptInterface
+fun getRecentFolders(authToken: String): String
+// JSON array of previously granted SAF folders. "[]" if refused, and also
+// "[]" when no SAF manager is wired up -- the two are indistinguishable here.
+// Format: [{"uri": "content://...", "name": "MyProject", "lastOpened": 1700000000}]
+// The key is "name", not "displayName", though it is built from the
+// provider's display name.
+
+@JavascriptInterface
+fun claimWorkspacePaths(authToken: String, pathsJson: String): Boolean
+// Claims absolute workspace and filesystem paths before they become usable.
+// A claimed device-folder copy cannot be removed until the app process restarts.
+// False rejects malformed input, a stale session, or a copy being removed or gone.
+
+@JavascriptInterface
+fun publishWorkspaceRoots(authToken: String, pageGeneration: Long, pathsJson: String): Boolean
+// Replaces the current document's complete workspace resource-root set.
+// Empty input closes the set; stale sessions, generations, and relative paths are refused.
+// Resource requests retain their origin, referrer, sensitive-path, and containment checks.
+// When the published paths span two or more distinct device-folder copies under saf-mirrors/,
+// MainActivity shows saf_workspace_multiple_folders once for that pageGeneration.
+
+@JavascriptInterface
+fun openRecentFolder(authToken: String, uriString: String)
+// Re-opens a previously granted SAF folder by URI.
+// Returns NOTHING -- it hands the URI to MainActivity and returns. A URI this
+// app holds no read and write grant for is refused there, after this call has
+// returned and before any sync starts: MainActivity.openRecentSafFolder shows
+// the saf_permission_expired notice and opens no picker. There is no return
+// value to test for validity.
+
+@JavascriptInterface
+fun getStorageBreakdown(authToken: String, replyId: String): String
+// ANSWERS BY replyId. Returns "" once the walk has started; anything else is a
+// refusal decided before it started, and is the sentence to show.
+//
+// Posted against replyId: JSON with per-component disk usage in bytes:
+// {"vscode_server": N, "extensions": N, "user_data": N, "logs": N,
+//  "tools": N, "saf_mirrors": N, "projects": N, "cache": N, "total": N}
+// "projects" is the default workspace; it is inside "total" only when it lies
+// outside filesDir (an install that kept it on shared storage).
+//
+// TAKES AS LONG AS THE DISK. Every figure is a directory walk and "total" walks
+// filesDir again on top, so on an install carrying the extracted server tree
+// (~800 MB before a project is opened) this runs for far longer than a relay
+// hop, which is why it does not answer where the caller waits. See the note at
+// the head of this section.
+
+@JavascriptInterface
+fun clearCaches(authToken: String, replyId: String): String
+// Clears npm-cache, pip's cache, tmp dir, crash logs, Python bytecode, VS Code logs, and
+// toolchain staging directories no download is using
+// ANSWERS BY replyId. Returns "" once the deletion has started; anything else is
+// a refusal decided before it started.
+// Posted against replyId: the number of bytes freed, as decimal text. Parse it;
+// the bridge carries strings, so this is "0" and not 0 when nothing was freed.
+// Deletes trees, so it takes as long as the disk. Same note.
+
+@JavascriptInterface
+fun getAvailableStorage(authToken: String): Long
+// Returns: available disk space in bytes
+
+@JavascriptInterface
+fun listSafMirrors(authToken: String, replyId: String): String
+// Returns "" once accepted, with the outcome posted against replyId. A non-empty
+// return is an immediate refusal and starts no work.
+// Posted data: ordinary local copies of device folders, largest first.
+// [{"hash":"abc123def456","name":"MyProject","bytes":N,
+//   "lastOpened":1700000000,"granted":true,"reclaimable":false}]
+// name and a non-zero lastOpened are absent after the recent entry is removed.
+// reclaimable remains false for compatibility. A snapshot cannot prove that
+// direct filesystem writes will not add unique files before removal commits.
+// Revoked permissions do not remove ordinary copies or their sync records.
+// Sizing walks every copy; call asynchronously. Discarded entries are not listed.
+
+@JavascriptInterface
+fun reclaimSafMirror(authToken: String, hash: String, force: Boolean, replyId: String): String
+// Requests removal of the local copy identified by a listed hash.
+// force=false refuses: every ordinary copy requires explicit destructive consent.
+// force=true asks for confirmation in Android, independently of the caller's UI.
+// Confirmation warns that the copy may contain files absent on the device.
+// It never bypasses the in-use guard, including mirrors claimed earlier in this
+// process. Closing a workspace can leave a write-back drain or filesystem client.
+// A request is refused immediately while this bridge has other storage work.
+// Empty return means accepted and answered later against replyId; any other
+// return is an immediate refusal and starts no work.
+// Posted empty payload means removed or cancelled by the user. A refusal posts
+// ok:false with its reason. Compare against the empty string, not truthiness.
+// The directory rename commits removal; recursive deletion runs afterwards and
+// the next launch finishes any discarded entries. Regrant creates a fresh copy.
+// Sizing can outlast a transport timeout. A timeout does not cancel native work.
+
+```
+
+#### Device Info
+
+```kotlin
+@JavascriptInterface
+fun getDeviceInfo(authToken: String): String
+// Returns JSON string. These nine keys and no others -- there is no ram_mb,
+// no storage_free_mb and no webview_version, though this block listed all
+// three with plausible values for a long time. For free space call
+// getAvailableStorage().
+// {
+//   "model": "Pixel 8",
+//   "android": 36,
+//   "api": 36,
+//   "manufacturer": "Google",
+//   "vscodroid_version": "1.6.0",
+//   "screen_width": 1080,
+//   "screen_height": 2400,
+//   "screen_density": 2.625,
+//   "orientation": "portrait"
+// }
+// `android` and `api` are two names for ONE value: both are
+// Build.VERSION.SDK_INT, so they are always equal and neither is the marketing
+// release. `Android ${info.android}` renders "Android 36", not "Android 16".
+// Not one aliasing the other after a rename -- both arrive in the same commit
+// (2d9d34f) and have been duplicates since the first version. Nothing in the
+// tree reads either key, so which one a caller picks has never mattered.
+// This block used to print 16 beside 36, which reads as a release number next
+// to an API level and is the shape that makes the duplication look deliberate.
+// `orientation` is the string "landscape" or "portrait".
+
+@JavascriptInterface
+fun getThemeMode(authToken: String): String
+// Returns: "light" or "dark" (follows Android system theme)
+```
+
+#### Page Colour
+
+One more object reaches the page outside `AndroidBridge`: `vscodroidPageColor`, which
+`addPageColorListener` in `VSCodroidWebView.kt` adds with
+`WebViewCompat.addWebMessageListener` before the first load, for every origin. The page
+script `server.js` adds to the workbench page (`INITIAL_THEME_MARKER`) posts it the colour
+it paints the page with, and the app gives that colour to the window behind the WebView,
+which shows below the page's last frame while the soft keyboard goes down and behind the
+system bars, and to the WebView's own background. It takes no token and returns nothing. A
+message is acted on only when it comes from the top frame on the loopback address and is a
+string holding an opaque `#rrggbb`, so the most a caller can do with it is set that colour,
+which the app also keeps for the screens of its next start. The type is tested before the
+data is read: a page can post an `ArrayBuffer` too, and reading one's data as a string
+throws in the callback the WebView runs on the UI thread.
+
+### 2.5 Extension Auth Callback Relay (Chrome Custom Tabs)
+
+Kotlin knows nothing about OAuth here. It relays one opaque blob between two
+browser contexts, because the workbench's own callback mechanism assumes both ends
+share a `localStorage`, and on Android they do not: `callback.html` opens in Chrome
+while the workbench runs in the WebView.
+
+```mermaid
+sequenceDiagram
+  participant W as WebView (VS Code)
+  participant K as Kotlin
+  participant C as Chrome Custom Tabs
+  participant P as Identity provider
+  W->>K: registerAuthCallback(id, nonce, documentId, pageGeneration, authToken)
+  W->>K: openExternalUrl(authUrl, authToken)
+  K->>K: AuthTabWindow.arm(authRequestIdsIn(authUrl), authCallbackNonceIn(authUrl), elapsedRealtime, pageGeneration)
+  K->>C: CustomTabsIntent.launchUrl (https to a non-loopback host, a plain VIEW intent otherwise)
+  C->>P: user login + consent
+  P-->>C: redirect to the workbench callback page
+  C-->>K: VIEW intent, vscodroid://callback?data=ENCODED_JSON
+  K->>K: gate: size, workbenchLoaded, armedAt(id), callbackSecretMatches(...), authCallbackIsExpected(...)
+  K-->>W: evaluateJavascript, writes vscode-web.url-callbacks[id]
+```
+
+The scheme is `vscodroid://callback`, not `vscodroid://oauth/<provider>`, and the
+payload is a single `data` parameter carrying the workbench's own JSON. Kotlin
+reads two things out of it: the request `id` (`callbackRequestId`) and the
+`vscodroid-nonce` parameter of `uri.query` (`callbackNonce`), which
+`callbackUriJson` removes before the address is relayed, because that secret is
+between this app and the browser and is not the extension's. No provider, code or
+state is parsed on the Kotlin side.
+
+The exported `BROWSABLE` intent filter can be invoked by any app or web page. The relay accepts only the exact callback scheme and host, limits the JSON payload to 8192 characters, requires a loaded workbench, and matches an active issued request id and its nonce before checking the ten-minute launch window. Invalid returns are logged without payloads. A genuine expired return shows the existing timeout notice once and retires that activation without releasing its identity.
+
+Patch 0019 registers each real callback id and minted nonce through `registerAuthCallback` before returning its URI. The native registry accepts canonical positive ids, exactly 32 lowercase hexadecimal nonce and document-id characters, the current document generation and a valid bridge token. Repeating the same registration is harmless; a conflicting nonce or document identity is refused. The method is not exposed through the extension command relay.
+
+Requests created before token injection remain in a private provider queue. Native token injection sets the document generation and dispatches `vscodroid-bridge-ready`; the provider synchronously flushes its own queued identities. Native readiness is accepted only after the JavaScript completion marker confirms that generation and successful registration. A page that answered with a failed registration keeps its editor scripts (key row, touch fixes, relay, clipboard and download capture) but is not marked ready, so it receives no sign-in return; a page that did not answer for the document gets no scripts at all. The source document must be the owned top-level HTTP workbench at the configured loopback port and root path. Completion from a replaced WebView or document is ignored.
+
+A main-frame auth navigation before readiness waits in a queue of at most 32 URLs with one fixed 30-second deadline. Successful bootstrap drains only matching registered requests. Failed bootstrap, timeout, page failure or replacement clears the queue without opening a browser. Subframes cannot enqueue auth launches. Ordinary external links keep their existing behavior.
+
+Outgoing addresses can activate only an already issued id with its original nonce. Missing, alternate or unissued pairs grant no callback authority. The parser reads at most eight distinct ids and applies the one extracted nonce independently to each issued identity. A repeated active launch preserves its original timestamp. Failed browser attempts retain the issued identity for an original-nonce retry; overlapping failures cannot remove an activation another attempt successfully launched.
+
+The registry retains at most 32 issued identities per document. When it is full, a registration drops the oldest identity that can no longer be satisfied, one whose late return was already reported or one launched more than ten minutes ago with no launch in flight, and is refused when there is none, so a request waiting for its launch or inside its window is never evicted. Arbitrary outgoing ids consume no capacity. Reload, folder switch, renderer recreation and process recreation discard the old authority. Numeric ids may then repeat with fresh nonces. A valid accepted callback keeps its launch visible while the workbench collects the relayed value, preserving resume suppression. The relay removes only the nonce parameter and preserves all other callback query bytes.
+
+The workbench's pending requests are in memory. A callback after process loss cannot restore them; the app shows the existing restart notice and requires a fresh sign-in. The actual provider exposes its random document identity through a non-configurable getter without a setter. Bootstrap never writes that identity. Callback delivery snapshots the registered identity and requires the current provider getter to match before writing localStorage, so stale bootstrap metadata cannot admit an old callback into a replacement page. While an active launch remains within its window, returning from the background uses the IndexedDB health check instead of a forced reload so the pending request remains available.
+
+#### Logging
+
+```kotlin
+@JavascriptInterface
+fun logToNative(authToken: String, level: String, tag: String, message: String)
+// Sends log from WebView to Android Logcat
+// level: "debug", "info", "warn", "error"
+```
+
+#### Crash Reporting
+
+```kotlin
+@JavascriptInterface
+fun getLastCrash(authToken: String): String?
+// Returns the most recent crash log text, or null if no crashes recorded
+// Privacy: crash logs are stored locally only, never transmitted
+
+@JavascriptInterface
+fun generateBugReport(authToken: String): String
+// Generates a bug report containing:
+// - Device info (model, Android version, app version)
+// - Memory usage
+// - The system's record of how this app's ten most recent processes ended
+//   (ActivityManager.getHistoricalProcessExitReasons): time, process,
+//   reason by name (ANR, LOW_MEMORY, CRASH_NATIVE, ...), status,
+//   importance, pss and rss, and the system's description
+// - The last 20 renderer deaths, from renderer.log under
+//   Environment.getLogsDir, which the two onRenderProcessGone overrides for the
+//   editor's WebView write through CrashReporter.recordRendererDeath, and the
+//   colour probe's own WebView does not: time, crashed or killed by
+//   the system, and the renderer priority at exit
+// - How many crash logs exist, plus the text of the three most recent
+// - The last 200 lines of the Node server's output, read from `server.log`
+//   under Environment.getLogsDir. ProcessManager.startOutputReader mirrors
+//   every line the server prints into that file through ServerLog, in every
+//   build, so the section is present rather than silently empty.
+// Answers the empty string only when the session token is refused.
+// Everything read off disk has the connection token replaced wherever it
+// appears as a `tkn=` parameter, and the server log is redacted a second
+// time on the way in so the token never lands in the file at all; that pass
+// also removes credential shapes (authorization and cookie headers, bearer
+// tokens, named keys and passwords, vendor-prefixed keys, one-line private
+// keys), including inside a JSON body quoted into another string.
+
+@JavascriptInterface
+fun clearCrashLogs(authToken: String)
+// Clears all stored crash logs
+```
+
+#### SSH Key Management
+
+```kotlin
+@JavascriptInterface
+fun generateSshKey(authToken: String, comment: String): String
+// Generates an ed25519 keypair at ~/.ssh/id_ed25519 using the bundled
+// ssh-keygen. The second argument is the key's COMMENT, not a key type --
+// the algorithm is not selectable, and a value like "rsa" would simply be
+// written into the comment field.
+// Empty passphrase, deliberately: the key is protected by the app sandbox,
+// which is the right trade against typing one on a phone keyboard.
+// Never overwrites an existing private key. A full pair is returned unchanged; a private
+// key without its public file fails with an error that says how to recover that file.
+// A standalone public file is also preserved: generation refuses it with guidance to
+// keep it or move it aside. No child is started for either refusal.
+// New output is generated in a private temporary directory. Both final paths are
+// checked again before publication: if either appeared during generation, nothing
+// is published. Links also refuse replacement if a file appears after that check.
+// If the private key is published but a later public publication fails, the private
+// key is retained with recovery guidance. Publication of the two filenames is not atomic.
+// Returns a JSON OBJECT string, not a bare key:
+//   {"success": true,  "publicKey": "ssh-ed25519 AAAA..."}                  <- newly generated
+//   {"success": true,  "publicKey": "ssh-ed25519 AAAA...", "existed": true} <- already there
+//   {"success": false, "error": "..."}
+// `existed` appears ONLY on the reuse path -- absent, not false, on a fresh
+// generation. It is the only way to tell "a key was made for you, upload it"
+// from "you already had one": publicKey looks identical either way.
+//
+// ANSWERED INLINE, unlike the four disk-walking commands, so it holds the
+// page's main thread until ssh-keygen exits. Bounded rather than open ended:
+// KEYGEN_TIMEOUT_SECONDS is 4. After normal exit the stdout drain is joined for
+// at most one second. A failure with a live child requests forced termination and
+// waits at most one second for exit instead. An interrupted caller has its flag
+// restored after cleanup. Only temporary output is removed; if termination does
+// not finish within the cleanup bound, that output is kept and the error says so.
+// The bundled extension waits five seconds. Moving this onto a replyId changes
+// both the relay contract and the Kotlin implementation.
+
+@JavascriptInterface
+fun getSshPublicKey(authToken: String): String
+// Reads ~/.ssh/id_ed25519.pub. Returns "" if there is no such file --
+// empty string is also what a refused token returns, so it is not evidence
+// that the key is missing.
+
+@JavascriptInterface
+fun listSshKeys(authToken: String): String
+// Every *.pub in ~/.ssh/, as a JSON array. Returns "[]" if the directory
+// does not exist. A key whose file cannot be read is skipped, not reported.
+// Each entry: { name, type }
+//   name: filename without the .pub suffix
+//   type: first field of the public key line, e.g. "ssh-ed25519"
+// The comment is NOT returned, and it used to be. A public key line's third
+// field is conventionally user@host or an email address, so for any key the
+// user imported rather than generated here it is a personal identifier, and
+// this command answers onto a channel every script on the workbench's origin
+// can read. Nothing in the app or in the bundled extensions ever read it.
+// NOT a fingerprint either: nothing here computes one. The KDoc on this method
+// said "fingerprint" while the code wrote "comment".
+```
+
+#### Toolchain Control
+
+`ToolchainRegistry.available` is the source for what these can name. It lists Ruby,
+Java 21 and C/C++, and nothing else.
+
+```kotlin
+@JavascriptInterface
+fun getAvailableToolchains(authToken: String): String
+// Every registry entry, installed or not, as a JSON array. "[]" if refused.
+// Each entry: { packName, displayName, description, estimatedSize, installed }
+// packName carries the "toolchain_" prefix; `installed` is computed against
+// the short name with that prefix stripped.
+
+@JavascriptInterface
+fun getInstalledToolchains(authToken: String): String
+// JSON array of installed SHORT names, e.g. ["ruby","java","cpp"]. "[]" if refused.
+
+@JavascriptInterface
+fun installToolchain(name: String, authToken: String)   // note: token LAST
+// Starts an async download + install. Accepts a pack name or a short name.
+// Returns immediately and reports nothing; progress arrives through the
+// manager's own state callbacks, not through a return value.
+
+@JavascriptInterface
+fun removeToolchain(name: String, authToken: String)    // note: token LAST
+// Deletes the toolchain's files, symlinks and env entries.
+
+@JavascriptInterface
+fun cancelToolchainInstall(name: String, authToken: String)  // note: token LAST
+// Cancels an in-progress download. Takes the pack NAME -- this was documented
+// for a long time as taking only a token, which would not compile.
+
+@JavascriptInterface
+fun openToolchainSettings(authToken: String)
+// Starts ToolchainActivity. Reachable over the relay as `openToolchainSettings`,
+// and the bundled saf-bridge extension sends it: the command palette entry
+// "VSCodroid: Manage Toolchains". The launcher long-press shortcut that
+// SplashActivity.publishToolchainShortcut publishes is the other route.
+// ToolchainActivity is still not exported, so those two are all of them.
+```
+
+#### About
+
+```kotlin
+@JavascriptInterface
+fun showAboutDialog(authToken: String)
+// Shows the native About dialog with version info, licenses, and links
+```
+
+#### Extra Key Row
+
+```kotlin
+@JavascriptInterface
+fun toggleExtraKeyRow(authToken: String): Boolean
+// Hides the Extra Key Row if it is shown, shows it if it is hidden, and keeps the
+// choice across restarts. Returns true when the row is now hidden; false when the
+// token is refused, which reads as "shown". Reachable over the relay as
+// `toggleExtraKeyRow`; the bundled saf-bridge extension sends it from
+// VSCodroid: Toggle Extra Key Row.
+```
+
+---
+
+## 3. (B) VS Code Remote Protocol
+
+This is VS Code's built-in protocol. VSCodroid uses it as-is (no modifications needed).
+
+### 3.1 HTTP Endpoints (Served by VS Code Server)
+
+| Endpoint                  | Method | Description                                  |
+| ------------------------- | ------ | -------------------------------------------- |
+| `/`                       | GET    | Serve vscode-web index.html. Answers **403** until the connection token is supplied |
+| `/static/**`              | GET    | Serve static assets (JS, CSS, fonts, images) |
+| `/version`                | GET    | Answered before the token check, which is what makes it the readiness probe |
+| `/vscode-remote-resource` | GET    | Serve workspace files to web client          |
+
+**There is no `/healthz` on any install, and there is no longer a stub that serves one.**
+This table listed the route for a long time. The only thing that ever answered it was a
+fallback server in `assets/server.js`, which bound the port when
+`vscode-reh/out/server-main.js` was missing and answered 200 to every path, `/version`
+included: a broken install reported a healthy start and put a page telling the user to run
+two shell scripts in front of them. The bootstrap now logs the missing entry point and
+exits 1, so the port stays unbound, the readiness poll fails, and the failure is reported
+as one. A probe of `/healthz` gets whatever the REH server does with an unknown route.
+
+### 3.2 WebSocket Connection
+
+| Endpoint                 | Description                                    |
+| ------------------------ | ---------------------------------------------- |
+| `ws://localhost:PORT/ws` | Main RPC channel between web client and server |
+
+**Protocol**: VS Code's `IExtHostRpcProtocol`, binary-framed messages with JSON-RPC semantics.
+
+> **Unverified, and flagged rather than reworded.** The `/ws` path and the protocol name
+> above come from the original design notes. Neither can be checked from this repository:
+> the server tree is a build artifact fetched by `scripts/fetch-vscode-oss.sh` and is not
+> committed, and nothing on the Kotlin side names a WebSocket path; the WebView is
+> pointed at the root URL and VS Code's own client opens the socket. Confirm against
+> `src/vs/server/node/` at the pinned tag before relying on either. The rest of this
+> section was checked against shipped code; this table was not.
+
+**Message types** (handled by VS Code internally):
+
+- File system operations (read, write, stat, readdir, watch)
+- Extension Host RPC (activate, deactivate, API calls)
+- Terminal I/O (create session, write, resize, kill)
+- Search operations (text search, file search)
+- Debug Adapter Protocol messages
+- SCM/Git operations
+- Configuration sync
+
+### 3.3 Server Launch Arguments
+
+**These are `server.js`'s arguments, not the editor server's, and the difference is
+load-bearing.** `ProcessManager.startServer` spawns `server.js`, which then forks
+`vscode-reh/out/server-main.js` with a command line it builds itself.
+
+What Kotlin passes (`ProcessManager.startServer`):
+
+```
+libnode.so
+--max-old-space-size=N        # V8 heap ceiling, derived from device RAM by
+                              # heapCeilingForDevice() -- not a constant
+server.js
+--host=127.0.0.1              # Loopback fallback when no socket is supplied
+--port=PORT                   # App-owned public port, retained across editor restarts
+--socket-path=PATH            # Private filesystem listener for this editor run
+--extensions-dir=PATH         # Custom extensions location
+--user-data-dir=PATH          # User settings location
+--server-data-dir=PATH        # Server data location
+--logsPath=PATH               # Log directory
+--log=info                    # Log level
+```
+
+What reaches the editor server is a different list. `server.js` reads `host`, `port` and `log` as its own **defaults** and rebuilds them, adds four flags nobody passed in, and passes `--socket-path` when supplied. It separately forwards a **whitelist of exactly four directory keys**:
+
+```js
+// server.js, at the fork
+['extensions-dir', 'user-data-dir', 'server-data-dir', 'logsPath']
+```
+
+Added by `server.js` itself, not passed from Kotlin:
+
+- `--accept-server-license-terms`
+- `--without-browser-env-var`: without it the server exports `BROWSER` pointing at
+  `bin/helpers/browser.sh`, a shebang script under `filesDir`. The server and the
+  extension host run without the terminal's exec interceptor, so SELinux refuses to
+  exec it there. Node's browser helpers prefer `$BROWSER` over `xdg-open`, so with it
+  set they stop at a script that cannot run; unset, they reach the `xdg-open` row the
+  exec table provides.
+- `--disable-workspace-trust`: without it every folder opens in Restricted Mode and
+  most extensions never activate. The `security.workspace.trust.enabled` setting
+  cannot substitute: it is APPLICATION-scoped, and the WEB CLIENT takes only the
+  remote-machine scopes from the machine settings file, so the flag is the only route
+  that works. The qualification matters, because the same file is read twice. The server
+  builds its own configuration service over it with no scope filter, which is why an
+  APPLICATION-scoped key the server owns, `extensions.verifySignature`, does take effect
+  from it. Only a key that is APPLICATION-scoped *and* read by the workbench cannot be
+  defaulted there. See `Environment.getMachineSettingsPath`.
+- `--enable-proposed-api ms-python.python`: the workbench strips the proposed APIs an
+  extension declares unless the server names it, and the Python extension, which declares
+  nine, then fails to activate at its first read of one (`testObserver`). The id is the
+  point: the flag with no id turns the check off for every extension on the phone.
+
+⚠️ **An argument not handled explicitly by `server.js` is dropped silently.** Adding a flag to
+the Kotlin command line and expecting the editor server to see it is the trap here,
+and it is worst for authentication: the server takes its connection token from
+`<server-data-dir>/data/token` precisely because no token flag is passed, and a
+`--connection-token-file` added to the Kotlin list would vanish at the fork and leave
+the server running with nothing in the log to say so. Change the fork in `server.js`,
+not only the spawn in `ProcessManager`.
+
+---
+
+## 4. (C) Process Management API
+
+### 4.1 Node.js Process Lifecycle
+
+> **Sketch, not the shipped signatures.** `startServer`, `waitForReady`, `stopServer`
+> and `getServerPid` exist on `ProcessManager`; `killServer` does not, and the
+> parameter lists below were written before the code. `isServerHealthy` is corrected
+> in place because it is the readiness probe and getting it wrong has cost this
+> project a release. Read `ProcessManager` for the rest; nothing gates this block.
+
+```kotlin
+interface ProcessManager {
+
+    // Launch Node.js server process
+    fun startServer(
+        nodePath: String,           // Path to libnode.so
+        serverScript: String,       // Path to server.js
+        port: Int,                  // Localhost port
+        environment: Map<String, String>,
+        maxOldSpaceSize: Int = 512  // V8 heap limit in MB
+    ): Process
+
+    // Check if server is ready
+    suspend fun waitForReady(
+        port: Int,
+        timeoutMs: Long = 30_000,
+        pollIntervalMs: Long = 200
+    ): Boolean
+
+    // Health check. Takes NO port -- it reads the port ProcessManager allocated,
+    // because the port is allocated once and reused across every restart.
+    fun isServerHealthy(): Boolean
+
+    // Graceful shutdown
+    fun stopServer(process: Process, timeoutMs: Long = 5_000)
+
+    // Force kill
+    fun killServer(process: Process)
+
+    // Get server PID
+    fun getServerPid(process: Process): Long?
+}
+```
+
+### 4.2 Health Check
+
+```
+GET http://127.0.0.1:PORT/version
+
+Response 200        : liveness probe succeeds
+Anything else       : liveness probe fails, including 403
+Response timeout/err: liveness probe fails
+```
+
+`/version` is answered before the connection-token check, so it needs no token.
+The response must be HTTP 200 with valid framing within one two-second monotonic
+deadline shared by connection, headers and body. `isServerHealthy()` uses this
+liveness check; HTTP success alone does not establish readiness.
+
+Before publishing the private connection token, `probeReadiness()` also requires
+the current spawn's listening announcement and a fresh response from
+`/vscodroid-server-proof/<challenge>`. The response must be the HMAC-SHA256 of the
+challenge under that run's private identity. An adopted server additionally needs
+a matching packaged commit and a current process-ownership record. The readiness
+epoch must remain current through the probes and token read, so a concurrent stop
+or restart prevents publication.
+
+**Polling strategy**:
+
+```
+Startup: poll every 200ms for up to 30 seconds   (waitForReady defaults)
+```
+
+That is the only polling there is. This block used to add "Running: poll every 5
+seconds (background watchdog)" and "After crash: poll every 200ms for up to 10
+seconds", and neither exists: the watchdog does not poll at all. It is a daemon
+thread blocked in `Process.waitFor()`, which costs nothing and learns of an exit
+immediately, and the post-crash wait is the same `waitForReady`, so its ceiling is
+30 seconds, not 10.
+
+### 4.3 Process Death Handling
+
+```kotlin
+// Monitor process via thread
+thread(name = "node-watchdog") {
+    val exitCode = process.waitFor()  // Blocks until process exits
+    when {
+        exitCode == 0     -> log("Server shut down gracefully")
+        exitCode == 137   -> log("Server killed (OOM or phantom limit)")
+        else              -> log("Server crashed: exit=$exitCode")
+    }
+    // Auto-restart unless app is finishing
+    if (!isFinishing) {
+        restartServer()
+    }
+}
+```
+
+**The restart is bounded, which this sketch does not show.** `NodeService` allows
+`MAX_RESTARTS = 5` (`hasRestartBudget`), with exponential backoff from
+`RESTART_DELAY_MS = 2000` shifted up to `MAX_BACKOFF_SHIFT = 4`. When the budget is
+spent the app stops trying and says so: the notification switches to "VSCodroid server
+stopped" / "Server crashed repeatedly. Please restart the app." and loses its Stop
+action, because there is no longer anything to stop. A reader taking the loop above at
+face value would expect an unlimited restart loop and would not know that user-visible
+end state exists.
+
+---
+
+## 5. Extension Integration API
+
+### 5.1 Open VSX Gallery API (used by VS Code UI)
+
+VS Code's built-in extension marketplace UI uses these endpoints. **Configured at
+runtime by `assets/server.js`, not at build time**. This section used to say
+"product.json", which points at the one place changing it does not work:
+
+```js
+// assets/server.js, productOverrides -- rewritten into product.json on EVERY start
+extensionsGallery: {
+    serviceUrl:          'https://open-vsx.org/vscode/gallery',
+    itemUrl:             'https://open-vsx.org/vscode/item',
+    resourceUrlTemplate: 'https://open-vsx.org/vscode/unpkg/{publisher}/{name}/{version}/{path}',
+    controlUrl:          '',
+    nlsBaseUrl:          '',
+}
+```
+
+Two things a reader editing this needs, both of which the old rendering hid:
+
+- **`branding/product.json` deliberately does not set the gallery**, and its own comment
+  says why: at build time the gallery named in `product.json` is where the bundled
+  js-debug extensions are fetched from, and pointing that at Open VSX breaks the build:
+  Open VSX serves repackaged copies whose checksums no longer match the ones
+  `product.json` pins. Left unset, they come from each extension's own GitHub release.
+- **All five keys must be listed together.** `server.js` applies `productOverrides` with
+  a shallow `Object.assign`, so `extensionsGallery` replaces the built object whole.
+  Dropping `controlUrl` or `nlsBaseUrl` from this block does not inherit them; it
+  removes them.
+
+> The request *methods* are not stated here on purpose. VS Code's gallery client decides
+> them and its source is not in this repository, so nothing here can settle whether
+> `extensionquery` is a GET or a POST. The three URLs above are verifiable and verified;
+> the verbs are not.
+
+### 5.2 Extension Lifecycle
+
+```
+Install:
+  1. Download .vsix from Open VSX
+  2. Extract to ~/.vscodroid/extensions/{publisher}.{name}-{version}/
+  3. Read package.json for activation events
+  4. Register with Extension Host
+
+Activate:
+  1. Activation event fires (e.g., onLanguage:python, *)
+  2. Extension Host loads extension main module
+  3. activate() function called
+  4. Extension registers commands, providers, etc.
+
+Deactivate:
+  1. deactivate() function called
+  2. Disposables cleaned up
+```
+
+### 5.3 Pre-bundled Extensions
+
+Extensions reach a device from **two** places, and conflating them is why this section
+was wrong for a long time.
+
+**1. Code - OSS builtins**: 96 directories inside the built server tree at
+`assets/vscode-reh/extensions/`. Themes and basic language support come from here:
+`theme-defaults`, `theme-monokai`, a `python` grammar extension, and so on. They are
+part of the server build, not of `assets/extensions/`, and nothing in this repository
+lists them; count them with
+`ls android/app/src/main/assets/vscode-reh/extensions/`.
+
+**2. `assets/extensions/`**: nine directories, extracted to `~/.vscodroid/extensions/`
+during setup:
+
+```mermaid
+flowchart TD
+  ROOT["assets/extensions/"] --> T["4 from Open VSX, fetched at build time"]
+  ROOT --> O["5 first-party, source in git"]
+  T --> T2["esbenp.prettier-vscode"]
+  T --> T3["ms-python.python"]
+  T --> T4["dbaeumer.vscode-eslint"]
+  T --> T5["bradlc.vscode-tailwindcss"]
+  O --> O1["vscodroid.vscodroid-saf-bridge (the 14 VSCodroid: commands)"]
+  O --> O2["vscodroid.vscodroid-welcome (Get Started walkthrough)"]
+  O --> O3["vscodroid.vscodroid-process-monitor"]
+  O --> O4["vscodroid.vscodroid-serve-network (LAN address of a dev server on this device)"]
+  O --> O5["vscodroid.vscodroid-editor-menus (Select All in the editor context menu, no code)"]
+```
+
+⚠️ **`git ls-files` answers a different question than `ls` here, and the gap is
+deliberate.** `.gitignore` ignores `assets/extensions/*` and un-ignores only
+`vscodroid.vscodroid-*/`, because this project's own extensions are source and the rest
+are downloads. So a worktree shows **five** directories and a built tree shows **nine**:
+the four Open VSX ones are fetched by `scripts/download-extensions.sh`, whose
+`EXTENSIONS` array is the tracked, authoritative list of what a build pulls. Read that
+array plus the five `vscodroid.*` directories; do not enumerate this set from git.
+
+The version is part of each directory name, and that is load-bearing, though not
+because of extraction. `bundledDirsToExtract` re-unpacks every `vscodroid.*` directory
+on each setup run, so edited code does reach an existing install; a fetched one is
+unpacked only when its directory is absent or was left half-finished, and not when the
+user removed it or the default profile already lists a gallery install or a newer copy of
+it. The server, however, caches its scan of
+user extensions against the modification time of `extensions.json`, so a changed
+`package.json` (its `contributes`, for example) stays invisible until the directory
+name changes and `reconcileExtensionsManifest` rewrites that file. Bump the version in
+the directory name, `package.json` and `MILESTONES.md` together for any manifest change;
+`supersededExtensionDirs` removes the older directory.
+
+---
+
+## 6. Toolchain Manager API
+
+### 6.1 Internal API
+
+> **Sketch, not the shipped API.** None of these five methods exists in this form:
+> the real one is `ToolchainManager` in Kotlin, and `ToolchainRegistry.available` is
+> what lists the toolchains. Kept as a record of the intended shape; do not write
+> against it.
+
+```typescript
+interface ToolchainManager {
+  // List available toolchains
+  listAvailable(): Promise<Toolchain[]>;
+
+  // List installed toolchains
+  listInstalled(): Promise<Toolchain[]>;
+
+  // Request toolchain asset pack from Play Store and configure
+  install(id: string, onProgress: (percent: number) => void): Promise<void>;
+
+  // Remove installed toolchain (free storage)
+  uninstall(id: string): Promise<void>;
+
+  // Check if toolchain asset pack is downloaded
+  isInstalled(id: string): boolean;
+
+  // Check if toolchain needed for file type
+  suggestForFile(filename: string): Toolchain | null;
+}
+
+interface Toolchain {
+  id: string; // "ruby", "java", "cpp" -- those three. Rust has no module, no
+              // asset pack and no ToolchainRegistry entry; it was planned and
+              // deferred, and naming it here read as a shipped option
+  name: string; // "Java 21"
+  version: string; // "17"
+  sizeMb: number; // 146
+  installed: boolean; // Whether asset pack is downloaded and extracted
+  installPath?: string; // e.g., "$PREFIX/lib/jvm/java-21-openjdk"
+  fileAssociations: string[]; // [".java"]
+  recommendedExtensions: string[]; // Open VSX extension ids
+}
+```
+
+### 6.2 Package Manager CLI API
+
+> ⚠️ **Proposed. This CLI does not exist.** There is no `vscodroid` executable and no
+> package-manager script: `assets/usr/` contains `lib` and `share` and **no `bin`
+> directory at all**, and nothing in `jniLibs/arm64-v8a/` is named for it. Every
+> occurrence of `vscodroid pkg` in this repository is in a document.
+>
+> Checked against a built tree rather than a worktree, with a control: `libnode.so`
+> resolves on the same path, so the absence below is a real absence and not a missing
+> build. Tier 3 of the bundling strategy remains a plan; the toolchains that do ship
+> arrive through `ToolchainManager`, not through this.
+
+```bash
+vscodroid pkg <command> [args]
+
+Commands:
+  search <query>    Search packages (queries Termux repo index)
+  install <pkg>     Download and install package
+  remove <pkg>      Remove installed package
+  list              List installed packages
+  list-available    List all available packages
+  update            Update all packages
+  info <pkg>        Show package details
+
+Exit codes:
+  0 = success
+  1 = package not found
+  2 = download failed
+  3 = installation failed
+  4 = insufficient storage
+```
+
+> **Note**: Package installation from Termux repositories is only available in the sideloaded version. Play Store version uses on-demand asset packs exclusively.
+
+---
+
+## 7. Error Codes
+
+> ⚠️ **Proposed, and never implemented. Nothing emits, logs, returns or matches any of
+> these seventeen codes.** Swept for each of them across the tree: every hit is in this
+> document. There is no `E001`, no `SERVER_OOM`, no `WEBVIEW_TOO_OLD` constant anywhere
+> in the Kotlin, the JS or the resources.
+>
+> What the app actually surfaces is a small set of user-facing strings:
+> `error_server_start`, `error_server_timeout`, `error_storage_full`,
+> `error_setup_failed`, `status_server_slow_start`, plus log lines. Errors are not
+> classified by code, so nothing can be filed, matched or triaged by one.
+>
+> **E101 WEBVIEW_CRASH** is detected (`onRenderProcessGone` rebuilds the view) and a
+> single crash is still recovered from silently. Repeated ones are not: three inside sixty
+> seconds (`CRASH_LOOP_WINDOW_MS`, `CRASH_LOOP_CRASHES`) are recovered as before, and a
+> fourth rebuilds the view without reloading the editor and puts up a page saying so, whose
+> only control (`vscodroid://reload-editor`) loads the editor again and clears the record.
+> The server is untouched throughout, which is why that control is not the retry the
+> server-gave-up page carries.
+>
+> **E102 WEBVIEW_TOO_OLD** describes a condition that is detected.
+> `MainActivity.checkWebViewVersion` reads `WebView.getCurrentWebViewPackage()` and
+> compares it against `WebViewVersion.MINIMUM_CHROME_MAJOR`, and a version the app
+> cannot parse is not treated as an old one. The result reaches the user as a toast,
+> not as a code: no production source contains the identifier `E102`, so this row is a
+> design record like the rest of the table.
+>
+> Kept as a design record. Do not write code that expects to receive these, and do not
+> cite a code in a bug report; no log line will contain one.
+
+### 7.1 Server Errors
+
+| Code | Name                | Description                               |
+| ---- | ------------------- | ----------------------------------------- |
+| E001 | SERVER_START_FAILED | Node.js failed to start                   |
+| E002 | SERVER_TIMEOUT      | Server didn't become ready within timeout |
+| E003 | SERVER_CRASH        | Server process exited unexpectedly        |
+| E004 | SERVER_OOM          | Server killed due to out-of-memory        |
+| E005 | PORT_IN_USE         | Localhost port already in use             |
+
+### 7.2 WebView Errors
+
+| Code | Name                | Description                                |
+| ---- | ------------------- | ------------------------------------------ |
+| E101 | WEBVIEW_CRASH       | WebView renderer process crashed           |
+| E102 | WEBVIEW_TOO_OLD     | WebView version below minimum (Chrome 125) |
+| E103 | WEBVIEW_LOAD_FAILED | Failed to load VS Code UI from localhost   |
+
+### 7.3 Binary Errors
+
+| Code | Name                  | Description                                   |
+| ---- | --------------------- | --------------------------------------------- |
+| E201 | EXTRACT_FAILED        | Failed to extract assets on first run         |
+| E202 | BINARY_NOT_FOUND      | Expected binary missing from nativeLibraryDir |
+| E203 | BINARY_NOT_EXECUTABLE | Binary lacks execute permission               |
+| E204 | STORAGE_FULL          | Insufficient storage for extraction           |
+
+### 7.4 Toolchain Errors
+
+| Code | Name            | Description                                          |
+| ---- | --------------- | ---------------------------------------------------- |
+| E301 | DOWNLOAD_FAILED | Toolchain asset pack download failed (network error) |
+| E302 | EXTRACT_FAILED  | Toolchain asset pack extraction failed               |
+| E303 | STORAGE_FULL    | Insufficient storage for toolchain                   |
+| E304 | ASSET_NOT_FOUND | Toolchain not available in Play Store asset packs    |
+| E305 | CONFIG_FAILED   | Failed to configure PATH/env for toolchain           |

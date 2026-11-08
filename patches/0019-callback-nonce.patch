@@ -1,0 +1,92 @@
+Register each sign-in identity when the workbench creates it.
+
+The native callback relay accepts only identities registered by the workbench,
+so an unrelated outgoing address cannot replace or reserve a callback nonce.
+Requests created before bridge initialization wait in a bounded private queue.
+The bridge-ready event flushes that queue and reports registration failure
+explicitly before deferred browser launches are released.
+
+The provider also owns an immutable document identity so a queued return cannot
+be delivered into a replacement page that reuses the same numeric request id.
+
+diff --git a/src/vs/code/browser/workbench/workbench.ts b/src/vs/code/browser/workbench/workbench.ts
+--- a/src/vs/code/browser/workbench/workbench.ts
++++ b/src/vs/code/browser/workbench/workbench.ts
+@@ -308,17 +308,60 @@
+ 	readonly onCallback = this._onCallback.event;
+ 
+ 	private pendingCallbacks = new Set<number>();
++	private readonly androidCallbacks = new Map<number, string>();
++	private readonly androidDocumentId = Array.from(crypto.getRandomValues(new Uint8Array(16)))
++		.map(b => b.toString(16).padStart(2, '0')).join('');
+ 	private lastTimeChecked = Date.now();
+ 	private checkCallbacksTimeout: Timeout | undefined = undefined;
+ 	private onDidChangeLocalStorageDisposable: IDisposable | undefined;
+ 
+ 	constructor(private readonly _callbackRoute: string) {
+ 		super();
++		Object.defineProperty(mainWindow, '__vscodroidCallbackDocumentId', { get: () => this.androidDocumentId });
++		this._register(addDisposableListener(mainWindow, 'vscodroid-bridge-ready', () => {
++			try {
++				this.flushAndroidCallbacks();
++			} catch (error) {
++				console.error(error);
++			}
++		}));
++		this.flushAndroidCallbacks();
++	}
++
++	private flushAndroidCallbacks(): void {
++		const browser = mainWindow as typeof mainWindow & {
++			AndroidBridge?: { registerAuthCallback(id: string, nonce: string, documentId: string, generation: number, token: string): boolean };
++			__vscodroid?: { authToken?: string; pageGeneration?: number; authCallbacksReady?: boolean };
++		};
++		if (!browser.AndroidBridge) {
++			this.androidCallbacks.clear();
++			return;
++		}
++		const metadata = browser.__vscodroid;
++		if (!metadata?.authToken || !Number.isSafeInteger(metadata.pageGeneration)) {
++			return;
++		}
++		try {
++			for (const [id, nonce] of this.androidCallbacks) {
++				if (!browser.AndroidBridge.registerAuthCallback(String(id), nonce, this.androidDocumentId, metadata.pageGeneration!, metadata.authToken)) {
++					throw new Error('The editor could not register this sign-in request. Reload the editor and try again.');
++				}
++				this.androidCallbacks.delete(id);
++			}
++		} catch (error) {
++			metadata.authCallbacksReady = false;
++			throw error;
++		}
+ 	}
+ 
+ 	create(options: Partial<UriComponents> = {}): URI {
+ 		const id = ++LocalStorageURLCallbackProvider.REQUEST_ID;
+ 		const queryParams: string[] = [`vscode-reqid=${id}`];
++
++		const nonce = Array.from(crypto.getRandomValues(new Uint8Array(16)))
++			.map(b => b.toString(16).padStart(2, '0'))
++			.join('');
++		queryParams.push(`vscodroid-nonce=${nonce}`);
+ 
+ 		for (const key of LocalStorageURLCallbackProvider.QUERY_KEYS) {
+ 			const value = options[key];
+@@ -332,6 +375,16 @@
+ 		// https://github.com/microsoft/vscode-dev/issues/62
+ 		// https://github.com/microsoft/vscode/blob/159479eb5ae451a66b5dac3c12d564f32f454796/extensions/github-authentication/src/githubServer.ts#L50-L50
+ 		if (!(options.authority === 'vscode.github-authentication' && options.path === '/dummy')) {
++			if (this.androidCallbacks.size >= 32) {
++				throw new Error('Too many pending sign-in requests. Reload the editor and try again.');
++			}
++			this.androidCallbacks.set(id, nonce);
++			try {
++				this.flushAndroidCallbacks();
++			} catch (error) {
++				this.androidCallbacks.delete(id);
++				throw error;
++			}
+ 			const key = `vscode-web.url-callbacks[${id}]`;
+ 			localStorage.removeItem(key);
+ 

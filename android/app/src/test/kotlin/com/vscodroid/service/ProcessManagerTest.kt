@@ -1,0 +1,4874 @@
+package com.vscodroid.service
+
+import android.app.ActivityManager
+import android.content.Context
+import com.vscodroid.util.Environment
+import com.vscodroid.util.PortFinder
+import com.vscodroid.util.Logger
+import io.mockk.every
+import io.mockk.just
+import io.mockk.mockk
+import io.mockk.mockkConstructor
+import io.mockk.mockkObject
+import io.mockk.unmockkAll
+import io.mockk.verify
+import io.mockk.Runs
+import org.junit.jupiter.api.AfterEach
+import org.junit.jupiter.api.Assertions.assertEquals
+import org.junit.jupiter.api.Assertions.assertFalse
+import org.junit.jupiter.api.Assertions.assertNotEquals
+import org.junit.jupiter.api.Assertions.assertNotNull
+import org.junit.jupiter.api.Assertions.assertNull
+import org.junit.jupiter.api.Assertions.assertTrue
+import org.junit.jupiter.api.Assumptions.assumeFalse
+import org.junit.jupiter.api.BeforeEach
+import org.junit.jupiter.api.Test
+import org.junit.jupiter.api.io.TempDir
+import org.junit.jupiter.params.ParameterizedTest
+import org.junit.jupiter.params.provider.ValueSource
+import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.CoroutineDispatcher
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.cancel
+import java.io.File
+import java.io.IOException
+import java.io.OutputStream
+import java.net.InetAddress
+import java.net.ServerSocket
+import java.nio.file.Files
+import java.nio.file.attribute.BasicFileAttributes
+import java.nio.file.attribute.PosixFilePermissions
+import java.util.Collections
+import java.util.UUID
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicReference
+import java.util.concurrent.TimeUnit
+import kotlin.concurrent.thread
+import kotlin.coroutines.CoroutineContext
+
+/**
+ * Tests for [ProcessManager]'s start guard and port allocation.
+ *
+ * Regression coverage for issue #3: the guard tested `serverProcess != null`,
+ * but only `stopServer()` ever cleared that field: the crash path left the
+ * dead Process referenced. Every automatic restart after an unexpected exit
+ * was therefore refused, and the app stayed wedged until it was relaunched.
+ *
+ * [Environment] is stubbed so the spawned command is `/bin/echo`, which lets a
+ * start actually succeed without the bundled Node binary. The private state is
+ * reached by reflection rather than widening the production API for a test.
+ */
+class ProcessManagerTest {
+
+    @TempDir
+    lateinit var tempDir: File
+
+    private lateinit var manager: ProcessManager
+    private lateinit var contextMock: Context
+
+    @BeforeEach
+    fun setUp() {
+        // Mock Logger to avoid android.util.Log crashes in JVM tests
+        mockEditorGateway()
+        mockkObject(Logger)
+        every { Logger.w(any(), any(), any()) } just Runs
+        // `Logger.w` and `Logger.e` take a defaulted throwable rather than having
+        // a two-argument overload, and mockk matches on the arity of the call.
+        // A two-argument call left unstubbed reaches android.util.Log, which is
+        // not mocked and throws, so both arities are stubbed.
+        every { Logger.w(any(), any()) } just Runs
+        every { Logger.i(any(), any()) } just Runs
+        every { Logger.d(any(), any()) } just Runs
+        every { Logger.e(any(), any(), any()) } just Runs
+        every { Logger.e(any(), any()) } just Runs
+
+        mockkObject(Environment)
+        every { Environment.getNodePath(any()) } returns "/bin/echo"
+        every { Environment.getServerScript(any()) } returns "server.js"
+        every { Environment.buildProcessEnvironment(any(), any()) } returns emptyMap()
+        every { Environment.getExtensionsDir(any()) } returns "extensions"
+        every { Environment.getUserDataDir(any()) } returns "data"
+        every { Environment.getLogsDir(any()) } returns "logs"
+
+        contextMock = mockk<Context>(relaxed = true)
+        every { contextMock.cacheDir } returns tempDir
+        every { contextMock.filesDir } returns tempDir
+
+        manager = ProcessManager(contextMock)
+    }
+
+    @AfterEach
+    fun tearDown() {
+        manager.stopServer()
+        unmockkAll()
+    }
+
+    @Test
+    fun `refuses to start while the process is alive`() {
+        manager.serverProcessField = mockk<Process>(relaxed = true) {
+            every { isAlive } returns true
+        }
+
+        assertFalse(manager.startServer(), "a live server must not be started twice")
+        assertEquals(0, manager.port, "the guard must reject before a port is taken")
+    }
+
+    @Test
+    fun `starts again after the process has died`() {
+        // The crash path leaves this reference in place; it must not block a restart.
+        val dead = mockk<Process>(relaxed = true) { every { isAlive } returns false }
+        manager.serverProcessField = dead
+
+        assertTrue(startAndAwaitWatchdog(), "a dead server must be restartable")
+        assertNotEquals(dead, manager.serverProcessField, "the dead reference must be replaced")
+    }
+
+    @Test
+    fun `the editor backend receives a private socket path`() {
+        val output = AtomicReference<String?>(null)
+        val read = CountDownLatch(1)
+        manager.onServerOutput = { output.set(it); read.countDown() }
+
+        assertTrue(startAndAwaitWatchdog())
+        assertTrue(read.await(5, TimeUnit.SECONDS), "the spawned command was never read")
+
+        val socketPath = Regex("--socket-path=([^ ]+)").find(output.get().orEmpty())?.groupValues?.get(1)
+        assertNotNull(socketPath, "the editor still binds the public TCP port")
+        assertTrue(socketPath!!.startsWith(tempDir.canonicalPath + "/"), "the backend is outside app-private storage")
+    }
+
+    @Test
+    fun `stopping the backend keeps the public origin reserved`() {
+        val gateway = EditorGateway()
+        every { EditorGateway.instance } returns gateway
+        try {
+            assertTrue(startAndAwaitWatchdog())
+            val publicPort = manager.port
+            assertFalse(PortFinder.isPortAvailable(publicPort), "the application does not own its public origin")
+
+            manager.stopServer()
+
+            assertFalse(PortFinder.isPortAvailable(publicPort), "Stop released the live WebView origin")
+        } finally {
+            gateway.close()
+            mockEditorGateway()
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = [false, true])
+    fun `a manager routes only through its selected gateway`(isolated: Boolean) {
+        val applicationGateway = EditorGateway.instance
+        val selected = if (isolated) mockk<EditorGateway>(relaxed = true) else applicationGateway
+        if (isolated) {
+            var bound: Int? = null
+            every { selected.boundPort } answers { bound }
+            every { selected.bind(any()) } answers { firstArg<Int>().also { bound = it } }
+        }
+        manager = if (isolated) ProcessManager(contextMock, selected) else {
+            ProcessManager::class.java.getConstructor(Context::class.java).newInstance(contextMock)
+        }
+
+        assertTrue(startAndAwaitWatchdog())
+        verify(exactly = 1) { selected.bind(any()) }
+        verify(exactly = 1) { selected.selectBackend(any(), any()) }
+        manager.stopServer()
+        verify(exactly = 1) { selected.withdrawBackend(any()) }
+        if (isolated) {
+            verify(exactly = 0) { applicationGateway.bind(any()) }
+            verify(exactly = 0) { applicationGateway.selectBackend(any(), any()) }
+            verify(exactly = 0) { applicationGateway.withdrawBackend(any()) }
+        }
+    }
+
+    @Test
+    fun `a public listener bind failure never spawns an editor backend`() {
+        val gateway = EditorGateway.instance
+        every { gateway.bind(any()) } throws java.io.IOException("No descriptors")
+
+        assertFalse(manager.startServer())
+
+        assertNull(manager.serverProcessField)
+        verify(exactly = 5) { gateway.bind(any()) }
+        verify(exactly = 0) { Environment.buildProcessEnvironment(any(), any()) }
+    }
+
+    @Test
+    fun `a bootstrap is ended if closing its input pipe fails`() {
+        val child = ProcessBuilder("/bin/sleep", "30").start()
+        val wrapped = object : Process() {
+            override fun getOutputStream() = object : OutputStream() {
+                override fun write(value: Int) = child.outputStream.write(value)
+                override fun close() {
+                    child.outputStream.close()
+                    throw IOException("Controlled input pipe close failure")
+                }
+            }
+            override fun getInputStream() = child.inputStream
+            override fun getErrorStream() = child.errorStream
+            override fun waitFor() = child.waitFor()
+            override fun waitFor(timeout: Long, unit: TimeUnit) = child.waitFor(timeout, unit)
+            override fun exitValue() = child.exitValue()
+            override fun destroy() = child.destroy()
+            override fun isAlive() = child.isAlive
+        }
+        mockkConstructor(ProcessBuilder::class)
+        every { anyConstructed<ProcessBuilder>().start() } returns wrapped
+        try {
+            assertFalse(manager.startServer())
+            assertTrue(child.waitFor(3, TimeUnit.SECONDS), "the failed launch left its bootstrap running")
+            assertNull(manager.serverProcessField)
+        } finally {
+            child.destroyForcibly()
+            assertTrue(child.waitFor(3, TimeUnit.SECONDS))
+        }
+    }
+
+    @Test
+    fun `a backend socket is refused when files points outside app data`() {
+        val app = File(tempDir, "app").apply { mkdirs() }
+        val outside = File(tempDir, "shared").apply { mkdirs() }
+        val files = File(app, "files")
+        Files.createSymbolicLink(files.toPath(), outside.toPath())
+        every { contextMock.filesDir } returns files
+
+        assertNull(editorBackendSocket(contextMock, "private-run"), "the backend escaped its private app root")
+    }
+
+    @Test
+    fun `a redirected files directory is refused before the origin is reserved`() {
+        val app = File(tempDir, "app").apply { mkdirs() }
+        val outside = File(tempDir, "shared").apply { mkdirs() }
+        val files = File(app, "files")
+        Files.createSymbolicLink(files.toPath(), outside.toPath())
+        every { contextMock.filesDir } returns files
+        val gateway = EditorGateway.instance
+
+        assertFalse(manager.startServer())
+
+        verify(exactly = 0) { gateway.bind(any()) }
+        verify(exactly = 0) { Environment.buildProcessEnvironment(any(), any()) }
+    }
+
+    @Test
+    fun `an app data alias still yields a private backend socket`() {
+        val app = File(tempDir, "app").apply { mkdirs() }
+        val files = File(app, "files").apply { mkdirs() }
+        val alias = File(tempDir, "alias")
+        Files.createSymbolicLink(alias.toPath(), app.toPath())
+        every { contextMock.filesDir } returns File(alias, "files")
+
+        assertEquals(files.canonicalFile, editorBackendSocket(contextMock, "private-run")?.parentFile)
+    }
+
+    @Test
+    fun `a previous watchdog cannot withdraw a replacement server`() {
+        val fixture = File(tempDir, "server-fixture.sh").apply {
+            writeText("#!/bin/sh\nexec /bin/sleep 20\n")
+            check(setExecutable(true))
+        }
+        every { Environment.getNodePath(any()) } returns fixture.path
+        val waiting = CountDownLatch(1)
+        val exited = CountDownLatch(1)
+        val reported = AtomicReference<Int?>(null)
+        val previous = mockk<Process>(relaxed = true) {
+            every { isAlive } returns false
+            every { waitFor() } answers {
+                waiting.countDown()
+                check(exited.await(5, TimeUnit.SECONDS))
+                137
+            }
+            every { waitFor(any(), any()) } returns true
+            every { exitValue() } returns 137
+        }
+        manager.serverProcessField = previous
+        manager.onServerCrashed = { reported.set(it) }
+        ProcessManager::class.java.getDeclaredMethod("startWatchdog").apply {
+            isAccessible = true
+        }.invoke(manager)
+        val previousWatch = field("watchdogThread").get(manager) as Thread
+        try {
+            assertTrue(waiting.await(5, TimeUnit.SECONDS), "the previous watchdog never waited")
+            synchronized(field("readinessLock").get(manager)!!) {
+                exited.countDown()
+                val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5)
+                while (previousWatch.state != Thread.State.BLOCKED && System.nanoTime() < deadline) {
+                    Thread.yield()
+                }
+                assertEquals(Thread.State.BLOCKED, previousWatch.state)
+                manager.stopServer()
+                assertTrue(manager.startServer(), "the replacement server must start")
+                manager.readyField = true
+                assertTrue(manager.isRunning(), "the replacement must still be running")
+            }
+            previousWatch.join(5_000)
+            assertFalse(previousWatch.isAlive, "the previous watchdog did not finish")
+            assertNull(reported.get(), "the previous exit was reported against the replacement")
+            assertTrue(manager.isReady(), "the previous watchdog withdrew replacement readiness")
+        } finally {
+            exited.countDown()
+            manager.stopServer()
+            previousWatch.interrupt()
+            previousWatch.join(5_000)
+        }
+    }
+
+    @Test
+    fun `a queued crash is discarded after the server is stopped`() {
+        val pending = ArrayDeque<Runnable>()
+        val scope = CoroutineScope(object : CoroutineDispatcher() {
+            override fun dispatch(context: CoroutineContext, block: Runnable) {
+                pending.addLast(block)
+            }
+        })
+        val handled = mutableListOf<Int>()
+        try {
+            dispatchServerCrash(scope, manager, 137) { exitCode, _ -> handled += exitCode }
+            assertEquals(1, pending.size, "the crash must still be waiting for the service dispatcher")
+            manager.stopServer()
+            pending.removeFirst().run()
+            assertTrue(handled.isEmpty(), "an old crash reached the handler after a stop")
+        } finally {
+            scope.cancel()
+        }
+    }
+
+    @Test
+    fun `a queued crash for the current server reaches the handler`() {
+        val pending = ArrayDeque<Runnable>()
+        val scope = CoroutineScope(object : CoroutineDispatcher() {
+            override fun dispatch(context: CoroutineContext, block: Runnable) {
+                pending.addLast(block)
+            }
+        })
+        val handled = mutableListOf<Int>()
+        try {
+            dispatchServerCrash(scope, manager, 137) { exitCode, _ -> handled += exitCode }
+            assertEquals(1, pending.size)
+            pending.removeFirst().run()
+            assertEquals(listOf(137), handled, "the current server's crash must still be handled")
+        } finally {
+            scope.cancel()
+        }
+    }
+
+    @Test
+    fun `heap attribution reads only the matching server epoch`() {
+        manager.heapOverrideActiveField = true
+        field("heapOverrideAskedMb").set(manager, 640)
+        val endedEpoch = manager.serverEpoch
+        assertEquals(640, manager.heapOverrideValueInEffect(endedEpoch))
+
+        manager.stopServer()
+        manager.heapOverrideActiveField = true
+        field("heapOverrideAskedMb").set(manager, 768)
+
+        assertNull(manager.heapOverrideValueInEffect(endedEpoch))
+        assertEquals(768, manager.heapOverrideValueInEffect(manager.serverEpoch))
+    }
+
+    @Test
+    fun `keeps the port across a restart`() {
+        // The WebView's loaded URL and the WebViewClient are bound to the port and are
+        // not rebuilt on restart, so it has to stay put. (This named the bridge's
+        // allowed-origin check as the second binding until #144 removed that check.)
+        manager.portField = 45678
+        manager.serverProcessField = mockk<Process>(relaxed = true) {
+            every { isAlive } returns false
+        }
+
+        assertTrue(startAndAwaitWatchdog())
+        assertEquals(45678, manager.port, "restart must reuse the original port")
+    }
+
+    @Test
+    fun `a file sitting where TMPDIR belongs is reported rather than ignored`() {
+        // `exists()` answers "something is here" and the code meant "a usable
+        // directory is here". They agree in every case anyone pictures (the path
+        // is absent, or it is the directory we made last time), and part company
+        // when a file is there, at which point `mkdirs()` cannot succeed and its
+        // false was being discarded.
+        //
+        // Not cosmetic: this path is TMPDIR and TMUX_TMPDIR for the server, so
+        // the consequence arrives later as temporary-file failures with nothing
+        // pointing back here.
+        val warnings = mutableListOf<String>()
+        every { Logger.w(any(), any()) } answers { warnings += secondArg<String>() }
+
+        val blocker = File(tempDir, "tmp")
+        check(blocker.createNewFile()) { "could not create the fixture" }
+        check(blocker.isFile) { "the fixture must be a file, or this proves nothing" }
+
+        assertTrue(
+            startAndAwaitWatchdog(),
+            "a broken TMPDIR must not stop a start; a server with one is far better " +
+                "than no server",
+        )
+        assertTrue(
+            warnings.any { it.contains(blocker.path) },
+            "the failure was discarded rather than reported: $warnings",
+        )
+    }
+
+    @Test
+    fun `a usable TMPDIR is left alone and says nothing`() {
+        // Control for the case above. Without it, code that warned unconditionally
+        // would satisfy it while telling the user their TMPDIR was broken on every
+        // healthy start.
+        val warnings = mutableListOf<String>()
+        every { Logger.w(any(), any()) } answers { warnings += secondArg<String>() }
+
+        check(File(tempDir, "tmp").mkdirs()) { "could not create the fixture" }
+
+        assertTrue(startAndAwaitWatchdog())
+        assertTrue(
+            warnings.none { it.contains("TMPDIR") },
+            "a working TMPDIR must not be reported as broken: $warnings",
+        )
+    }
+
+    @Test
+    fun `a restart does not care whether the port is still free`() {
+        // Deliberate, and the opposite of what it looks like. A restart used to
+        // refuse when something already held the port, on the reasoning that the
+        // holder would satisfy the health probe and refill the restart budget.
+        // The reasoning about the budget was right; the conclusion was not, and
+        // this pins the behaviour that replaced it so nobody restores the check
+        // without reading why it went.
+        //
+        // The holder in the case that matters is not a stranger. It is our own
+        // editor server, surviving a SIGKILL of the parent that forked it -- a
+        // live, working server that the open WebView is still talking to.
+        // Refusing to start took that editor away from the user to fix
+        // bookkeeping, and could not recover afterwards: the port is resolved only
+        // while it is zero, so the refusal repeated for the life of the instance.
+        //
+        // StubServer(null) holds the port without serving on it, so this asserts
+        // the start proceeds because of the port's state and not because of
+        // anything the holder answers.
+        val holder = StubServer(null)
+        try {
+            manager.portField = holder.port
+
+            assertTrue(
+                startAndAwaitWatchdog(),
+                "a held port must not stop a restart; the surviving server is usually " +
+                    "ours, and the user is still using it",
+            )
+            assertEquals(
+                holder.port, manager.port,
+                "and the port must still be the one the WebView is bound to",
+            )
+        } finally {
+            holder.stop()
+        }
+    }
+
+    @Test
+    fun `allocates a port on the first start`() {
+        assertTrue(startAndAwaitWatchdog())
+        assertNotEquals(0, manager.port, "the first start must allocate a port")
+    }
+
+    @Test
+    fun `the shutdown flag is set before the process is destroyed`() {
+        // The watchdog decides crash-versus-stop by reading isShuttingDown, and it
+        // wakes the moment the child dies. So the flag has to be true *before*
+        // destroy() is called; set afterwards, the watchdog can read a stale false,
+        // call it a crash, and restart the server the user just asked to stop.
+        //
+        // On a phone that is not cosmetic. The server holds the foreground service
+        // and the extension host, so a stop that silently restarts leaves the
+        // process alive after the user believed they had ended it.
+        //
+        // Asserted at the moment of destroy() rather than by watching for a
+        // restart. A behavioural test was tried first and did not discriminate:
+        // with the assignment moved one line down it still passed, because the
+        // child takes long enough to die that the flag is set before the watchdog
+        // can observe it. A test of ordering has to observe the ordering; racing
+        // it only measures how fast the machine is.
+        val flagWhenDestroyed = AtomicBoolean(false)
+        val process = mockk<Process>(relaxed = true) {
+            every { isAlive } returns true
+            every { destroy() } answers { flagWhenDestroyed.set(manager.isShuttingDownField) }
+        }
+        manager.serverProcessField = process
+
+        manager.stopServer()
+
+        assertTrue(
+            flagWhenDestroyed.get(),
+            "isShuttingDown must already be true when the process is destroyed"
+        )
+    }
+
+    @Test
+    fun `a stop that does not finish in time force-kills rather than waiting on`() {
+        // Two invariants in one, and the issue that prompted this asked for
+        // neither directly. The wait must be BOUNDED -- the notification's Stop
+        // action reaches here on the main thread, and anything dispatched behind
+        // it waits too, which is what users saw as a freeze. And when the budget
+        // elapses the process must be killed outright, because shortening a wait
+        // without the forcible kill trades a freeze for an orphaned Node.
+        val process = mockk<Process>(relaxed = true) {
+            every { isAlive } returns true
+            // The server ignores SIGTERM in this scenario -- the case the budget
+            // exists for.
+            every { waitFor(any(), any()) } returns false
+        }
+        manager.serverProcessField = process
+
+        manager.stopServer()
+
+        verify(exactly = 1) { process.waitFor(any(), any()) }
+        verify(exactly = 1) { process.destroyForcibly() }
+        // The unbounded overload would hang the caller forever, which is the
+        // shape this replaced elsewhere in the app.
+        verify(exactly = 0) { process.waitFor() }
+    }
+
+    /**
+     * Writes the note `assets/server.js` leaves naming the editor server it forked,
+     * with a `/proc` entry that still says it is one.
+     *
+     * The same fixture [AdoptionTest] builds; restated here because that class is
+     * about the start and this pair is about the stop.
+     */
+    private fun recordEditorServer(pid: Int, port: Int) {
+        manager.portField = port
+        File(tempDir, "server").mkdirs()
+        File(tempDir, "server/editor-server.pid").writeText("""{"pid":$pid,"port":$port,"runId":"stop-fixture"}""")
+        field("serverRunId").set(manager, "stop-fixture")
+        File(tempDir, "proc/$pid").mkdirs()
+        File(tempDir, "proc/$pid/cmdline")
+            .writeText("/lib/libnode.so\u0000/data/server/vscode-reh/out/server-main.js\u0000")
+        File(tempDir, "proc/$pid/environ").writeText("VSCODROID_SERVER_RUN_ID=stop-fixture\u0000")
+        manager.procDirField = File(tempDir, "proc")
+    }
+
+    @Test
+    fun `a stop that force-kills the bootstrap also ends the server it forked`() {
+        // The other half of the forcible kill, and the half that was missing.
+        // `destroyForcibly` is a SIGKILL, `assets/server.js` forwards nothing when
+        // it gets one, and `fork()` sets no PDEATHSIG, so the editor server it
+        // forked outlives the stop still holding the port. Nothing clears the note
+        // naming it either -- that is deleted from the CHILD's exit handler -- so
+        // the state a stop left behind was exactly the orphan the adoption branch
+        // exists for: a second Node process holding the port and its heap, with no
+        // service, no notification and no way for the user to end it.
+        //
+        // The bootstrap's own SIGTERM handler covers the ordinary stop, forwarding
+        // and then escalating well inside the wait, so what this case is about is
+        // a bootstrap that never ran it.
+        val killed = mutableListOf<Int>()
+        manager.killRecordedProcess = { killed += it }
+        recordEditorServer(pid = 8123, port = 13400)
+        val process = mockk<Process>(relaxed = true) {
+            every { isAlive } returns true
+            // The bootstrap does not answer the SIGTERM, which is the case the
+            // forcible kill exists for and the only case that orphans the child.
+            every { waitFor(any(), any()) } returns false
+        }
+        manager.serverProcessField = process
+
+        manager.stopServer()
+
+        assertEquals(
+            listOf(8123), killed,
+            "the recorded pid is the only handle this class has on the forked server",
+        )
+    }
+
+    @Test
+    fun `a stop the bootstrap answers leaves the recorded pid alone`() {
+        // The guard on the reap above, and not a no-op assertion. A bootstrap that
+        // exited did so from its child's exit handler, so that child is already
+        // gone and the note it left was deleted in the same handler. A note still
+        // sitting there after a clean stop therefore belongs to something started
+        // since, and signalling it would end a server this stop has nothing to do
+        // with.
+        val killed = mutableListOf<Int>()
+        manager.killRecordedProcess = { killed += it }
+        recordEditorServer(pid = 8123, port = 13400)
+        val process = mockk<Process>(relaxed = true) {
+            every { isAlive } returns true
+            every { waitFor(any(), any()) } returns true
+        }
+        manager.serverProcessField = process
+
+        manager.stopServer()
+
+        assertTrue(killed.isEmpty(), "a stop the bootstrap completed has nothing left to reap")
+    }
+
+    @Test
+    fun `stopping a second time touches nothing and reports nothing running`() {
+        // Two callers now stop the same server on one Stop press. NodeService
+        // does it inline when the notification action arrives, because a service
+        // that is started *and* bound is not destroyed by stopSelf() alone, and
+        // then Service.onDestroy does it again once the activity finishes and
+        // releases the binding. The second call has to be harmless as a property
+        // of this class rather than as an accident of ordering, because which
+        // one runs second depends on how quickly the activity goes away.
+        val process = mockk<Process>(relaxed = true) {
+            every { isAlive } returns true
+            every { waitFor(any(), any()) } returns true
+        }
+        manager.serverProcessField = process
+
+        manager.stopServer()
+        assertNull(manager.serverProcessField, "the first stop must release the process")
+
+        manager.stopServer()
+
+        assertNull(manager.serverProcessField, "the second stop must not resurrect anything")
+        assertFalse(manager.isRunning(), "a stopped server must not report itself alive")
+        // Once, from the first call. A destroy issued against an already-reaped
+        // process is where a double stop would start signalling a PID the system
+        // has since handed to something else.
+        verify(exactly = 1) { process.destroy() }
+    }
+
+    @Test
+    fun `the derived heap ceiling reaches the command line`() {
+        // The wire, not the predicate. HeapCeilingTest pins how the number is
+        // computed and says nothing about whether it is used: replacing
+        // "--max-old-space-size=$heapMb" with a literal 512 left all of those
+        // green, because heapMb stayed referenced by the log line beside it and
+        // the file still compiled.
+        //
+        // The command line is already observable. startServer spawns /bin/echo
+        // in this fixture and redirects stderr into stdout, so the process
+        // prints its own arguments and onServerOutput receives them. Nothing had
+        // to be added to production code to see them -- the seam was already
+        // there, unused.
+        //
+        // 3 GB is chosen so the expected ceiling is 384, which no literal in the
+        // production path happens to equal. Asserting against 512 would have
+        // passed against the very mutation this exists to catch.
+        val am = mockk<ActivityManager>(relaxed = true) {
+            every { isLowRamDevice } returns false
+            every { getMemoryInfo(any()) } answers {
+                firstArg<ActivityManager.MemoryInfo>().totalMem = 3L * 1024 * 1024 * 1024
+            }
+        }
+        every { contextMock.getSystemService(ActivityManager::class.java) } returns am
+
+        val expected = heapCeilingMb(3L * 1024, isLowRam = false)
+        assertNotEquals(
+            HEAP_CEILING_DEFAULT_MB, expected,
+            "the fixture must not pick the value a regression would also produce"
+        )
+
+        val output = StringBuilder()
+        val printed = CountDownLatch(1)
+        manager.onServerOutput = { line -> output.append(line).append('\n'); printed.countDown() }
+
+        // Through the helper, not startServer() directly: the output latch fires
+        // when echo prints, which is before it exits, so waiting on that alone
+        // would leave the watchdog thread running into the next test class and
+        // logging through a Logger mock that unmockkAll() has already torn down.
+        assertTrue(startAndAwaitWatchdog(), "the fixture server must start")
+        assertTrue(printed.await(5, TimeUnit.SECONDS), "the spawned process never printed its arguments")
+
+        assertTrue(
+            output.contains("--max-old-space-size=$expected"),
+            "the derived ceiling must reach the command line; got: $output"
+        )
+        // The control for `a ceiling that has spent its budget does not reach the
+        // command line`. Without it a flag stuck at true would satisfy that case,
+        // and the notification would tell every user their setting had been turned
+        // off when they never had one.
+        assertFalse(
+            manager.heapOverrideIgnored(),
+            "a start that had no setting to ignore must not report one",
+        )
+    }
+
+    @Test
+    fun `a ceiling set in settings json reaches the command line, clamped`() {
+        // The wire for the override arm, and the counterpart of `the derived heap
+        // ceiling reaches the command line`. The pure functions above settle what
+        // the number should be; nothing there notices if the settings file is never
+        // opened, and the derived arm would go on producing a plausible number.
+        //
+        // The fixture asks for more than the device can hold on purpose, so the
+        // number that has to appear is the CLAMPED one. A test that asked for
+        // something already legal would pass against a wiring that skipped the
+        // clamp, which is the half that carries the safety argument.
+        //
+        // 3 GiB of visible RAM gives an override maximum of 768, a quarter of it, so
+        // a request of 4096 must arrive as 768. That collides with HEAP_CEILING_MAX_MB,
+        // so the sizes are chosen again below to keep the assertion discriminating.
+        val totalMb = 6L * 1024
+        val am = mockk<ActivityManager>(relaxed = true) {
+            every { isLowRamDevice } returns false
+            every { getMemoryInfo(any()) } answers {
+                firstArg<ActivityManager.MemoryInfo>().totalMem = totalMb * 1024 * 1024
+            }
+        }
+        every { contextMock.getSystemService(ActivityManager::class.java) } returns am
+
+        val settings = File(tempDir, "Machine/settings.json").apply {
+            parentFile!!.mkdirs()
+            // One key per line, which is what every writer of this file produces:
+            // the workbench's settings editor, and FirstRunSetup.insertSetting.
+            // The reader is anchored to the start of a line, so a fixture that put
+            // the key beside the brace would be rejected for a reason that has
+            // nothing to do with the wiring under test.
+            writeText("{\n    \"vscodroid.server.heapCeilingMb\": 4096,\n}\n")
+        }
+        every { Environment.getMachineSettingsPath(any()) } returns settings.path
+
+        // A quarter of 6144 is 1536, so the request is clamped to the absolute cap.
+        val expected = heapOverrideMaxMb(totalMb)
+        assertEquals(HEAP_OVERRIDE_ABS_MAX_MB, expected, "the fixture must exercise the clamp")
+        assertNotEquals(
+            heapCeilingMb(totalMb, isLowRam = false), expected,
+            "the fixture must not pick the number the derived arm would also produce",
+        )
+        assertNotEquals(
+            4096, expected,
+            "the fixture must not pick a number an unclamped wiring would also produce",
+        )
+
+        val output = StringBuilder()
+        val printed = CountDownLatch(1)
+        manager.onServerOutput = { line -> output.append(line).append('\n'); printed.countDown() }
+
+        assertTrue(startAndAwaitWatchdog(), "the fixture server must start")
+        assertTrue(printed.await(5, TimeUnit.SECONDS), "the spawned process never printed its arguments")
+
+        assertTrue(
+            output.contains("--max-old-space-size=$expected"),
+            "the clamped override must reach the command line; got: $output",
+        )
+        assertTrue(
+            manager.heapOverrideInEffect(),
+            "a spawn that honoured the user's number must say so, or the kill latch " +
+                "charges the wrong party",
+        )
+    }
+
+    @Test
+    fun `exactly one heap flag reaches the command line`() {
+        // The Worker shim in patches/0003 matches --max-old-space-size=(\d+) and
+        // takes the LAST it sees when re-expressing it as a resource limit, so a
+        // second flag would silently decide the Extension Host's budget while the
+        // main isolate used the first. Cheap to assert, and invisible otherwise.
+        val output = StringBuilder()
+        val printed = CountDownLatch(1)
+        manager.onServerOutput = { line -> output.append(line).append('\n'); printed.countDown() }
+
+        assertTrue(startAndAwaitWatchdog(), "the fixture server must start")
+        assertTrue(printed.await(5, TimeUnit.SECONDS), "the spawned process never printed its arguments")
+
+        assertEquals(
+            1,
+            Regex("--max-old-space-size=").findAll(output).count(),
+            "there must be exactly one heap flag on the command line; got: $output",
+        )
+    }
+
+    @Test
+    fun `a ceiling that has spent its budget does not reach the command line`() {
+        // The latch's arithmetic is pinned by HeapOverrideLatchTest and its counting
+        // site by HeapLatchCallSiteTest. Neither notices if the START never consults
+        // the count, which is the arm that actually protects the user: without it
+        // the value is disabled in a preference nobody reads and the server keeps
+        // being spawned with it forever.
+        val totalMb = 6L * 1024
+        val am = mockk<ActivityManager>(relaxed = true) {
+            every { isLowRamDevice } returns false
+            every { getMemoryInfo(any()) } answers {
+                firstArg<ActivityManager.MemoryInfo>().totalMem = totalMb * 1024 * 1024
+            }
+        }
+        every { contextMock.getSystemService(ActivityManager::class.java) } returns am
+
+        val settings = File(tempDir, "Machine/settings.json").apply {
+            parentFile!!.mkdirs()
+            writeText("{\n    \"vscodroid.server.heapCeilingMb\": 4096,\n}\n")
+        }
+        every { Environment.getMachineSettingsPath(any()) } returns settings.path
+
+        // The value recorded as seen must be the same 4096, or heapKillsForValue
+        // hands back a fresh budget and this proves nothing. That is the whole
+        // fixture: a budget spent against THIS value.
+        val prefs = mockk<android.content.SharedPreferences>(relaxed = true) {
+            every { getInt(PREF_HEAP_VALUE_SEEN, any()) } returns 4096
+            every { getInt(PREF_HEAP_KILLS, any()) } returns HEAP_OVERRIDE_KILL_BUDGET
+        }
+        every { contextMock.getSharedPreferences(HEAP_PREFS_NAME, any()) } returns prefs
+
+        val output = StringBuilder()
+        val printed = CountDownLatch(1)
+        manager.onServerOutput = { line -> output.append(line).append('\n'); printed.countDown() }
+
+        assertTrue(startAndAwaitWatchdog(), "the fixture server must start")
+        assertTrue(printed.await(5, TimeUnit.SECONDS), "the spawned process never printed its arguments")
+
+        assertTrue(
+            output.contains("--max-old-space-size=${heapCeilingMb(totalMb, isLowRam = false)}"),
+            "a suspended ceiling must fall back to the derived one; got: $output",
+        )
+        assertFalse(
+            output.contains("--max-old-space-size=${heapOverrideMaxMb(totalMb)}"),
+            "the suspended value must not reach the command line at all; got: $output",
+        )
+        assertFalse(
+            manager.heapOverrideInEffect(),
+            "a value that was not honoured must not be charged for the next kill",
+        )
+        // And the user has to be able to find out. The suspension is raised once,
+        // through a callback that is null with no activity bound and into a notice
+        // the very next launch clears as its first statement, while the suspension
+        // itself lasts until they edit the value. This is what NodeService puts on
+        // the foreground card, which outlives both.
+        assertTrue(
+            manager.heapOverrideIgnored(),
+            "a setting the start refused to use must be answerable somewhere the " +
+                "user can still see it",
+        )
+    }
+
+    @Test
+    fun `the value honoured and the kills against it are written down`() {
+        // The read side of the latch is covered above and by HeapOverrideLatchTest;
+        // nothing covered the WRITE, and the pair written here is the latch's whole
+        // memory. heapKillsForValue compares the value recorded as seen against the
+        // one asked for now, and NodeService counts kills onto the number stored
+        // beside it. Delete this one statement and both reads answer 0 for ever: a
+        // value that has killed the server ten times is honoured on the eleventh
+        // start, the notice telling the user why their ceiling stopped applying
+        // never appears, and nothing else in the suite goes red.
+        val totalMb = 6L * 1024
+        val am = mockk<ActivityManager>(relaxed = true) {
+            every { isLowRamDevice } returns false
+            every { getMemoryInfo(any()) } answers {
+                firstArg<ActivityManager.MemoryInfo>().totalMem = totalMb * 1024 * 1024
+            }
+        }
+        every { contextMock.getSystemService(ActivityManager::class.java) } returns am
+
+        val settings = File(tempDir, "Machine/settings.json").apply {
+            parentFile!!.mkdirs()
+            writeText("{\n    \"vscodroid.server.heapCeilingMb\": 4096,\n}\n")
+        }
+        every { Environment.getMachineSettingsPath(any()) } returns settings.path
+
+        // A preference file that remembers, rather than a relaxed mock that
+        // discards: what is being asserted is what a later read would find, and a
+        // mock that swallows every put would satisfy a `verify` on the put alone.
+        val stored = mutableMapOf<String, Int>()
+        var commits = 0
+        val editor = mockk<android.content.SharedPreferences.Editor>(relaxed = true)
+        every { editor.putInt(any(), any()) } answers {
+            stored[firstArg()] = secondArg()
+            editor
+        }
+        every { editor.commit() } answers { commits++; true }
+        val prefs = mockk<android.content.SharedPreferences>(relaxed = true) {
+            every { getInt(any(), any()) } answers { stored[firstArg<String>()] ?: secondArg() }
+            every { edit() } returns editor
+        }
+        every { contextMock.getSharedPreferences(HEAP_PREFS_NAME, any()) } returns prefs
+
+        assertTrue(startAndAwaitWatchdog(), "the fixture server must start")
+
+        assertEquals(
+            4096, stored[PREF_HEAP_VALUE_SEEN],
+            "the value the user asked for was not recorded, so the next start cannot " +
+                "tell a value that has been killing this device from one they changed. " +
+                "Stored: $stored",
+        )
+        assertEquals(
+            0, stored[PREF_HEAP_KILLS],
+            "the count against this value was not recorded, so every kill charged to " +
+                "it lands on a number nothing keeps. Stored: $stored",
+        )
+        // PortFinder writes to this same preference file and ends with apply(), so
+        // counting commits rather than edits is what keeps this about the latch.
+        // One commit, because a switch to apply() here is the regression that
+        // records the pair and then loses it to the SIGKILL it is recording.
+        assertEquals(
+            1, commits,
+            "the pair must be committed, not applied: what it has to survive is the " +
+                "kill of this app's own process, and apply() is what loses that race",
+        )
+    }
+
+    @Test
+    fun `a device that ignores the request is not charged for its kills`() {
+        // The attribution bug this closes was in the obvious spelling: setting the
+        // flag from "a request was present" rather than "a request was taken". On a
+        // low-RAM device the request is not taken, the derived floor is what runs,
+        // and a flag set anyway hands the next SIGKILL to a value the device never
+        // ran with. Three of those disable a setting the user never got to try, and
+        // nothing anywhere would say why.
+        //
+        // 8 GB so the derived arm reaches the cap and not the floor: the assertion
+        // below is that 256 came from the low-RAM flag, and on a small total it
+        // would come from the arithmetic too.
+        val am = mockk<ActivityManager>(relaxed = true) {
+            every { isLowRamDevice } returns true
+            every { getMemoryInfo(any()) } answers {
+                firstArg<ActivityManager.MemoryInfo>().totalMem = 8L * 1024 * 1024 * 1024
+            }
+        }
+        every { contextMock.getSystemService(ActivityManager::class.java) } returns am
+
+        val settings = File(tempDir, "Machine/settings.json").apply {
+            parentFile!!.mkdirs()
+            writeText("{\n    \"vscodroid.server.heapCeilingMb\": 1024,\n}\n")
+        }
+        every { Environment.getMachineSettingsPath(any()) } returns settings.path
+
+        val output = StringBuilder()
+        val printed = CountDownLatch(1)
+        manager.onServerOutput = { line -> output.append(line).append('\n'); printed.countDown() }
+
+        assertTrue(startAndAwaitWatchdog(), "the fixture server must start")
+        assertTrue(printed.await(5, TimeUnit.SECONDS), "the spawned process never printed its arguments")
+
+        assertTrue(
+            output.contains("--max-old-space-size=$HEAP_CEILING_MIN_MB"),
+            "a low-RAM device must ignore the request; got: $output",
+        )
+        assertFalse(
+            manager.heapOverrideInEffect(),
+            "the request was not taken, so its budget must not be spent on this server's kills",
+        )
+    }
+
+    @Test
+    fun `a directory where the settings file belongs is read as no setting`() {
+        // The fail-safe direction, through the guard rather than through the catch.
+        // This comment used to say a directory was the cheapest way to make
+        // readText throw, and it is not: `takeIf { it.isFile }` answers false for a
+        // directory and the read never happens, so `asked` is null and
+        // requestedHeapCeiling returns before its catch is anywhere near. The catch
+        // is exercised by the case below instead.
+        //
+        // What is left is still worth pinning, and it is the branch a device
+        // actually meets: no readable setting means the number the device ran
+        // before the key existed, and the start happens at all.
+        val am = mockk<ActivityManager>(relaxed = true) {
+            every { isLowRamDevice } returns false
+            every { getMemoryInfo(any()) } answers {
+                firstArg<ActivityManager.MemoryInfo>().totalMem = 3L * 1024 * 1024 * 1024
+            }
+        }
+        every { contextMock.getSystemService(ActivityManager::class.java) } returns am
+        val notAFile = File(tempDir, "Machine/settings.json").apply { mkdirs() }
+        every { Environment.getMachineSettingsPath(any()) } returns notAFile.path
+
+        val output = StringBuilder()
+        val printed = CountDownLatch(1)
+        manager.onServerOutput = { line -> output.append(line).append('\n'); printed.countDown() }
+
+        assertTrue(startAndAwaitWatchdog(), "a settings path that is not a file must not stop a start")
+        assertTrue(printed.await(5, TimeUnit.SECONDS), "the spawned process never printed its arguments")
+
+        assertTrue(
+            output.contains("--max-old-space-size=${heapCeilingMb(3L * 1024, isLowRam = false)}"),
+            "the derived ceiling must survive a settings path that is not a file; got: $output",
+        )
+        assertFalse(
+            manager.heapOverrideInEffect(),
+            "nothing was honoured, so nothing may be charged for the next kill",
+        )
+    }
+
+    @Test
+    fun `a throw while reading the setting leaves the derived ceiling alone`() {
+        // The catch inside requestedHeapCeiling, which nothing entered until this.
+        // The case above cannot reach it, and the two fall back to DIFFERENT
+        // numbers, which is what makes this worth a case of its own: without the
+        // inner catch the throw travels to heapCeilingForDevice's catch, and that
+        // one abandons the derivation entirely for the flat HEAP_CEILING_DEFAULT_MB.
+        // A 3 GB device would be handed 512 where it had been running 384.
+        //
+        // The throw comes from the mocked path lookup rather than from a file made
+        // unreadable, because file permissions are the property of the machine
+        // running the suite and not of the code under test: a run as root reads a
+        // mode 000 file happily and the case would pass by never throwing. Where
+        // inside the try it is raised does not matter; that the start survives it
+        // with the derived number does.
+        val am = mockk<ActivityManager>(relaxed = true) {
+            every { isLowRamDevice } returns false
+            every { getMemoryInfo(any()) } answers {
+                firstArg<ActivityManager.MemoryInfo>().totalMem = 3L * 1024 * 1024 * 1024
+            }
+        }
+        every { contextMock.getSystemService(ActivityManager::class.java) } returns am
+        every { Environment.getMachineSettingsPath(any()) } throws
+            IllegalStateException("the settings path could not be resolved")
+
+        val derived = heapCeilingMb(3L * 1024, isLowRam = false)
+        assertNotEquals(
+            HEAP_CEILING_DEFAULT_MB, derived,
+            "the fixture must not pick a size the outer catch would also produce",
+        )
+
+        val output = StringBuilder()
+        val printed = CountDownLatch(1)
+        manager.onServerOutput = { line -> output.append(line).append('\n'); printed.countDown() }
+
+        assertTrue(startAndAwaitWatchdog(), "a throw while reading the setting must not stop a start")
+        assertTrue(printed.await(5, TimeUnit.SECONDS), "the spawned process never printed its arguments")
+
+        assertTrue(
+            output.contains("--max-old-space-size=$derived"),
+            "a throw while reading the setting must leave the DERIVED ceiling, not " +
+                "collapse the device onto the flat default; got: $output",
+        )
+        assertFalse(
+            manager.heapOverrideInEffect(),
+            "nothing was honoured, so nothing may be charged for the next kill",
+        )
+    }
+
+    @Test
+    fun `a ceiling the user lowered is never suspended by the latch`() {
+        // The direction the latch had no notion of. Its remedy for a value that
+        // keeps getting the server killed is to ignore it and fall back to the
+        // derived arm -- which for a value the user LOWERED is the larger number,
+        // handed back to the device that was being killed at the smaller one. The
+        // 137 the latch counts is deliberately over-counted (the phantom-process
+        // limit produces it too), so the kills need not have anything to do with
+        // the user's value at all.
+        //
+        // 6 GB derives 768; the request is 384, which is honoured verbatim. The
+        // preference file says that exact value has already spent the whole budget,
+        // which under the old rule was enough to disable it.
+        val totalMb = 6L * 1024
+        val am = mockk<ActivityManager>(relaxed = true) {
+            every { isLowRamDevice } returns false
+            every { getMemoryInfo(any()) } answers {
+                firstArg<ActivityManager.MemoryInfo>().totalMem = totalMb * 1024 * 1024
+            }
+        }
+        every { contextMock.getSystemService(ActivityManager::class.java) } returns am
+
+        val settings = File(tempDir, "Machine/settings.json").apply {
+            parentFile!!.mkdirs()
+            writeText("{\n    \"vscodroid.server.heapCeilingMb\": 384,\n}\n")
+        }
+        every { Environment.getMachineSettingsPath(any()) } returns settings.path
+
+        val derived = heapCeilingMb(totalMb, isLowRam = false)
+        assertTrue(384 < derived, "the fixture must LOWER the ceiling, derived is $derived")
+
+        // A budget already spent against this exact value. heapKillsForValue hands
+        // a fresh budget to a value that has changed, so the stored value has to be
+        // the same 384 or this proves nothing.
+        val prefs = mockk<android.content.SharedPreferences>(relaxed = true) {
+            every { getInt(PREF_HEAP_VALUE_SEEN, any()) } returns 384
+            every { getInt(PREF_HEAP_KILLS, any()) } returns HEAP_OVERRIDE_KILL_BUDGET
+        }
+        every { contextMock.getSharedPreferences(HEAP_PREFS_NAME, any()) } returns prefs
+
+        val output = StringBuilder()
+        val printed = CountDownLatch(1)
+        manager.onServerOutput = { line -> output.append(line).append('\n'); printed.countDown() }
+
+        assertTrue(startAndAwaitWatchdog(), "the fixture server must start")
+        assertTrue(printed.await(5, TimeUnit.SECONDS), "the spawned process never printed its arguments")
+
+        assertTrue(
+            output.contains("--max-old-space-size=384"),
+            "a lowered ceiling was suspended, so the device that was being killed at " +
+                "384 is handed $derived instead; got: $output",
+        )
+        assertFalse(
+            output.contains("--max-old-space-size=$derived"),
+            "the derived ceiling reached the command line over the user's smaller " +
+                "one; got: $output",
+        )
+        assertFalse(
+            manager.heapOverrideInEffect(),
+            "a lowered ceiling cannot be what a low-memory kill is about, so the next " +
+                "one must not spend a life against it",
+        )
+    }
+
+    @Test
+    fun `the start summary names what was asked for and clamps only when it clamped`() {
+        // The one line in a bug report whose whole job is to say where the ceiling
+        // came from. It used to read "user override, clamped" for every honoured
+        // value, including the common case where the request passed through
+        // untouched, so a maintainer was told the app had reduced a number it had
+        // not and went looking for a request nobody made.
+        //
+        // 4 GB derives 512 and allows up to 1024, so 640 is honoured verbatim.
+        val am = mockk<ActivityManager>(relaxed = true) {
+            every { isLowRamDevice } returns false
+            every { getMemoryInfo(any()) } answers {
+                firstArg<ActivityManager.MemoryInfo>().totalMem = 4L * 1024 * 1024 * 1024
+            }
+        }
+        every { contextMock.getSystemService(ActivityManager::class.java) } returns am
+
+        val settings = File(tempDir, "Machine/settings.json").apply {
+            parentFile!!.mkdirs()
+            writeText("{\n    \"vscodroid.server.heapCeilingMb\": 640,\n}\n")
+        }
+        every { Environment.getMachineSettingsPath(any()) } returns settings.path
+        assertEquals(
+            640, heapCeilingMb(4L * 1024, isLowRam = false, requestedMb = 640),
+            "the fixture must pick a value the clamp leaves alone",
+        )
+
+        // Synchronised, because two threads log into it. `startWatchdog` is
+        // running before `startServer` composes the summary, so the watchdog's
+        // own line and this one are appended concurrently, and an ArrayList
+        // loses one of them. The loss is invisible in isolation and shows up
+        // only under the load of the whole suite, which is the worst way for a
+        // test to be wrong.
+        val said = Collections.synchronizedList(mutableListOf<String>())
+        every { Logger.i(any(), any()) } answers { said += secondArg<String>() }
+
+        assertTrue(startAndAwaitWatchdog(), "the fixture server must start")
+
+        val summary = said.singleOrNull { it.startsWith("Server process started") }
+        assertNotNull(summary, "the start summary was not logged at all: $said")
+        assertTrue(
+            summary!!.contains("heap ceiling 640MB (user override)"),
+            "the summary does not name the source without claiming a clamp: $summary",
+        )
+        assertFalse(
+            summary.contains("clamped"),
+            "the summary claims a clamp over a value that passed through untouched: $summary",
+        )
+    }
+
+    @Test
+    fun `the start summary says what a clamped request asked for`() {
+        // The other half. 6 GB allows up to 1536, so a request of 4096 really is
+        // reduced -- and the reader has to be able to tell this case from the one
+        // above, which the single word "clamped" could not do on its own.
+        val totalMb = 6L * 1024
+        val am = mockk<ActivityManager>(relaxed = true) {
+            every { isLowRamDevice } returns false
+            every { getMemoryInfo(any()) } answers {
+                firstArg<ActivityManager.MemoryInfo>().totalMem = totalMb * 1024 * 1024
+            }
+        }
+        every { contextMock.getSystemService(ActivityManager::class.java) } returns am
+
+        val settings = File(tempDir, "Machine/settings.json").apply {
+            parentFile!!.mkdirs()
+            writeText("{\n    \"vscodroid.server.heapCeilingMb\": 4096,\n}\n")
+        }
+        every { Environment.getMachineSettingsPath(any()) } returns settings.path
+
+        // Synchronised, because two threads log into it. `startWatchdog` is
+        // running before `startServer` composes the summary, so the watchdog's
+        // own line and this one are appended concurrently, and an ArrayList
+        // loses one of them. The loss is invisible in isolation and shows up
+        // only under the load of the whole suite, which is the worst way for a
+        // test to be wrong.
+        val said = Collections.synchronizedList(mutableListOf<String>())
+        every { Logger.i(any(), any()) } answers { said += secondArg<String>() }
+
+        assertTrue(startAndAwaitWatchdog(), "the fixture server must start")
+
+        val summary = said.singleOrNull { it.startsWith("Server process started") }
+        assertNotNull(summary, "the start summary was not logged at all: $said")
+        assertTrue(
+            summary!!.contains("heap ceiling ${heapOverrideMaxMb(totalMb)}MB (user override of 4096MB, clamped)"),
+            "a reduced request must show both numbers, or the clamp is unreadable: $summary",
+        )
+    }
+
+    @Test
+    fun `the start summary says so when nobody asked for anything`() {
+        // The control. A summary that said "user override" unconditionally would
+        // satisfy both cases above while telling every reader that a user chose a
+        // number they never touched.
+        val am = mockk<ActivityManager>(relaxed = true) {
+            every { isLowRamDevice } returns false
+            every { getMemoryInfo(any()) } answers {
+                firstArg<ActivityManager.MemoryInfo>().totalMem = 4L * 1024 * 1024 * 1024
+            }
+        }
+        every { contextMock.getSystemService(ActivityManager::class.java) } returns am
+        every { Environment.getMachineSettingsPath(any()) } returns
+            File(tempDir, "Machine/settings.json").path
+
+        // Synchronised, because two threads log into it. `startWatchdog` is
+        // running before `startServer` composes the summary, so the watchdog's
+        // own line and this one are appended concurrently, and an ArrayList
+        // loses one of them. The loss is invisible in isolation and shows up
+        // only under the load of the whole suite, which is the worst way for a
+        // test to be wrong.
+        val said = Collections.synchronizedList(mutableListOf<String>())
+        every { Logger.i(any(), any()) } answers { said += secondArg<String>() }
+
+        assertTrue(startAndAwaitWatchdog(), "the fixture server must start")
+
+        val summary = said.singleOrNull { it.startsWith("Server process started") }
+        assertNotNull(summary, "the start summary was not logged at all: $said")
+        assertTrue(
+            summary!!.contains("heap ceiling 512MB (derived from device RAM)"),
+            "a derived ceiling must not be reported as a user's choice: $summary",
+        )
+    }
+
+    @Test
+    fun `a stop that lands while the server is spawning takes the process with it`() {
+        // The window NodeService.shutdown documents and leaves to onDestroy to
+        // reap. `stopServer()` runs on the main thread and reads `serverProcess`,
+        // which is null everywhere above the spawn, so a Stop pressed inside the
+        // few milliseconds ProcessBuilder.start() takes destroys nothing and
+        // returns. What it leaves is a Node process with no foreground service
+        // tracking it, no watchdog, and the editor port in its hand: the next cold
+        // start either adopts it, keeping the session, or moves to another port
+        // and takes the workbench's IndexedDB with it.
+        //
+        // The stop is fired from inside the start rather than raced against it.
+        // buildProcessEnvironment is the last thing startServer asks for before it
+        // spawns, so answering it from the stop is the same interleaving a Stop
+        // press produces, and it produces it every time rather than on a slow
+        // machine.
+        every { Environment.buildProcessEnvironment(any(), any()) } answers {
+            manager.stopServer()
+            emptyMap()
+        }
+
+        assertFalse(
+            manager.startServer(),
+            "a start that spawned into a stop reported success, so the caller believes " +
+                "there is a server and nothing is tracking the process there is",
+        )
+        assertNull(
+            manager.serverProcessField,
+            "the spawned process is still referenced, so the stop that already ran " +
+                "cannot have ended it",
+        )
+        assertFalse(manager.isRunning(), "a stopped server must not report itself alive")
+    }
+
+    @Test
+    fun `an interrupted start cannot replace a later start`() {
+        val preparing = CountDownLatch(1)
+        val resume = CountDownLatch(1)
+        val firstPreparation = AtomicBoolean(true)
+        val earlier = AtomicReference<Boolean>()
+        val later = AtomicReference<Boolean>()
+        val replacement = AtomicReference<Process>()
+        every { Environment.buildProcessEnvironment(any(), any()) } answers {
+            if (firstPreparation.compareAndSet(true, false)) {
+                preparing.countDown()
+                check(resume.await(5, TimeUnit.SECONDS))
+            }
+            emptyMap()
+        }
+        val first = thread { earlier.set(manager.startServer()) }
+        var second: Thread? = null
+        try {
+            assertTrue(preparing.await(5, TimeUnit.SECONDS), "the first start never reached preparation")
+            manager.stopServer()
+            second = thread {
+                later.set(manager.startServer())
+                replacement.set(manager.serverProcessField)
+            }
+            awaitQueuedOrCompletedStart(second, later)
+        } finally {
+            resume.countDown()
+            first.join(5_000)
+            second?.join(5_000)
+        }
+        assertFalse(first.isAlive || second?.isAlive == true, "a start did not finish")
+        assertEquals(false, earlier.get(), "the stopped start must not become current again")
+        assertEquals(true, later.get(), "the replacement start must succeed")
+        assertNotNull(replacement.get(), "the replacement process must have been recorded")
+        assertTrue(
+            manager.serverProcessField === replacement.get(),
+            "the interrupted start displaced the replacement process",
+        )
+    }
+
+    @Test
+    fun `a stop invalidates a start already waiting behind another start`() {
+        val preparing = CountDownLatch(1)
+        val resume = CountDownLatch(1)
+        val firstPreparation = AtomicBoolean(true)
+        val earlier = AtomicReference<Boolean>()
+        val later = AtomicReference<Boolean>()
+        every { Environment.buildProcessEnvironment(any(), any()) } answers {
+            if (firstPreparation.compareAndSet(true, false)) {
+                preparing.countDown()
+                check(resume.await(5, TimeUnit.SECONDS))
+            }
+            emptyMap()
+        }
+        val first = thread { earlier.set(manager.startServer()) }
+        var second: Thread? = null
+        try {
+            assertTrue(preparing.await(5, TimeUnit.SECONDS), "the first start never reached preparation")
+            manager.stopServer()
+            second = thread { later.set(manager.startServer()) }
+            awaitQueuedOrCompletedStart(second, later)
+            manager.stopServer()
+        } finally {
+            resume.countDown()
+            first.join(5_000)
+            second?.join(5_000)
+        }
+        assertFalse(first.isAlive || second?.isAlive == true, "a start did not finish")
+        assertEquals(false, earlier.get(), "the earlier stopped start resumed")
+        assertEquals(false, later.get(), "a queued start resumed after it was stopped")
+        assertNull(manager.serverProcessField, "a stopped queued start left a process behind")
+    }
+
+    private fun awaitQueuedOrCompletedStart(worker: Thread, outcome: AtomicReference<Boolean>) {
+        val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5)
+        while (outcome.get() == null) {
+            val frame = worker.stackTrace.firstOrNull()
+            if (worker.state == Thread.State.BLOCKED &&
+                frame?.className == ProcessManager::class.java.name && frame.methodName == "startServer"
+            ) return
+            check(worker.isAlive && System.nanoTime() < deadline) { "the next start never queued or completed" }
+            Thread.sleep(5)
+        }
+    }
+
+    @Test
+    fun `a replacement service waits for canceled preparation cleanup`() {
+        val preparing = CountDownLatch(1)
+        val resume = CountDownLatch(1)
+        val earlier = AtomicReference<Boolean>()
+        val later = AtomicReference<Boolean>()
+        val replacement = ProcessManager(contextMock)
+        every { Environment.buildProcessEnvironment(any(), any()) } answers {
+            if (Thread.currentThread().name == "previous-service-start") {
+                preparing.countDown()
+                check(resume.await(5, TimeUnit.SECONDS))
+            }
+            emptyMap()
+        }
+        val first = thread(name = "previous-service-start") { earlier.set(manager.startServer()) }
+        var second: Thread? = null
+        try {
+            assertTrue(preparing.await(5, TimeUnit.SECONDS))
+            manager.stopServer()
+            second = thread { later.set(replacement.startServer()) }
+            awaitQueuedOrCompletedStart(second, later)
+            assertNull(later.get(), "a replacement service started before the old caller cleaned up")
+        } finally {
+            resume.countDown()
+            first.join(5_000)
+            second?.join(5_000)
+            replacement.stopServer()
+        }
+        assertFalse(first.isAlive || second?.isAlive == true)
+        assertEquals(false, earlier.get())
+        assertEquals(true, later.get())
+    }
+
+    @Test
+    fun `a canceled caller cannot start a process`() {
+        assertFalse(manager.startServer { false }, "a canceled caller started a process")
+        assertNull(manager.serverProcessField)
+        verify(exactly = 0) { Environment.buildProcessEnvironment(any(), any()) }
+    }
+
+    @Test
+    fun `a caller canceled during preparation cannot publish its process`() {
+        val active = AtomicBoolean(true)
+        every { Environment.buildProcessEnvironment(any(), any()) } answers {
+            active.set(false)
+            emptyMap()
+        }
+
+        assertFalse(manager.startServer(active::get), "a start published after its caller was canceled")
+        assertNull(manager.serverProcessField)
+    }
+
+    @Test
+    fun `the port on the command line is the one PortFinder handed out`() {
+        // `allocates a port on the first start` asserts only that the port is not
+        // zero, which stays true if the wiring is replaced by any number at all.
+        // What matters is that the port the server is told to listen on is the
+        // remembered one: PortFinder exists so the WebView origin survives a cold
+        // start, and a port chosen anywhere else silently empties the workbench's
+        // IndexedDB.
+        //
+        // 41234 is outside the scan range PortFinder itself would return, so a
+        // reimplementation that scans instead of asking cannot produce it.
+        mockkObject(PortFinder)
+        every { PortFinder.getOrAllocatePort(any()) } returns 41234
+
+        val output = StringBuilder()
+        val printed = CountDownLatch(1)
+        manager.onServerOutput = { line -> output.append(line).append('\n'); printed.countDown() }
+
+        assertTrue(startAndAwaitWatchdog(), "the fixture server must start")
+        assertTrue(printed.await(5, TimeUnit.SECONDS), "the spawned process never printed its arguments")
+
+        assertEquals(41234, manager.port, "the manager must report the allocated port")
+        assertTrue(
+            output.contains("--port=41234"),
+            "the allocated port must reach the command line; got: $output"
+        )
+    }
+
+    @Test
+    fun `the server is told to bind loopback, and nothing widens it`() {
+        // The heap ceiling and the port are each pinned to the command line above.
+        // The bind address was not, and it is the one of the three that cannot be
+        // walked back after a release: a server on 0.0.0.0 puts the editor and its
+        // connection token on whatever network the phone has joined.
+        //
+        // It is also load-bearing somewhere non-obvious. PortFinder probes
+        // availability on 127.0.0.1 specifically, and its own comment records why:
+        // Java sets SO_REUSEADDR by default, so a wildcard ServerSocket can bind a
+        // port that is already held on loopback and report it free. That probe is
+        // correct only while the server binds the address it probes. Widening the
+        // bind here would not fail anything -- it would quietly turn PortFinder's
+        // answer back into the wrong one, three files away.
+        //
+        // The literal is repeated rather than read from production, deliberately.
+        // Asserting against the same constant the code uses would pass whatever
+        // that constant became, which is the mutation this exists to catch.
+        val output = StringBuilder()
+        val printed = CountDownLatch(1)
+        manager.onServerOutput = { line -> output.append(line).append('\n'); printed.countDown() }
+
+        assertTrue(startAndAwaitWatchdog(), "the fixture server must start")
+        assertTrue(printed.await(5, TimeUnit.SECONDS), "the spawned process never printed its arguments")
+
+        assertTrue(
+            output.contains("--host=127.0.0.1"),
+            "the server must be told to bind loopback; got: $output"
+        )
+        // Both directions, because the first assertion alone still passes if a
+        // second, wider bind argument is appended after it.
+        assertFalse(
+            output.contains("0.0.0.0"),
+            "nothing may put the server on a routable address; got: $output"
+        )
+    }
+
+    @Test
+    fun `a restart clears the shutdown flag so the next crash is still a crash`() {
+        // stopServer() sets isShuttingDown so the watchdog does not read a
+        // deliberate stop as a crash. Nothing cleared it on the way back in until
+        // startServer() did, and without that the flag stays set for the rest of
+        // the process: the next real crash is logged as a graceful shutdown and
+        // onServerCrashed never fires, so the automatic restart that exists for
+        // exactly that case never runs. The app sits with a dead server and a
+        // log line saying it shut down cleanly.
+        // Through the helper for the first start too, so that watchdog has already
+        // finished before the flag is set. Started bare, it can still be between
+        // its flag check and its callback when the second start installs one --
+        // and then it counts the latch down itself, which would let this pass
+        // with the reset deleted.
+        assertTrue(startAndAwaitWatchdog(), "the fixture server must start")
+        manager.stopServer()
+
+        // Fails by timeout if the flag survived: the watchdog returns early and
+        // the callback is never invoked.
+        assertTrue(
+            startAndAwaitWatchdog(),
+            "a server started after a deliberate stop must still report its exit"
+        )
+    }
+
+    @Test
+    fun `a low-RAM device gets the floor on the command line`() {
+        // The pure function is covered; this is the only thing that runs the
+        // branch reading the flag off a device. It also settles a claim worth
+        // recording: ActivityManager.MemoryInfo() is constructible in a plain JVM
+        // test and its fields are writable, so heapCeilingForDevice does not
+        // always fall through to its catch -- the try block completes here and
+        // produces a value the catch cannot.
+        //
+        // 8 GB with the flag set, so the expected 256 can only come from the flag
+        // being read: on totalMem alone 8 GB derives the maximum, not the floor.
+        val am = mockk<ActivityManager>(relaxed = true) {
+            every { isLowRamDevice } returns true
+            every { getMemoryInfo(any()) } answers {
+                firstArg<ActivityManager.MemoryInfo>().totalMem = 8L * 1024 * 1024 * 1024
+            }
+        }
+        every { contextMock.getSystemService(ActivityManager::class.java) } returns am
+
+        assertNotEquals(
+            HEAP_CEILING_MIN_MB, heapCeilingMb(8L * 1024, isLowRam = false),
+            "the fixture must not pick a size that reaches the floor without the flag"
+        )
+
+        val output = StringBuilder()
+        val printed = CountDownLatch(1)
+        manager.onServerOutput = { line -> output.append(line).append('\n'); printed.countDown() }
+
+        assertTrue(startAndAwaitWatchdog(), "the fixture server must start")
+        assertTrue(printed.await(5, TimeUnit.SECONDS), "the spawned process never printed its arguments")
+
+        assertTrue(
+            output.contains("--max-old-space-size=$HEAP_CEILING_MIN_MB"),
+            "the low-RAM flag must reach the command line; got: $output"
+        )
+    }
+
+    @Test
+    fun `the watchdog names the signal that killed the server`() {
+        // SignalNameTest pins the translation and nothing checked that the
+        // watchdog performs it. Replacing the call with the bare number leaves
+        // every one of those green: they call signalName directly, and the log
+        // line is the only place the result was ever used.
+        //
+        // What is lost is only the diagnostic -- onServerCrashed still fires, so
+        // the restart still happens -- which is why it could rot unnoticed. The
+        // log is what someone reads to understand why the server died, and
+        // "signal 11" makes them look it up while "SIGSEGV" tells them.
+        //
+        // 139, not 137: the branch above this one claims 137 for the
+        // out-of-memory message, so a fixture using it never reaches the code
+        // under test at all. 139 is 128 + SIGSEGV, and "SIGSEGV" is a string the
+        // broken path cannot produce.
+        manager.serverProcessField = mockk<Process>(relaxed = true) {
+            every { waitFor() } returns 139
+            every { isAlive } returns false
+        }
+
+        val named = CountDownLatch(1)
+        every { Logger.w(any(), match<String> { it.contains("SIGSEGV") }, any()) } answers {
+            named.countDown()
+        }
+
+        ProcessManager::class.java.getDeclaredMethod("startWatchdog")
+            .apply { isAccessible = true }
+            .invoke(manager)
+
+        assertTrue(
+            named.await(5, TimeUnit.SECONDS),
+            "the watchdog must name the signal, not print its number"
+        )
+    }
+
+    @Test
+    fun `the watchdog tells an OOM kill from an ordinary signal`() {
+        // 137 is 128 + SIGKILL, and on this platform that is nearly always the
+        // low-memory killer or the phantom-process limit: the two causes a
+        // reader has to act on, and the two that no other exit code announces.
+        //
+        // The assertion is on the words, and it has to be. 137 is a member of
+        // the 129..192 range the branch below it covers, so deleting the 137
+        // line does not remove a log line: it falls through and warns
+        // "Server killed by SIGKILL" instead. A test asserting that a warning
+        // was logged, or that the exit code reached onServerCrashed, stays green
+        // through exactly that deletion and proves nothing.
+        manager.serverProcessField = mockk<Process>(relaxed = true) {
+            every { waitFor() } returns 137
+            every { isAlive } returns false
+        }
+
+        val diagnosed = CountDownLatch(1)
+        every {
+            Logger.w(any(), match<String> { it.contains("OOM or phantom limit") }, any())
+        } answers {
+            diagnosed.countDown()
+        }
+
+        ProcessManager::class.java.getDeclaredMethod("startWatchdog")
+            .apply { isAccessible = true }
+            .invoke(manager)
+
+        assertTrue(
+            diagnosed.await(5, TimeUnit.SECONDS),
+            "137 must be reported as memory or the process limit, not as a bare signal"
+        )
+    }
+
+    @Test
+    fun `the watchdog writes how the server ended to the server log`() {
+        // The two tests above pin the words, and they reach logcat only. The
+        // gave-up page and the bug report both read server.log, so a server
+        // killed by a signal before it printed anything left six start
+        // summaries there and nothing saying how any of them ended.
+        //
+        // Its own manager, because the shared one was built with a relative
+        // logs directory and ServerLog resolves its file at construction.
+        every { Environment.getLogsDir(any()) } returns File(tempDir, "logs").path
+        val watched = ProcessManager(contextMock)
+        watched.serverProcessField = mockk<Process>(relaxed = true) {
+            every { waitFor() } returns 139
+            every { isAlive } returns false
+        }
+        val crashed = CountDownLatch(1)
+        watched.onServerCrashed = { crashed.countDown() }
+
+        ProcessManager::class.java.getDeclaredMethod("startWatchdog")
+            .apply { isAccessible = true }
+            .invoke(watched)
+
+        assertTrue(crashed.await(5, TimeUnit.SECONDS), "the watchdog never reported the exit")
+        assertEquals(
+            listOf("Server killed by SIGSEGV"),
+            File(tempDir, "logs/server.log").takeIf { it.isFile }?.readLines(),
+            "the exit must be in server.log before the crash is reported"
+        )
+    }
+
+    // -- Connection token --
+
+    @Test
+    fun `reads the token the server wrote`() {
+        writeTokenFile("  6f1e4c2a-token\n")
+        becomeReady()
+
+        assertEquals("6f1e4c2a-token", manager.connectionToken, "surrounding whitespace must be trimmed")
+    }
+
+    @Test
+    fun `has no token before the server has written one`() {
+        every { Environment.getUserDataDir(any()) } returns File(tempDir, "empty").absolutePath
+        becomeReady()
+
+        assertNull(manager.connectionToken, "an absent file must not produce a token")
+    }
+
+    @Test
+    fun `treats an empty token file as no token`() {
+        // An empty string would otherwise be appended as `tkn=`, which the server
+        // rejects like any wrong token -- a 403 that looks nothing like its cause.
+        writeTokenFile("   \n")
+        becomeReady()
+
+        assertNull(manager.connectionToken, "a blank file must not produce a token")
+    }
+
+    @Test
+    fun `reads the token when the server becomes ready, and hands it out only while it is`() {
+        // The file changes before the first ask, as a rotation changes it: a getter
+        // that read the file on first use, or on every use, would hand out what it
+        // holds now, which after a rotation is the next server's token, to whatever
+        // holds the port before that server is ready.
+        val token = writeTokenFile("first")
+        becomeReady()
+        token.writeText("second")
+        assertEquals(
+            "first", manager.connectionToken,
+            "the token must be the one read when readiness was recorded, not the one " +
+                "the file holds when it is asked for",
+        )
+
+        manager.stopServer()
+        assertNull(
+            manager.connectionToken,
+            "a server that is not ready may not be the one on the port, and whatever " +
+                "is there would be handed the token",
+        )
+
+        becomeReady()
+        assertEquals(
+            "second", manager.connectionToken,
+            "the next readiness must read the token its own server holds",
+        )
+    }
+
+    @Test
+    fun `a probe that lost to a clear leaves the ready server's token alone`() {
+        // Kills: storing the token ahead of the epoch check. A probe of the previous
+        // spawn can hold what it read across a whole restart: the clear, the
+        // rotation and the next server's readiness can all land between its read and
+        // its lock. Stored on its way out, even by a probe that then loses, that
+        // value replaces the token of the server that is ready with one no server
+        // accepts, and every page load is "Forbidden." until the next restart.
+        //
+        // Staged from the lookup of the token's path, which runs between the probe's
+        // request and its lock, so the interleaving is a statement rather than a
+        // race. The next server's probe is stood in for by the two writes it makes,
+        // as in `a probe that lost to a clear does not withdraw a later probe's answer`.
+        val stale = File(tempDir, "stale-token").apply { writeText("previous-server") }
+        var staged = false
+        every { Environment.getConnectionTokenPath(any()) } answers {
+            staged = true
+            manager.stopServer()
+            manager.cachedTokenField = "next-server"
+            manager.readyField = true
+            stale.path
+        }
+        val server = StubServer(200)
+        val recorded = try {
+            manager.portField = server.port
+            manager.probeReadiness()
+        } finally {
+            server.stop()
+        }
+
+        assertTrue(staged, "the probe no longer reads the token, so no restart was staged inside it")
+        assertFalse(recorded, "a probe that lost to a clear must say so")
+        assertEquals(
+            "next-server", manager.connectionToken,
+            "the losing probe stored the token it read over the one the ready server holds",
+        )
+    }
+
+    /**
+     * Makes the manager ready the way production does, through the probe, which
+     * is also the one place the token file is read.
+     */
+    private fun becomeReady() {
+        val server = StubServer(200)
+        try {
+            manager.portField = server.port
+            assertTrue(manager.probeReadiness(), "the probe must succeed or nothing here is under test")
+        } finally {
+            server.stop()
+        }
+    }
+
+    /**
+     * Writes the token where the server actually puts it, through the same
+     * derivation production uses.
+     *
+     * The `data/` level is the whole point: the server rewrites the user-data
+     * path to `<server-data-dir>/data` before it resolves the token, so a path
+     * built straight from `--user-data-dir` lands one directory too high and
+     * finds nothing. [Environment.getConnectionTokenPath] is left unstubbed so
+     * that derivation is what runs here.
+     */
+    private fun writeTokenFile(contents: String): File {
+        val userDataDir = File(tempDir, "user-data")
+        every { Environment.getUserDataDir(any()) } returns userDataDir.absolutePath
+
+        val token = File(Environment.getConnectionTokenPath(mockk(relaxed = true)))
+        assertEquals(
+            File(userDataDir, "data/token").absolutePath, token.absolutePath,
+            "the token path must stay under data/, where the server writes it",
+        )
+        token.parentFile!!.mkdirs()
+        return token.apply { writeText(contents) }
+    }
+
+    /**
+     * Starts the server and waits for the watchdog to report `/bin/echo` exiting.
+     *
+     * Waiting is what keeps the watchdog thread from outliving the test and
+     * logging through the Logger mock after `unmockkAll()` has torn it down,
+     * which collides with the next test class re-mocking the same object in this
+     * JVM. It also pins the watchdog itself: without it the latch never fires,
+     * and the watchdog is the mechanism the whole restart depends on.
+     */
+    private fun startAndAwaitWatchdog(): Boolean {
+        val exited = CountDownLatch(1)
+        manager.onServerCrashed = { exited.countDown() }
+        val started = manager.startServer()
+        assertTrue(exited.await(5, TimeUnit.SECONDS), "watchdog never reported the exit")
+        return started
+    }
+}
+
+/** Reaches [ProcessManager.serverProcess], which is private production state. */
+private var ProcessManager.serverProcessField: Process?
+    get() = field("serverProcess").get(this) as Process?
+    set(value) = field("serverProcess").set(this, value)
+
+/** Reaches [ProcessManager.isShuttingDown], which is private production state. */
+private val ProcessManager.isShuttingDownField: Boolean
+    get() = field("isShuttingDown").getBoolean(this)
+
+/** Reaches `ProcessManager._isReady`, which is private production state. */
+private var ProcessManager.readyField: Boolean
+    get() = field("_isReady").getBoolean(this)
+    set(value) = field("_isReady").setBoolean(this, value)
+
+/** Reaches `ProcessManager.cachedToken`, which is private production state. */
+private var ProcessManager.cachedTokenField: String?
+    get() = field("cachedToken").get(this) as String?
+    set(value) = field("cachedToken").set(this, value)
+
+/** Reaches [ProcessManager._port], which is private production state. */
+private var ProcessManager.portField: Int
+    get() = field("_port").getInt(this)
+    set(value) = field("_port").setInt(this, value)
+
+/**
+ * Reaches `ProcessManager.procDir`, which is private production state.
+ *
+ * The machines this suite runs on have no `/proc`, so without redirecting it the
+ * adoption tests could only ever exercise the branch where the recorded process
+ * is missing, passing, while never once adopting anything.
+ */
+private var ProcessManager.procDirField: File
+    get() = field("procDir").get(this) as File
+    set(value) = field("procDir").set(this, value)
+
+/**
+ * Reaches `ProcessManager.heapOverrideActive`, which is private production state.
+ *
+ * Set rather than read: the tests that need it are asserting that something CLEARS
+ * the flag, and a field that starts false makes those assertions pass against a
+ * clear that was deleted. Putting it up first is what stands in for the earlier
+ * spawn in the same instance that would have left it there.
+ */
+private var ProcessManager.heapOverrideActiveField: Boolean
+    get() = field("heapOverrideActive").getBoolean(this)
+    set(value) = field("heapOverrideActive").setBoolean(this, value)
+
+/**
+ * Reaches `ProcessManager.heapOverrideSuspendedNow`, which is private production
+ * state.
+ *
+ * Set rather than read, for the reason [heapOverrideActiveField] gives: the
+ * assertions that need it are about something CLEARING the flag, and a field that
+ * starts false satisfies those against a clear that was deleted.
+ */
+private var ProcessManager.heapOverrideSuspendedNowField: Boolean
+    get() = field("heapOverrideSuspendedNow").getBoolean(this)
+    set(value) = field("heapOverrideSuspendedNow").setBoolean(this, value)
+
+private fun field(name: String) =
+    ProcessManager::class.java.getDeclaredField(name).apply { isAccessible = true }
+
+/**
+ * Readiness: whether the server is *serving*, as opposed to whether its process
+ * exists.
+ *
+ * The two were the same question to every caller until they were not.
+ * `MainActivity` navigated its WebView the moment `isRunning()` was true, and
+ * that is true from the instant the process is spawned, while the editor server
+ * inside it is still seconds away from binding its port, and for the whole of a
+ * restart after a crash. The user got a connection-refused page, and
+ * `onReceivedError` only logs, so nothing took it away again.
+ *
+ * These pin the flag's transitions rather than the navigation, because the
+ * navigation lives in an Activity and no JVM test can reach it. What they can do
+ * is make sure the answer the Activity now trusts is the answer the health probe
+ * actually gave.
+ */
+class ServerReadinessTest {
+
+    @TempDir
+    lateinit var tempDir: File
+
+    private lateinit var manager: ProcessManager
+    private lateinit var contextMock: Context
+    private var stub: StubServer? = null
+
+    @BeforeEach
+    fun setUp() {
+        mockEditorGateway()
+        mockkObject(Logger)
+        every { Logger.w(any(), any(), any()) } just Runs
+        every { Logger.w(any(), any()) } just Runs
+        every { Logger.i(any(), any()) } just Runs
+        every { Logger.d(any(), any()) } just Runs
+        every { Logger.e(any(), any()) } just Runs
+        every { Logger.e(any(), any(), any()) } just Runs
+
+        mockkObject(Environment)
+        every { Environment.getNodePath(any()) } returns "/bin/echo"
+        every { Environment.getServerScript(any()) } returns "server.js"
+        every { Environment.buildProcessEnvironment(any(), any()) } returns emptyMap()
+        every { Environment.getExtensionsDir(any()) } returns "extensions"
+        every { Environment.getUserDataDir(any()) } returns "data"
+        every { Environment.getLogsDir(any()) } returns "logs"
+
+        contextMock = mockk<Context>(relaxed = true)
+        every { contextMock.cacheDir } returns tempDir
+        every { contextMock.filesDir } returns tempDir
+
+        manager = ProcessManager(contextMock)
+    }
+
+    @AfterEach
+    fun tearDown() {
+        stub?.stop()
+        manager.stopServer()
+        unmockkAll()
+    }
+
+    /** Points the manager at a loopback server that answers with [status]. */
+    private fun serving(status: Int): StubServer =
+        StubServer(status).also { stub = it; manager.portField = it.port }
+
+    @Test
+    fun `a dripping response body cannot extend the readiness deadline`() {
+        val holder = serving(200)
+        holder.body = "x".repeat(20)
+        holder.bodyDelayMs = 150
+        val began = System.nanoTime()
+
+        assertFalse(manager.probeReadiness(), "a peer extended the probe by keeping individual reads alive")
+
+        assertTrue(TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - began) < 2500)
+    }
+
+    @Test
+    fun `dripping headers cannot extend the readiness deadline`() {
+        val holder = serving(200)
+        holder.body = "x"
+        holder.headerDelayMs = 50
+        val began = System.nanoTime()
+
+        assertFalse(manager.probeReadiness(), "a peer extended the probe while response headers were parsed")
+
+        assertTrue(TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - began) < 2500)
+    }
+
+    @Test
+    fun `a probe accepts the fixed routes close delimited framing`() {
+        serving(200).rawResponse = "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\ncommit\n"
+        assertTrue(manager.isServerHealthy())
+    }
+
+    @Test
+    fun `a probe refuses incomplete oversized and unsupported response framing`() {
+        val holder = serving(200)
+        for (response in listOf(
+            "HTTP/1.1 200 OK\r\n",
+            "HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nshort",
+            "HTTP/1.1 200 OK\r\nX-Large: " + "x".repeat(4096) + "\r\n\r\nbody",
+            "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n1\r\nx\r\n0\r\n\r\n",
+            "HTTP/1.1 200 OK\r\nContent-Length: 1\r\nContent-Length: 2\r\n\r\nx",
+            "HTTP/1.1 200 OK\r\nContent-Length: -1\r\n\r\nx",
+        )) {
+            holder.rawResponse = response
+            assertFalse(manager.isServerHealthy(), "invalid framing was accepted: ${response.take(80)}")
+        }
+    }
+
+    @Test
+    fun `readiness comes from the probe answering, not from the process existing`() {
+        // Kills: moving `_isReady = true` out of the `if (isServerHealthy())`
+        // branch in waitForReady, or deriving readiness from process liveness
+        // anywhere. There is no process at all here -- serverProcess is null and
+        // isRunning() is false -- so a liveness-derived answer cannot pass.
+        serving(200)
+
+        assertFalse(manager.isRunning(), "the fixture must have no process, or it proves nothing")
+        val ready = runBlocking { manager.waitForReady(timeoutMs = 3_000, pollIntervalMs = 25) }
+
+        assertTrue(ready, "a server answering 200 is ready")
+        assertTrue(manager.isReady(), "and the answer has to be recorded for the main thread")
+    }
+
+    @Test
+    fun `the probe asks the route that answers before the token check`() {
+        // Kills: probing `/` instead of `/version`. `/` answers 403 as soon as
+        // the server requires a connection token, so a probe pointed at it can
+        // only ever report a healthy start for a server that will serve the user
+        // nothing but Forbidden. `/version` is answered before that check.
+        val server = serving(200)
+
+        runBlocking { manager.waitForReady(timeoutMs = 3_000, pollIntervalMs = 25) }
+
+        assertEquals("GET /version", server.lastRequestLine()?.substringBeforeLast(' '))
+    }
+
+    @Test
+    fun `a server that answers Forbidden is not ready`() {
+        // Kills: relaxing the probe from `responseCode == 200` to `< 500` or
+        // `< 400`. That exact relaxation shipped once. 403 is the value that
+        // discriminates -- a 404 or a 500 would fail against the relaxed form
+        // too, and so would prove less.
+        serving(403)
+
+        val ready = runBlocking { manager.waitForReady(timeoutMs = 400, pollIntervalMs = 25) }
+
+        assertFalse(ready, "403 is an answer, but it is not a healthy one")
+        assertFalse(manager.isReady(), "and it must not leave the flag set")
+    }
+
+    @Test
+    fun `nothing listening is not ready`() {
+        // The cold-start window itself: a port is allocated and the process is
+        // spawning, but nothing is bound to it yet. This is the state the
+        // Activity used to navigate into.
+        //
+        // The port is held rather than freed, for the reason already written out
+        // in `a probe against a server that is not serving leaves the answer
+        // alone`. Stopping the stub first would make this assert that nothing
+        // else on the machine is listening on that port, which is not this
+        // test's to guarantee: on a shared runner something else takes the freed
+        // port between the stop and the probe, the probe gets its 200, and the
+        // assertion fails for a reason that has nothing to do with readiness.
+        // Measured on CI 2026-08-16, one failure out of 909 tests.
+        //
+        // It still tests what it says it does. The probe cannot tell a refused
+        // connection from one that is accepted and dropped; both are "not
+        // serving" in the only sense it can observe, and only the second cannot
+        // be taken by someone else.
+        val server = StubServer(null)
+        try {
+            manager.portField = server.port
+
+            val ready = runBlocking { manager.waitForReady(timeoutMs = 400, pollIntervalMs = 25) }
+
+            assertFalse(ready)
+            assertFalse(manager.isReady())
+        } finally {
+            server.stop()
+        }
+    }
+
+    @Test
+    fun `starting clears a readiness left over from the previous server`() {
+        // Kills: deleting `_isReady = false` from startServer(). This instance is
+        // reused across restarts -- it keeps its port on purpose -- so a stale
+        // true would report the dead server's readiness for the whole of the new
+        // server's startup, which is the window this work is about.
+        //
+        // The spawn is made to fail, and that is what makes the test mean what it
+        // says. Written against a successful `/bin/echo` start it passed without
+        // startServer clearing anything at all: echo exits before the assertion
+        // and the watchdog's own clear had already run, so the test was measuring
+        // the watchdog while claiming to measure startServer. A failed spawn
+        // starts no watchdog -- the clear happens before the ProcessBuilder call,
+        // the throw is caught, and nothing else in the class has run -- so
+        // startServer is the only thing that can have cleared it.
+        //
+        // It is also the sharper case. A restart whose spawn fails must not leave
+        // the dead server's readiness standing for a caller to act on.
+        every { Environment.getNodePath(any()) } returns "/nonexistent/node"
+        manager.readyField = true
+
+        assertFalse(manager.startServer(), "the spawn must fail, or this proves nothing")
+
+        assertFalse(manager.isReady(), "a server that is starting is not serving")
+    }
+
+    @Test
+    fun `a probe after the poll has given up still records readiness`() {
+        // Kills: dropping the `_isReady = true` record from probeReadiness, which
+        // would leave waitForReady's bounded loop as the only writer again.
+        //
+        // This is the piece that removes the cliff. A start slower than the poll
+        // used to leave the flag false for as long as the process lived, because
+        // the only writer lived inside a loop that had already returned -- both
+        // call sites then refused a server that was serving. Asking again has to
+        // be able to change the answer, or asking again is pointless.
+        //
+        // Deliberately not preceded by waitForReady: this is the standalone
+        // probe, on a manager that has never polled.
+        serving(200)
+        assertFalse(manager.isReady(), "the fixture must start out not ready")
+
+        assertTrue(manager.probeReadiness(), "a server answering 200 is serving")
+        assertTrue(manager.isReady(), "and asking again has to be able to change the answer")
+    }
+
+    @Test
+    fun `a probe cannot record a readiness that was withdrawn while it was asking`() {
+        // The one way the isReady()/isRunning() discipline could still hand a stale
+        // true to the navigation decision. probeReadiness blocks inside its HTTP
+        // call for as long as the timeouts allow and cannot be cancelled, so a
+        // server that stops during that window is cleared by the watchdog or by the
+        // stop -- and then the probe's own write lands afterwards and puts the flag
+        // back. isReady() then answers true over a dead port until the next start
+        // clears it, which is a whole restart backoff away, and an activity binding
+        // inside that window navigates to a refused port that nothing takes away.
+        //
+        // The clear is issued from the serving thread, between the request being
+        // read and the answer being written, so it is inside the window by
+        // construction rather than by timing.
+        val server = serving(200)
+        server.beforeAnswer = { manager.stopServer() }
+
+        assertFalse(
+            manager.probeReadiness(),
+            "a probe that lost to a clear must report what the clear said, not what " +
+                "the port said",
+        )
+        assertFalse(manager.isReady(), "and it must not leave the flag set behind it")
+    }
+
+    @Test
+    fun `a probe that lost to a clear does not withdraw a later probe's answer`() {
+        // The other interleaving, and the one the epoch alone did not cover. Two
+        // probes overlap here as readily as a probe and a clear: a launch that is
+        // superseded leaves its coroutine inside a blocking probe that
+        // cancellation cannot reach, and the attempt replacing it starts polling
+        // straight away.
+        //
+        // Written as write-then-validate, the loser set the flag, compared, and
+        // then cleared a readiness the WINNER had already established and already
+        // announced. Nothing re-derives it after that, so isReady() answered false
+        // over a server that was serving, and the next activity to bind sat on the
+        // placeholder with no onServerReady ever coming.
+        //
+        // Both steps are taken from the serving thread, between the request being
+        // read and the answer being written, so they are inside the losing probe's
+        // window by construction rather than by timing. The winning probe is stood
+        // in for by the write itself: the stub answers one request at a time, so a
+        // second real probe issued from here would queue behind the one parked in
+        // this callback, and what is under test is what the parked probe does on
+        // its way out, which is the same whoever set the flag.
+        val server = serving(200)
+        server.beforeAnswer = {
+            manager.stopServer()
+            manager.readyField = true
+        }
+
+        assertFalse(
+            manager.probeReadiness(),
+            "a probe that lost to a clear must report what the clear said",
+        )
+        assertTrue(
+            manager.isReady(),
+            "but it must not take a readiness established after that clear with it",
+        )
+    }
+
+    @Test
+    fun `a probe against a server that is not serving leaves the answer alone`() {
+        // The other direction, and the reason the record is conditional: a probe
+        // that fails must not clear a readiness established earlier, because a
+        // single refused connection during a restart is not evidence the server
+        // has stopped -- the watchdog owns that transition.
+        //
+        // The port is held rather than released. Stopping the stub and probing the
+        // freed port asserts that nothing else on the machine is listening there,
+        // which is not this test's to guarantee: a shared CI runner reused the port
+        // between the stop and the probe, the probe got its 200, and the assertion
+        // below failed for a reason that had nothing to do with readiness. A socket
+        // that accepts and drops the connection is "not serving" in the only sense
+        // the probe can observe, and cannot be taken by anyone else.
+        val server = StubServer(null)
+        try {
+            manager.portField = server.port
+            manager.readyField = true
+
+            assertFalse(manager.probeReadiness())
+            assertTrue(manager.isReady(), "one failed probe must not be treated as a stop")
+        } finally {
+            server.stop()
+        }
+    }
+
+    @Test
+    fun `the not-serving fixture really is holding its port`() {
+        // Control for the test above. Without it, a fixture that failed to bind at
+        // all would produce the same refused probe and the same green result, and
+        // the case would pass while testing nothing.
+        val server = StubServer(null)
+        try {
+            assertTrue(server.port > 0, "the fixture must have bound a port")
+            java.net.Socket().use { probe ->
+                probe.connect(java.net.InetSocketAddress("127.0.0.1", server.port), 2000)
+                assertTrue(probe.isConnected, "the port must accept connections")
+            }
+        } finally {
+            server.stop()
+        }
+    }
+
+    @Test
+    fun `stopping clears readiness`() {
+        // Kills: deleting `_isReady = false` from stopServer(). Without it a
+        // stopped server still reports itself ready, and the next activity to
+        // bind navigates straight at it.
+        manager.readyField = true
+
+        manager.stopServer()
+
+        assertFalse(manager.isReady())
+    }
+
+    @Test
+    fun `the watchdog clears readiness when the process dies`() {
+        // Kills: deleting `_isReady = false` from startWatchdog, or putting it
+        // after the isShuttingDown early return so only deliberate stops clear
+        // it. The crash is the case that matters -- the process is respawned
+        // within seconds and the flag has to be false for that whole window.
+        val release = CountDownLatch(1)
+        val process = mockk<Process>(relaxed = true) {
+            every { isAlive } returns true
+            every { waitFor() } answers { release.await(5, TimeUnit.SECONDS); 137 }
+        }
+        manager.serverProcessField = process
+        manager.readyField = true
+
+        val crashed = CountDownLatch(1)
+        manager.onServerCrashed = { crashed.countDown() }
+        ProcessManager::class.java.getDeclaredMethod("startWatchdog")
+            .apply { isAccessible = true }
+            .invoke(manager)
+
+        // Positive control: without it the assertion below would also pass on a
+        // fixture that was never ready to begin with.
+        assertTrue(manager.isReady(), "the fixture must start out ready")
+
+        release.countDown()
+        assertTrue(crashed.await(5, TimeUnit.SECONDS), "the watchdog never saw the exit")
+        assertFalse(manager.isReady(), "a process that has exited is not serving")
+    }
+}
+
+/**
+ * Where readiness may be withdrawn, which is one place and not five.
+ *
+ * The rule is invisible in any single line and breaking it is silent.
+ * `ProcessManager.probeReadiness` blocks for as long as its HTTP timeouts allow
+ * and cannot be cancelled, so a clear that only wrote the flag is overwritten by
+ * a probe that started before it and finished after it: `isReady()` then answers
+ * true over a dead port until the next start clears it again, a whole restart
+ * backoff away, and an activity binding inside that window navigates to a refused
+ * port that nothing takes back down. What makes a clear stand is the epoch bump
+ * `clearReadiness` performs with it under the readiness lock. A write placed
+ * beside the flag instead compiles, satisfies every behavioural case in this
+ * file, and reinstates the whole window.
+ *
+ * Source text because there is nothing else to read: the defect is a write that
+ * does not exist yet, and no fixture can reach code nobody has written. The
+ * behavioural half is `a probe cannot record a readiness that was withdrawn while
+ * it was asking`; this is what stops a fifth clear site walking round it.
+ */
+class ReadinessWithdrawalCallSiteTest {
+
+    private val source = File("src/main/kotlin/com/vscodroid/service/ProcessManager.kt")
+
+    /** The file with comment lines dropped, so prose about the flag is not read as code. */
+    private fun codeLines(): List<IndexedValue<String>> {
+        check(source.isFile) {
+            "ProcessManager.kt not found at ${source.absolutePath} -- this guard would " +
+                "otherwise pass by reading nothing"
+        }
+        return source.readLines().withIndex().filterNot { (_, line) ->
+            val t = line.trimStart()
+            t.startsWith("//") || t.startsWith("*") || t.startsWith("/*")
+        }
+    }
+
+    /**
+     * The declaration of [name] and the lines to its closing brace, by depth.
+     *
+     * The second break is not redundant with the first: a declaration whose body
+     * is an expression carries no brace of its own, so a window bounded only by
+     * depth runs on until the NEXT declaration opens one and everything asserted
+     * about it is asserted about a function nobody named.
+     */
+    private fun bodyOf(name: String): List<IndexedValue<String>> {
+        val lines = codeLines()
+        val start = lines.indexOfFirst { (_, l) -> l.contains(name) }
+        assertTrue(start >= 0, "$name is gone; this guard names a function")
+        val nextDeclaration =
+            Regex("""^\s*(private |internal |protected |public )*(override |suspend )*fun \w""")
+        val body = mutableListOf<IndexedValue<String>>()
+        var depth = 0
+        var entered = false
+        for ((offset, line) in lines.drop(start).withIndex()) {
+            if (offset > 0 && !entered && nextDeclaration.containsMatchIn(line.value)) break
+            body += line
+            depth += line.value.count { it == '{' } - line.value.count { it == '}' }
+            if (depth > 0) entered = true
+            if (entered && depth <= 0) break
+        }
+        return body
+    }
+
+    @Test
+    fun `readiness is withdrawn in exactly one place, and it is the one that bumps the epoch`() {
+        // The declaration itself is not a withdrawal, and excluding it is what
+        // keeps the count meaningful rather than off by one.
+        val withdrawals = codeLines().filter { (_, l) ->
+            l.contains("_isReady = false") && !l.contains("var _isReady")
+        }
+        assertEquals(
+            1, withdrawals.size,
+            "a clear that does not bump the epoch is overwritten by a probe that was " +
+                "already in flight; route it through clearReadiness. Found:\n" +
+                withdrawals.joinToString("\n") { (i, l) ->
+                    "  ProcessManager.kt:${i + 1}: ${l.trim()}"
+                },
+        )
+
+        // Which one it is, not merely how many. A count alone is satisfied by a
+        // single stray write anywhere in the file, including the one this rule
+        // exists to forbid.
+        val clear = bodyOf("private fun clearReadiness(")
+        assertTrue(
+            clear.any { (_, l) -> l.contains("_isReady = false") },
+            "the one withdrawal left is not the one inside clearReadiness",
+        )
+        assertTrue(
+            clear.any { (_, l) -> l.contains("readinessEpoch") },
+            "and the withdrawal has to carry the epoch bump, or the lock has nothing " +
+                "to compare a probe against",
+        )
+    }
+}
+
+/**
+ * Readiness for a start that spawned a process, and what the port's answer is
+ * worth before that process says it is listening.
+ *
+ * Readiness is not an idle question: it is what points the WebView at the port,
+ * and `MainActivity` builds that URL with the connection token in it. Binding a
+ * loopback port on Android needs no permission, so whatever holds the port when
+ * the probe asks is handed the credential if the probe believes it. A bare 200 was
+ * the whole test once; then a start that recorded `spawnedOntoHeldPort` asked the
+ * holder which build it was, which is the public `microsoft/vscode` commit and so
+ * something an imitator answers, and a holder that took the port between the free
+ * check and the child's listen was never asked at all.
+ *
+ * What the probe now waits for is the line `server-main.js` prints from its own
+ * listen callback, read off the spawned process's pipe. A child that lost the port
+ * prints EADDRINUSE instead. The fixtures below stand in for the child with a
+ * script that prints that line, or with `/bin/echo`, which prints the command
+ * line and nothing else; the stub on the port is the same either way, because
+ * the point is that the stub's answer is not what decides.
+ */
+class HeldPortReadinessTest {
+
+    @TempDir
+    lateinit var tempDir: File
+
+    private lateinit var manager: ProcessManager
+    private lateinit var contextMock: Context
+    private var stub: StubServer? = null
+
+    /**
+     * Counted down when the spawned process's listening line has been read, or
+     * null when the fixture's child does not print one.
+     *
+     * The watchdog latch the spawn helpers already wait on is not enough here:
+     * `waitFor()` returns when the process exits, and the reader thread may still
+     * be behind it on the pipe. The flag under test is lowered by that reader
+     * before it invokes `onServerOutput`, so waiting on the callback is waiting on
+     * the flag.
+     */
+    private var listening: CountDownLatch? = null
+
+    /** What the packaged tree records, and so what `/version` answers here. */
+    private val commit = "a5b500951314efd502d07465bd138dfbd714a960"
+
+    /** A build that is not this one, in the shape `/version` answers with. */
+    private val stranger = "1111111111111111111111111111111111111111"
+
+    @BeforeEach
+    fun setUp() {
+        mockEditorGateway()
+        mockkObject(Logger)
+        every { Logger.w(any(), any(), any()) } just Runs
+        every { Logger.w(any(), any()) } just Runs
+        every { Logger.i(any(), any()) } just Runs
+        every { Logger.d(any(), any()) } just Runs
+        every { Logger.e(any(), any(), any()) } just Runs
+        every { Logger.e(any(), any()) } just Runs
+
+        File(tempDir, "server/vscode-reh").mkdirs()
+        File(tempDir, "server/$REH_PRODUCT_FILE").writeText("""{"commit":"$commit"}""")
+
+        mockkObject(Environment)
+        every { Environment.getNodePath(any()) } returns "/bin/echo"
+        every { Environment.getServerScript(any()) } returns "server.js"
+        every { Environment.buildProcessEnvironment(any(), any()) } returns emptyMap()
+        every { Environment.getExtensionsDir(any()) } returns "extensions"
+        every { Environment.getUserDataDir(any()) } returns "data"
+        every { Environment.getLogsDir(any()) } returns "logs"
+
+        contextMock = mockk<Context>(relaxed = true)
+        every { contextMock.cacheDir } returns tempDir
+        every { contextMock.filesDir } returns tempDir
+
+        manager = ProcessManager(contextMock)
+    }
+
+    @AfterEach
+    fun tearDown() {
+        stub?.stop()
+        manager.stopServer()
+        unmockkAll()
+    }
+
+    /** Points the manager at a loopback server answering [status] as [reports]. */
+    private fun serving(status: Int, reports: String): StubServer =
+        StubServer(status, reports).also { stub = it; manager.portField = it.port }
+
+    /**
+     * Makes the spawned child print what `server-main.js` prints once it is bound,
+     * in place of `/bin/echo`, which prints the command line and nothing else.
+     *
+     * A script rather than a stubbed argument, so the line is on the pipe the
+     * way the real one is: on its own, from the child's stdout, after the spawn.
+     */
+    private fun childReportsListening() {
+        val node = File(tempDir, "node.sh").apply {
+            writeText("""
+                #!/bin/sh
+                for arg do
+                    case "${'$'}arg" in
+                        --socket-path=*) echo "$SERVER_LISTENING_LINE ${'$'}{arg#*=}" ;;
+                    esac
+                done
+            """.trimIndent() + "\n")
+            setExecutable(true)
+        }
+        every { Environment.getNodePath(any()) } returns node.path
+        listening = CountDownLatch(1)
+        manager.onServerOutput = { line ->
+            if (line.contains(SERVER_LISTENING_LINE)) listening?.countDown()
+        }
+    }
+
+    /**
+     * Spawns onto the port the stub is holding, and waits for the spawned process
+     * to be reaped before returning.
+     *
+     * The wait is not tidiness. `/bin/echo` exits at once and the watchdog clears
+     * readiness when it does, so an assertion made while that thread is still on
+     * its way would be racing it and would fail on a busy machine for a reason
+     * that has nothing to do with the probe.
+     */
+    private fun spawnOntoHeldPort() {
+        spawn()
+    }
+
+    /** Starts on a port nothing holds, and waits for the spawn to be reaped. */
+    private fun spawnOnFreePort() {
+        spawn()
+    }
+
+    private fun spawn() {
+        val exited = CountDownLatch(1)
+        manager.onServerCrashed = { exited.countDown() }
+        assertTrue(manager.startServer(), "the spawn must happen or nothing here is under test")
+        assertTrue(exited.await(5, TimeUnit.SECONDS), "the watchdog never reported the exit")
+        listening?.let {
+            assertTrue(it.await(5, TimeUnit.SECONDS), "the listening line never reached the reader")
+        }
+        stub?.proofKey = field("serverRunId").get(manager) as String?
+    }
+
+    @Test
+    fun `a holder this start could not have bound is not ready for answering 200`() {
+        // Kills: restoring `probeReadiness` to `isServerHealthy().also { ... }`,
+        // which is any 200 from anybody. This is the disclosure: readiness is
+        // what `NodeService.announceReady` fires on and what sends MainActivity
+        // to `?folder=...&tkn=<connection token>`, so a stranger that answers
+        // here is handed the credential for every route of the editor server.
+        // Each spawn writes a new token, which bounds what the holder learns to
+        // one server's lifetime; it does not make handing it over harmless.
+        serving(200, reports = stranger)
+        spawnOntoHeldPort()
+
+        assertFalse(
+            manager.probeReadiness(),
+            "a 200 from a party this start could not have bound the port for proves " +
+                "only that something is there",
+        )
+        assertFalse(manager.isReady(), "and nothing may record it as ready")
+        assertFalse(
+            runBlocking { manager.waitForReady(timeoutMs = 300, pollIntervalMs = 25) },
+            "the whole poll must reach the same answer, or CANNOT_BIND is never reached",
+        )
+    }
+
+    @Test
+    fun `a holder answering as this build is not ready before the spawned process binds`() {
+        // Kills: restoring the commit comparison as the whole of the held-port
+        // guard. The commit `/version` reports is microsoft/vscode's public tag
+        // SHA, so a process that binds the remembered port during a restart's
+        // backoff and answers it is indistinguishable from ours by that test, and
+        // readiness would send it the token. The child spawned here is `/bin/echo`,
+        // which never prints the listening line, exactly as a child that lost the
+        // port never does.
+        serving(200, reports = commit)
+        spawnOntoHeldPort()
+
+        assertFalse(
+            manager.probeReadiness(),
+            "a holder that knows a public commit has proved nothing about who it is",
+        )
+        assertFalse(manager.isReady(), "and nothing may record it as ready")
+        assertFalse(
+            runBlocking { manager.waitForReady(timeoutMs = 300, pollIntervalMs = 25) },
+            "the whole poll must reach the same answer, or CANNOT_BIND is never reached",
+        )
+    }
+
+    @Test
+    fun `a server authenticated as the spawned run is ready after its listening line`() {
+        // The complement, and the reason the guard waits rather than refusing a
+        // held port outright. Kills: turning the guard into `if
+        // (spawnedOntoHeldPort) return false`. One real start lands exactly here,
+        // a reap whose signal released the socket just after the port was asked,
+        // and the user has a working editor on that port. Refusing it ends the
+        // launch in CANNOT_BIND with a healthy server sitting right there.
+        //
+        // The stub answers as a stranger on purpose: once our own process has
+        // said it is listening, what the port says about itself is not consulted.
+        serving(200, reports = stranger)
+        childReportsListening()
+        spawnOntoHeldPort()
+
+        assertTrue(
+            manager.probeReadiness(),
+            "a port our own process reports bound is the server the user is about to use",
+        )
+        assertTrue(manager.isReady(), "and that has to be recorded for the main thread")
+    }
+
+    @Test
+    fun `a start that had its port to itself is ready once its own process reports binding`() {
+        // Kills: asking the port for an identity on every start, which would refuse
+        // to serve a tree that records no commit. The port is moved after the start
+        // rather than before it, because what is under test is what the spawned
+        // process said and not what is listening: the stub here answers as a
+        // stranger and is believed anyway.
+        manager.portField = PortFinder.findAvailablePort()
+        childReportsListening()
+        spawnOnFreePort()
+        val elsewhere = StubServer(200, stranger).also { stub = it }
+        elsewhere.proofKey = field("serverRunId").get(manager) as String?
+        manager.portField = elsewhere.port
+
+        assertTrue(
+            manager.probeReadiness(),
+            "a start whose process reported its listen answers to nobody about which build it is",
+        )
+    }
+
+    @Test
+    fun `a start that had its port to itself is not ready on a stranger's answer alone`() {
+        // The window the held-port flag never covered. The port read free at the
+        // spawn, so `spawnedOntoHeldPort` is false, and a process that binds it
+        // in the second or two before the child's own listen holds it when the
+        // probe asks: the child prints EADDRINUSE, the holder answers 200, and a
+        // guard keyed on the flag hands the holder the token on that 200 with no
+        // question asked. Kills: gating the wait on `spawnedOntoHeldPort`.
+        manager.portField = PortFinder.findAvailablePort()
+        spawnOnFreePort()
+        val squatter = StubServer(200, commit).also { stub = it }
+        manager.portField = squatter.port
+
+        assertFalse(
+            manager.probeReadiness(),
+            "a 200 from a port the spawned process has not reported binding is somebody else's",
+        )
+        assertFalse(manager.isReady(), "and nothing may record it as ready")
+    }
+
+    @Test
+    fun `a historical listening line cannot authenticate a replacement listener`() {
+        manager.portField = PortFinder.findAvailablePort()
+        childReportsListening()
+        spawnOnFreePort()
+        // spawn waits for both the exit watchdog and the trusted stdout reader.
+        assertFalse(manager.isRunning())
+        val holder = StubServer(200, commit).also { stub = it }
+        manager.portField = holder.port
+        val token = File(tempDir, "private-token").apply { writeText("private-previous-server-token") }
+        every { Environment.getConnectionTokenPath(any()) } returns token.path
+
+        val ready = manager.probeReadiness()
+        assertFalse(ready, "a stopped listener's output vouched for the new holder; token published: ${manager.connectionToken != null}")
+        assertFalse(manager.isReady())
+        assertNull(manager.connectionToken)
+    }
+
+    @Test
+    fun `a listening line from an earlier process does not vouch for the next one`() {
+        // Kills: raising the flag once at construction instead of at every spawn.
+        // This instance lives across restarts, so a line printed by the server
+        // that just died would otherwise stand for the replacement while the port
+        // is held by whoever took it in the backoff. The identity guard in the
+        // reader (`serverProcess === process`) is not reached here: the first
+        // child's line is fully consumed before stopServer, and the second child
+        // prints none, so no reader ever lowers the flag for a process that is
+        // not current. That guard has no test; it would need a seam that holds a
+        // reader mid-pipe across a restart.
+        manager.portField = PortFinder.findAvailablePort()
+        childReportsListening()
+        spawnOnFreePort()
+        manager.stopServer()
+
+        every { Environment.getNodePath(any()) } returns "/bin/echo"
+        listening = null
+        serving(200, reports = commit)
+        spawnOntoHeldPort()
+
+        assertFalse(
+            manager.probeReadiness(),
+            "the previous process's listen is not evidence about this one",
+        )
+    }
+
+    @Test
+    fun `a build that cannot say what it is trusts nobody on a port it could not bind`() {
+        // A tree with no commit used to be the case the held-port guard had to
+        // fail closed on, because the commit was its only evidence. It is not
+        // evidence any more, and this pins that the absence of one does not open
+        // anything: the holder answers, the spawned `/bin/echo` never reports a
+        // listen, and the run ends in CANNOT_BIND as it would with a commit.
+        File(tempDir, "server/$REH_PRODUCT_FILE").delete()
+        serving(200, reports = commit)
+        spawnOntoHeldPort()
+
+        assertFalse(
+            manager.probeReadiness(),
+            "a build with no commit cannot recognise itself, so it must not accept " +
+                "somebody else's word for it",
+        )
+    }
+
+    @Test
+    fun `a tree that records no commit still becomes ready once its own process binds`() {
+        // The control for the case above, and the property the old guard could
+        // not have: readiness does not depend on the packaged tree naming a commit,
+        // because the evidence comes from the spawned process and not from the
+        // port. Kills: any fail-closed branch on `bundledServerCommit()` in the
+        // readiness path.
+        File(tempDir, "server/$REH_PRODUCT_FILE").delete()
+        serving(200, reports = "")
+        childReportsListening()
+        spawnOntoHeldPort()
+
+        assertTrue(
+            manager.probeReadiness(),
+            "a process that reported its own listen needs no commit to be believed",
+        )
+    }
+}
+
+/**
+ * The clock the start poll spends its budget on.
+ *
+ * `waitForReady` bounded thirty seconds with `System.currentTimeMillis()`, which
+ * is the wall clock and is corrected out from under a running app: NTP or NITZ
+ * arrives as the network attaches, which is exactly where a first launch after a
+ * boot sits, and on a device whose RTC was materially wrong the step is large.
+ * Forward, the poll ended without another probe and the launch fell through to
+ * the slower late-readiness path; backward, the coroutine stayed in the poll past
+ * the timeout; and either way the "Server ready after Nms" line in a bug report
+ * was a number that never happened.
+ *
+ * A time correction cannot be staged from a JVM test, which is why the clock is a
+ * seam. These pin the two halves that make the seam mean something: the loop is
+ * bounded by what it reads there, and what it reads there by default is not the
+ * wall clock.
+ */
+class ReadyPollClockTest {
+
+    @TempDir
+    lateinit var tempDir: File
+
+    private lateinit var manager: ProcessManager
+    private var stub: StubServer? = null
+
+    @BeforeEach
+    fun setUp() {
+        mockEditorGateway()
+        mockkObject(Logger)
+        every { Logger.w(any(), any(), any()) } just Runs
+        every { Logger.w(any(), any()) } just Runs
+        every { Logger.i(any(), any()) } just Runs
+        every { Logger.d(any(), any()) } just Runs
+        every { Logger.e(any(), any(), any()) } just Runs
+        every { Logger.e(any(), any()) } just Runs
+
+        val contextMock = mockk<Context>(relaxed = true)
+        every { contextMock.cacheDir } returns tempDir
+        every { contextMock.filesDir } returns tempDir
+        manager = ProcessManager(contextMock)
+    }
+
+    @AfterEach
+    fun tearDown() {
+        stub?.stop()
+        unmockkAll()
+    }
+
+    @Test
+    fun `the poll spends the budget on its own clock and not on the wall`() {
+        // Kills: restoring `System.currentTimeMillis()` to either end of the loop
+        // bound. The fake clock steps a second per reading while real time barely
+        // moves, so a loop bounded by it leaves after about ten readings, and a
+        // loop bounded by anything else sits here for the whole ten seconds --
+        // which is the backward-correction half of the defect, measured in the
+        // only direction a test can move a clock.
+        val server = StubServer(403).also { stub = it }
+        manager.portField = server.port
+        var fakeNanos = 0L
+        manager.nanoClock = { fakeNanos += 1_000_000_000L; fakeNanos }
+
+        val startedAt = System.nanoTime()
+        val ready = runBlocking { manager.waitForReady(timeoutMs = 10_000, pollIntervalMs = 20) }
+        val realMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startedAt)
+
+        assertFalse(ready, "403 is not readiness; the fixture would prove nothing otherwise")
+        assertNotNull(server.lastRequestLine(), "the poll must actually have asked")
+        assertTrue(
+            realMs < 3_000,
+            "a poll bounded by the clock it was given must not spend the wall's " +
+                "ten seconds; it spent ${realMs}ms",
+        )
+    }
+
+    @Test
+    fun `the clock it is given by default is not the wall clock`() {
+        // The other half. The seam above proves the loop reads the clock; this
+        // proves the clock production hands it is a monotonic one. Kills: a
+        // default of `{ System.currentTimeMillis() }`, whose readings are
+        // milliseconds, so a fiftieth of a second across the sleep reads as about
+        // 50 rather than as tens of millions.
+        val before = manager.nanoClock()
+        Thread.sleep(50)
+        val after = manager.nanoClock()
+
+        assertTrue(
+            after - before >= 20_000_000L,
+            "the default clock must tick in nanoseconds; it moved by ${after - before}",
+        )
+    }
+}
+
+/**
+ * Adopting a server this instance did not start.
+ *
+ * The case: `assets/server.js` forks the editor server and forwards SIGTERM, but
+ * a SIGKILLed `server.js` (routine here) forwards nothing and `fork()` sets no
+ * PDEATHSIG, so the child outlives its parent still holding the port. Measured
+ * on an emulator, spawning anyway produces a parent whose own child prints
+ * EADDRINUSE and never exits: this class ends up watching a process whose death
+ * means nothing while the process serving the user is untracked.
+ *
+ * Adoption removes the second process and puts the watch on the one that
+ * matters. Both halves are pinned here, because either alone is worse than
+ * neither: adopting without watching trades a loud failure for a silent one,
+ * which is the trade the port refusal was removed for, running the other way.
+ */
+class AdoptionTest {
+
+    @TempDir
+    lateinit var tempDir: File
+
+    private lateinit var manager: ProcessManager
+    private lateinit var contextMock: Context
+    private var stub: StubServer? = null
+
+    /** Written where [Environment.getConnectionTokenPath] is stubbed to look. */
+    private val token = "adopt-2f9c-token"
+
+    /**
+     * The commit the packaged tree records, which is what the real `/version`
+     * answers with: the route ends the response with `productService.commit`.
+     *
+     * Written into a `product.json` fixture below, so a holder of the port has to
+     * produce it before adoption will hand it the WebView and the token.
+     */
+    private val commit = "a5b500951314efd502d07465bd138dfbd714a960"
+
+    @BeforeEach
+    fun setUp() {
+        mockEditorGateway()
+        mockkObject(Logger)
+        every { Logger.w(any(), any(), any()) } just Runs
+        every { Logger.w(any(), any()) } just Runs
+        every { Logger.i(any(), any()) } just Runs
+        every { Logger.d(any(), any()) } just Runs
+        every { Logger.e(any(), any(), any()) } just Runs
+        every { Logger.e(any(), any()) } just Runs
+
+        val tokenFile = File(tempDir, "token").apply { writeText(token) }
+        File(tempDir, "server/vscode-reh").mkdirs()
+        File(tempDir, "server/$REH_PRODUCT_FILE").writeText("""{"commit":"$commit"}""")
+
+        mockkObject(Environment)
+        every { Environment.getNodePath(any()) } returns "/bin/echo"
+        every { Environment.getServerScript(any()) } returns "server.js"
+        every { Environment.buildProcessEnvironment(any(), any()) } returns emptyMap()
+        every { Environment.getExtensionsDir(any()) } returns "extensions"
+        every { Environment.getUserDataDir(any()) } returns "data"
+        every { Environment.getLogsDir(any()) } returns "logs"
+        every { Environment.getConnectionTokenPath(any()) } returns tokenFile.path
+
+        contextMock = mockk<Context>(relaxed = true)
+        every { contextMock.cacheDir } returns tempDir
+        every { contextMock.filesDir } returns tempDir
+
+        manager = ProcessManager(contextMock)
+    }
+
+    @AfterEach
+    fun tearDown() {
+        stub?.stop()
+        stopAndAwaitWatchdog()
+        unmockkAll()
+    }
+
+    private fun stopAndAwaitWatchdog() {
+        // stopServer clears this field before interrupting the watch.
+        val watchdog = field("watchdogThread").get(manager) as Thread?
+        manager.stopServer()
+        watchdog?.join(5_000)
+        assertFalse(watchdog?.isAlive == true, "the server watchdog outlived the test")
+    }
+
+    /**
+     * Points the manager at a loopback server answering [status] on every route,
+     * and reporting [reports] as the build it is.
+     *
+     * The default is this app's own commit, so the fixture stands for the case
+     * adoption is for: the editor server that survived its bootstrap. A test that
+     * wants a stranger passes something else.
+     */
+    private fun serving(status: Int, reports: String = commit): StubServer =
+        StubServer(status, reports).also { stub = it; manager.portField = it.port }
+
+    /**
+     * Makes [port] the one a previous process left behind in preferences.
+     *
+     * The counterpart to [serving] for a COLD start: that one writes the port
+     * straight into the field, which is the restart path, and every adoption case
+     * written before this one took it. A cold start has to find the port the way
+     * production finds it, out of preferences, or the branch under test is not the
+     * one that runs.
+     *
+     * The key is restated rather than read from PortFinder, which keeps it private.
+     * The failure direction of that drift is the loud one: a key that stops matching
+     * makes the remembered port read as absent, no adoption happens, and the case
+     * below goes red rather than green.
+     */
+    private fun remember(port: Int) {
+        val prefs = mockk<android.content.SharedPreferences>(relaxed = true) {
+            every { getInt("server_port", any()) } returns port
+        }
+        every { contextMock.getSharedPreferences(any(), any()) } returns prefs
+    }
+
+    /**
+     * Writes the note `assets/server.js` leaves naming the editor server it
+     * forked, and a matching `/proc` entry, then points the manager at both.
+     *
+     * [entry] is what `/proc/<pid>/cmdline` will say. The default is what the real
+     * bootstrap forks; a test passes something else to stand for a pid that has
+     * been recycled into an unrelated process.
+     */
+    private fun recordEditorServer(
+        pid: Int,
+        port: Int,
+        entry: String = "server-main.js",
+        runId: String = "run-$pid",
+        privateSocket: Boolean = true,
+    ) {
+        File(tempDir, "server").mkdirs()
+        val socket = if (privateSocket) editorBackendSocket(contextMock, runId)?.path else null
+        val note = org.json.JSONObject().put("pid", pid).put("port", port).put("runId", runId)
+        if (socket != null) note.put("socketPath", socket)
+        File(tempDir, "server/editor-server.pid").writeText(note.toString())
+        File(tempDir, "proc/$pid").mkdirs()
+        // NUL-separated, the way the kernel writes argv. Written as escapes
+        // rather than as raw bytes: two NULs in the source made every tool
+        // that classifies a file by its bytes call this one binary, and plain
+        // grep then reported zero matches for every pattern in the largest
+        // test file in this package. A sweep over the tree cannot tell that
+        // zero from a clean one.
+        File(tempDir, "proc/$pid/cmdline")
+            .writeText("/lib/libnode.so\u0000/data/server/vscode-reh/out/$entry\u0000")
+        File(tempDir, "proc/$pid/environ").writeText("VSCODROID_SERVER_RUN_ID=$runId\u0000")
+        manager.procDirField = File(tempDir, "proc")
+        stub?.proofKey = runId
+    }
+
+    /** Holds the port without answering, so any HTTP probe would fail. */
+    private fun holdingPortSilently(): StubServer =
+        StubServer(null).also { stub = it; manager.portField = it.port }
+
+    @Test
+    fun `an out of root backend note is never connected`() {
+        val holder = serving(200)
+        recordEditorServer(4242, holder.port)
+        val noteFile = File(tempDir, "server/editor-server.pid")
+        val outside = File(tempDir.parentFile, "outside.sock")
+        noteFile.writeText(org.json.JSONObject(noteFile.readText()).put("socketPath", outside.path).toString())
+        manager.killRecordedProcess = { }
+        val gateway = EditorGateway.instance
+
+        assertTrue(manager.startServer())
+
+        assertFalse(manager.isAdopted())
+        verify(exactly = 0) { gateway.selectBackend(outside, any()) }
+    }
+
+    @Test
+    fun `a legacy TCP survivor is ended before its public origin is reserved`() {
+        val holder = serving(200)
+        recordEditorServer(4242, holder.port, privateSocket = false)
+        val killed = mutableListOf<Int>()
+        manager.killRecordedProcess = { killed += it; holder.stop() }
+        val gateway = EditorGateway.instance
+        every { gateway.bind(holder.port) } answers {
+            assertEquals(listOf(4242), killed, "the legacy listener was not ended before binding")
+            holder.port
+        }
+
+        assertTrue(manager.startServer())
+
+        assertEquals(listOf(4242), killed)
+        assertFalse(manager.isAdopted(), "a TCP backend cannot survive behind the private transport")
+        assertEquals(holder.port, manager.port)
+    }
+
+    @Test
+    fun `reaping an owned backend removes its private socket entry`() {
+        val holder = serving(200)
+        recordEditorServer(4242, holder.port)
+        val endpoint = editorBackendSocket(contextMock, "run-4242")!!
+        openUnixServerChannel().use { socket ->
+            socket.bind(java.net.UnixDomainSocketAddress.of(endpoint.toPath()))
+            manager.killRecordedProcess = { socket.close() }
+            val captured = File(tempDir, "server/editor-server.pid").readText()
+
+            assertTrue(manager.reapRecordedEditorServer("stopping the owned backend", captured))
+
+            assertFalse(Files.exists(endpoint.toPath()), "the terminated backend left its socket entry")
+        }
+    }
+
+    @Test
+    fun `a terminated private backend leaves no socket entry on the next start`() {
+        val holder = serving(200)
+        recordEditorServer(4242, holder.port)
+        val endpoint = editorBackendSocket(contextMock, "run-4242")!!
+        openUnixServerChannel().use { socket ->
+            socket.bind(java.net.UnixDomainSocketAddress.of(endpoint.toPath()))
+        }
+        File(tempDir, "proc/4242").deleteRecursively()
+        manager.killRecordedProcess = { throw AssertionError("a terminated process must not be signalled") }
+
+        assertTrue(manager.startServer())
+
+        assertFalse(manager.isAdopted())
+        assertFalse(Files.exists(endpoint.toPath()), "a dead backend accumulated a stale socket entry")
+    }
+
+    @Test
+    fun `a PID identity mismatch alone leaves its endpoint untouched`() {
+        val holder = serving(200)
+        recordEditorServer(4242, holder.port)
+        val endpoint = editorBackendSocket(contextMock, "run-4242")!!
+        openUnixServerChannel().use { socket ->
+            socket.bind(java.net.UnixDomainSocketAddress.of(endpoint.toPath()))
+            File(tempDir, "proc/4242/cmdline").writeText("other-program\u0000")
+            manager.killRecordedProcess = { throw AssertionError("an unverified process must not be signalled") }
+
+            assertTrue(manager.startServer())
+
+            assertFalse(manager.isAdopted())
+            assertTrue(Files.exists(endpoint.toPath()), "unknown process ownership was treated as death")
+        }
+    }
+
+    @Test
+    fun `reaping never removes an endpoint outside the recorded private run path`() {
+        val holder = serving(200)
+        recordEditorServer(4242, holder.port)
+        val outside = File(tempDir.parentFile, "other-${UUID.randomUUID()}.sock")
+        openUnixServerChannel().use { socket ->
+            socket.bind(java.net.UnixDomainSocketAddress.of(outside.toPath()))
+            try {
+                val noteFile = File(tempDir, "server/editor-server.pid")
+                noteFile.writeText(org.json.JSONObject(noteFile.readText()).put("socketPath", outside.path).toString())
+                manager.killRecordedProcess = { }
+
+                assertTrue(manager.reapRecordedEditorServer("stopping the owned backend", noteFile.readText()))
+
+                assertTrue(Files.exists(outside.toPath()), "an unvalidated endpoint was removed")
+            } finally {
+                Files.deleteIfExists(outside.toPath())
+            }
+        }
+    }
+
+    @Test
+    fun `a listener returning the public commit without a run proof is not adopted`() {
+        val holder = serving(200)
+        recordEditorServer(4242, holder.port)
+        holder.proofKey = null
+
+        assertTrue(manager.startServer())
+
+        assertFalse(manager.isAdopted())
+        assertFalse(manager.probeReadiness())
+        assertNull(manager.connectionToken)
+    }
+
+    @Test
+    fun `a listener signing with a different run key is not adopted`() {
+        val holder = serving(200)
+        recordEditorServer(4242, holder.port)
+        holder.proofKey = "another-private-run"
+
+        assertTrue(manager.startServer())
+
+        assertFalse(manager.isAdopted())
+        assertFalse(manager.probeReadiness())
+        assertNull(manager.connectionToken)
+    }
+
+    @Test
+    fun `an adopted listener cannot replay an earlier challenge response`() {
+        val holder = serving(200)
+        recordEditorServer(4242, holder.port)
+        assertTrue(manager.startServer())
+        assertTrue(manager.isAdopted())
+        holder.replayProof = true
+
+        assertFalse(manager.probeReadiness())
+        assertNull(manager.connectionToken)
+    }
+
+    @Test
+    fun `a live editor server of ours on the port is adopted rather than spawned over`() {
+        // Two things have to be true before a start hands the user someone else's
+        // process: the note says the holder is an editor server of ours, and the
+        // port answers. This fixture supplies both.
+        //
+        // The listener must prove its private run identity without receiving
+        // either that key or the connection token in the request.
+        val holder = serving(200)
+        recordEditorServer(pid = 4242, port = holder.port)
+
+        assertTrue(manager.startServer(), "adopting is a successful start")
+        assertTrue(manager.isAdopted(), "the server on the port is not ours to claim we spawned")
+        assertNull(
+            manager.serverProcessField,
+            "adoption must not spawn a second server onto a port the first still holds",
+        )
+        val asked = holder.lastRequestLine()
+        assertTrue(
+            Regex("GET /vscodroid-server-proof/[a-f0-9]{32} HTTP/1\\.0").matches(asked.orEmpty()),
+            "adoption must send only a fresh challenge to the listener: $asked",
+        )
+        assertFalse(asked.orEmpty().contains("run-4242"), "the challenge disclosed the private run identity")
+        assertFalse(
+            asked!!.contains("tkn"),
+            "the liveness probe must not carry the connection token: $asked",
+        )
+    }
+
+    /** Spawns over a holder with no note, which is not ours to adopt, and waits for the exit. */
+    private fun spawnOverStranger() {
+        serving(200)
+        val exited = CountDownLatch(1)
+        manager.onServerCrashed = { exited.countDown() }
+        assertTrue(manager.startServer(), "the spawn must happen or nothing here is under test")
+        assertTrue(exited.await(5, TimeUnit.SECONDS), "the watchdog never reported the exit")
+        assertFalse(manager.isAdopted(), "an unrecorded holder is not ours to adopt")
+    }
+
+    @Test
+    fun `a start that spawns replaces the connection token in place`() {
+        // Kills: dropping the rotation, and replacing it with a delete that leaves
+        // the server to create the file. A new file needs a free inode and block,
+        // and on a full partition the server swallows the failed write and serves
+        // with a token nothing can read, so every page load is refused.
+        val tokenPath = File(tempDir, "token").toPath()
+        val ownerOnly = PosixFilePermissions.fromString("rw-------")
+        Files.setPosixFilePermissions(tokenPath, ownerOnly)
+        val before = Files.readAttributes(tokenPath, BasicFileAttributes::class.java).fileKey()
+
+        spawnOverStranger()
+
+        val rotated = tokenPath.toFile().readText()
+        assertNotEquals(token, rotated, "a token the port holder may have been sent must not outlive the spawn")
+        assertTrue(Regex("[0-9A-Za-z_-]{36}").matches(rotated)) {
+            "the server keeps only a token matching its own format and writes a new one " +
+                "otherwise, which is the allocation this avoids: $rotated"
+        }
+        assertEquals(
+            before, Files.readAttributes(tokenPath, BasicFileAttributes::class.java).fileKey(),
+            "the file was replaced rather than rewritten, which needs space a full disk does not have",
+        )
+        assertEquals(ownerOnly, Files.getPosixFilePermissions(tokenPath), "the token must stay owner-readable only")
+    }
+
+    @Test
+    fun `a spawn never writes through a link at the token path`() {
+        val victim = File(tempDir, "victim").apply { writeText("keep me") }
+        val tokenPath = File(tempDir, "token").toPath()
+        Files.delete(tokenPath)
+        Files.createSymbolicLink(tokenPath, victim.toPath())
+
+        spawnOverStranger()
+
+        assertEquals("keep me", victim.readText(), "the rotation wrote into the file a link pointed at")
+        assertFalse(Files.isSymbolicLink(tokenPath), "the link must go, so the server mints a token of its own")
+    }
+
+    @Test
+    fun `a token file that cannot be rewritten is removed rather than kept`() {
+        // Kills: keeping the file when the rewrite fails. The server reuses any token
+        // it finds there, so a file the app cannot open for writing (its write bit
+        // cleared from a terminal, which runs as the app) would carry the token the
+        // port holder may have been sent across every spawn.
+        val tokenPath = File(tempDir, "token").toPath()
+        Files.setPosixFilePermissions(tokenPath, PosixFilePermissions.fromString("r--------"))
+        assumeFalse(Files.isWritable(tokenPath), "root writes through the mode, so the rewrite cannot fail")
+
+        spawnOverStranger()
+
+        assertFalse(
+            tokenPath.toFile().exists(),
+            "the old token outlived a spawn because its file could not be rewritten",
+        )
+    }
+
+    @Test
+    fun `the token is replaced before the server is spawned`() {
+        // Kills: moving the rotation below the spawn. The server reads the file once,
+        // as it builds its server object, and keeps that token for its lifetime, so a
+        // rotation that can land after that read leaves it holding the old token
+        // while the probe caches the new one, and every page load is refused. The
+        // environment is built on the way to the spawn, so the file as it stands
+        // then is what a process started there would read. It stands in for the
+        // spawn rather than being it: a rotation moved between the two also fails
+        // here, though it would still land first.
+        val tokenFile = File(tempDir, "token")
+        var atSpawn: String? = null
+        every { Environment.buildProcessEnvironment(any(), any()) } answers {
+            atSpawn = tokenFile.readText()
+            emptyMap()
+        }
+
+        spawnOverStranger()
+
+        assertNotEquals(
+            token, atSpawn,
+            "the file still held the old token when the spawn's environment was built",
+        )
+        assertEquals(
+            tokenFile.readText(), atSpawn,
+            "the file changed again after the spawn's environment was built",
+        )
+    }
+
+    @Test
+    fun `an adopted server keeps the token it holds`() {
+        // Kills: moving the rotation above the adoption branch. The adopted server
+        // read its token when it started and never reads the file again, so a
+        // rotated file would name a token no live server accepts.
+        val holder = serving(200)
+        recordEditorServer(pid = 4242, port = holder.port)
+
+        assertTrue(manager.startServer(), "adopting is a successful start")
+        assertTrue(manager.isAdopted(), "the fixture must adopt, or nothing here is under test")
+        assertEquals(token, File(tempDir, "token").readText(), "adoption rewrote the token its server holds")
+        assertNull(manager.connectionToken, "no token may be handed out before readiness")
+
+        assertTrue(manager.probeReadiness(), "the adopted server answers, so it is ready")
+        assertEquals(token, manager.connectionToken, "readiness must load the token the adopted server holds")
+    }
+
+    @Test
+    fun `adopting the server readiness was announced for is recognised as that server`() {
+        // What MainActivity reads to leave a connected page alone. A bootstrap killed
+        // on its own leaves its child serving the page, and the restart adopts that
+        // child; reloading then restarts the extension host for a connection that
+        // never broke. But a restart can also adopt a child the page never saw, when
+        // a second bootstrap died before it was announced, and that page's server is
+        // gone, so only the editor readiness was announced for may skip the reload.
+        val holder = serving(200)
+        recordEditorServer(pid = 4242, port = holder.port)
+        assertTrue(manager.probeReadiness())
+        manager.markReadyAnnounced()
+
+        assertTrue(manager.startServer(), "adopting is a successful start")
+        assertTrue(
+            manager.continuesAnnouncedServer(),
+            "the survivor of the announced server was not recognised, so the page " +
+                "connected to it is reloaded anyway",
+        )
+    }
+
+    @Test
+    fun `adopting a child the page never saw is not taken for the page's own server`() {
+        val holder = serving(200)
+        recordEditorServer(pid = 4242, port = holder.port)
+        assertTrue(manager.probeReadiness())
+        manager.markReadyAnnounced()
+        // A restart spawned a second bootstrap, which forked 4343 and died before
+        // its server was announced.
+        recordEditorServer(pid = 4343, port = holder.port)
+
+        assertTrue(manager.startServer(), "adopting is a successful start")
+        assertFalse(
+            manager.continuesAnnouncedServer(),
+            "a child the page never connected to was taken for the page's own server, " +
+                "which would leave the page on a server that is gone",
+        )
+    }
+
+    @Test
+    fun `a different run reusing the announced pid still needs a page reload`() {
+        val holder = serving(200)
+        recordEditorServer(pid = 4242, port = holder.port, runId = "original")
+        assertTrue(manager.probeReadiness())
+        manager.markReadyAnnounced()
+        recordEditorServer(pid = 4242, port = holder.port, runId = "replacement")
+
+        assertTrue(manager.startServer())
+        assertFalse(manager.continuesAnnouncedServer(), "the replacement run needs its own token loaded")
+    }
+
+    @Test
+    fun `a note replaced during the adoption probe cannot claim page continuity`() {
+        val holder = serving(200)
+        recordEditorServer(pid = 4242, port = holder.port, runId = "original")
+        assertTrue(manager.probeReadiness())
+        manager.markReadyAnnounced()
+        holder.beforeAnswer = {
+            recordEditorServer(pid = 4242, port = holder.port, runId = "replacement")
+        }
+
+        assertTrue(manager.startServer())
+        assertFalse(manager.continuesAnnouncedServer(), "the probe outlived the announced editor note")
+    }
+
+    @Test
+    fun `an adopted readiness probe cannot publish a replacement run token`() {
+        val holder = serving(200)
+        recordEditorServer(pid = 4242, port = holder.port, runId = "original")
+        assertTrue(manager.probeReadiness())
+        manager.markReadyAnnounced()
+        assertTrue(manager.startServer())
+        val replacementToken = "replacement-server-token"
+        val replaced = AtomicBoolean(false)
+        holder.beforeAnswer = {
+            if (replaced.compareAndSet(false, true)) {
+                recordEditorServer(pid = 4243, port = holder.port, runId = "replacement")
+                File(tempDir, "proc/4242/cmdline").delete()
+                File(tempDir, "token").writeText(replacementToken)
+            }
+        }
+
+        synchronized(field("readinessLock").get(manager)!!) {
+            assertFalse(manager.probeReadiness(), "the request crossed into another editor run")
+            assertTrue(replaced.get(), "the fixture must replace the run during the request")
+            assertFalse(manager.isReady())
+            assertNull(manager.connectionToken)
+            holder.beforeAnswer = null
+            manager.stopServer()
+            recordEditorServer(pid = 4243, port = holder.port, runId = "replacement")
+            assertTrue(manager.startServer())
+            assertTrue(manager.probeReadiness())
+            assertEquals(replacementToken, manager.connectionToken)
+            assertFalse(manager.continuesAnnouncedServer(), "the replacement still needs its page loaded")
+        }
+    }
+
+    @Test
+    fun `a ready adoption announces its captured note after disk replacement`() {
+        val holder = serving(200)
+        recordEditorServer(pid = 4242, port = holder.port, runId = "original")
+        assertTrue(manager.probeReadiness())
+        manager.markReadyAnnounced()
+        assertTrue(manager.startServer())
+        assertTrue(manager.probeReadiness())
+
+        synchronized(field("readinessLock").get(manager)!!) {
+            recordEditorServer(pid = 4243, port = holder.port, runId = "replacement")
+            File(tempDir, "token").writeText("replacement-server-token")
+            // The callback chose continuity for the ready run, before recording it.
+            assertTrue(manager.continuesAnnouncedServer())
+            manager.markReadyAnnounced()
+            manager.stopServer()
+            recordEditorServer(pid = 4243, port = holder.port, runId = "replacement")
+            assertTrue(manager.startServer())
+            assertTrue(manager.probeReadiness())
+            assertFalse(manager.continuesAnnouncedServer(), "a mutable note replaced the announced identity")
+        }
+    }
+
+    @Test
+    fun `a stop that lands while the port is being adopted ends the server instead`() {
+        // The counterpart of `a stop that lands while the server is spawning takes
+        // the process with it`, on the branch that has no Process for the stop to
+        // find, and the interleaving is not an exotic one. With the activity gone
+        // nothing is bound, so the service keeps serving; the server crashes,
+        // NodeService restarts it on Dispatchers.IO, an orphan of the previous run
+        // still holds the port, and the start parks inside the adoption round trip
+        // for a second of connect plus a second of read while the notification's
+        // Stop action runs stopServer() on the main thread.
+        //
+        // That stop reads `adopted` as false for the whole of the window, so it
+        // reaps nothing and returns; the branch then cleared isShuttingDown and
+        // marked the server adopted milliseconds later, undoing the stop after
+        // stopSelf() had already been called. What the user was left with is the
+        // state adoption exists to end: an untracked editor server holding the port,
+        // and the adoption watch polling it for the life of the process.
+        //
+        // Fired from the serving thread, between the request being read and the
+        // answer being written, so the stop is inside the round trip by
+        // construction rather than by timing.
+        val killed = mutableListOf<Int>()
+        manager.killRecordedProcess = { killed += it }
+        val holder = serving(200)
+        recordEditorServer(pid = 4242, port = holder.port)
+        holder.beforeAnswer = { manager.stopServer() }
+
+        assertFalse(
+            manager.startServer(),
+            "a start that adopted into a stop reported success, so the caller is told " +
+                "the stop left it a server to serve",
+        )
+        assertFalse(
+            manager.isAdopted(),
+            "a stop must not be undone by the adoption it landed inside",
+        )
+        assertTrue(
+            manager.isShuttingDownField,
+            "clearing the flag the stop set makes the next exit read as a clean one, " +
+                "so nothing recovers from it",
+        )
+        assertEquals(
+            listOf(4242), killed,
+            "the stop asked for the server to be gone, and the orphan it could not see " +
+                "is the only thing left holding the port",
+        )
+    }
+
+    @Test
+    fun `the first start in a process adopts the server still holding the remembered port`() {
+        // The launch adoption exists for, and the one it could not reach. Every
+        // case above puts the port into the field by hand, which is what a RESTART
+        // looks like; a cold start arrives with the field at zero, and the port
+        // was then taken from `getOrAllocatePort`, which answers a held port by
+        // walking to a free one. So the port handed back was free by construction,
+        // the "is it free" answer was unconditionally yes, both readers of the note
+        // are gated on its negation, and the server that outlived its bootstrap was
+        // abandoned together with the IndexedDB keyed to its origin.
+        //
+        // Built without `serving`, deliberately, so the field is left at zero and
+        // the port has to be found the way production finds it.
+        val holder = StubServer(200, commit).also { stub = it }
+        remember(holder.port)
+        recordEditorServer(pid = 4242, port = holder.port)
+
+        assertEquals(0, manager.port, "the fixture must start from a manager that has never held a port")
+        assertTrue(manager.startServer(), "adopting is a successful start")
+        assertTrue(manager.isAdopted(), "a cold start must adopt the server that outlived the last process")
+        assertEquals(
+            holder.port, manager.port,
+            "and stay on the origin the workbench's IndexedDB is keyed to",
+        )
+        assertNull(manager.serverProcessField, "adoption spawns nothing")
+    }
+
+    @Test
+    fun `a cold start moves off a remembered port a stranger is holding`() {
+        // The other half of asking about the remembered port: having asked, a start
+        // that cannot claim the holder still has to get somewhere. Nothing is bound
+        // yet on a cold start, so moving costs only the storage the allocator
+        // already logs, while staying costs a child that prints EADDRINUSE and then
+        // does not exit.
+        val holder = StubServer(null).also { stub = it }
+        remember(holder.port)
+        val gateway = EditorGateway.instance
+        every { gateway.bind(holder.port) } throws java.net.BindException("Foreign holder")
+
+        val exited = CountDownLatch(1)
+        manager.onServerCrashed = { exited.countDown() }
+        assertTrue(manager.startServer())
+
+        assertFalse(manager.isAdopted(), "an unrecorded holder is not ours to adopt")
+        assertNotEquals(
+            holder.port, manager.port,
+            "a port a stranger holds must not be the one the spawn is pointed at",
+        )
+        // Last, for the reason `a recorded server that is not answering on the port
+        // is not adopted` gives: a timeout here would report a stuck watchdog and
+        // send the reader to the wrong file, so the assertions naming the defect go
+        // first.
+        assertTrue(exited.await(5, TimeUnit.SECONDS), "watchdog never reported the exit")
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = [true, false])
+    fun `moving from a held public origin ends only the verified private survivor`(sameRun: Boolean) {
+        val holder = StubServer(null).also { stub = it }
+        remember(holder.port)
+        recordEditorServer(pid = 7311, port = holder.port)
+        if (!sameRun) File(tempDir, "proc/7311/environ").writeText("VSCODROID_SERVER_RUN_ID=another-run\u0000")
+        val killed = mutableListOf<Int>()
+        manager.killRecordedProcess = { killed += it }
+        val gateway = EditorGateway()
+        every { EditorGateway.instance } returns gateway
+        try {
+            assertTrue(manager.startServer())
+
+            assertNotEquals(holder.port, manager.port)
+            assertFalse(manager.isAdopted())
+            assertEquals(if (sameRun) listOf(7311) else emptyList<Int>(), killed)
+            assertFalse(PortFinder.isPortAvailable(manager.port), "the replacement origin is not reserved")
+        } finally {
+            stopAndAwaitWatchdog()
+            gateway.close()
+        }
+    }
+
+    @Test
+    fun `a cold start ends a recorded server it declines and keeps the port the reap frees`() {
+        // The first start used to move off the remembered port before the reap
+        // ran, so an editor server of this build that answered `/version` too
+        // slowly for the one-second probe, which a loaded device manages at cold
+        // start, was declined and then left where it was: a Node heap and one of
+        // the 32 phantom-process slots held until the OS took them back, and the
+        // workbench storage keyed to the origin abandoned for nothing.
+        //
+        // Built the way `the first start in a process adopts...` is built, with
+        // the port left at zero and remembered in preferences, because the move
+        // under test only exists on that path. The port question is driven by
+        // hand for the reason `a start onto a port the reap just freed...` gives:
+        // held at the first ask, free once the reap has run.
+        val killed = mutableListOf<Int>()
+        manager.killRecordedProcess = { killed += it }
+        val holder = StubServer(null).also { stub = it }
+        remember(holder.port)
+        recordEditorServer(pid = 7311, port = holder.port, privateSocket = false)
+        val asked = intArrayOf(0)
+        mockkObject(PortFinder)
+        every { PortFinder.isPortAvailable(holder.port) } answers { asked[0]++ > 0 }
+        // 41234 is outside the scan range, so a move is unmistakable in the failure.
+        every { PortFinder.getOrAllocatePort(any()) } returns 41234
+
+        val exited = CountDownLatch(1)
+        manager.onServerCrashed = { exited.countDown() }
+        assertEquals(0, manager.port, "the fixture must start from a manager that has never held a port")
+        assertTrue(manager.startServer())
+
+        assertEquals(listOf(7311), killed, "a declined server of ours must be ended, not abandoned")
+        assertEquals(
+            holder.port, manager.port,
+            "and a port the reap freed is kept, with the origin the workbench's storage is keyed to",
+        )
+        assertTrue(exited.await(5, TimeUnit.SECONDS), "watchdog never reported the exit")
+    }
+
+    @Test
+    fun `a cold start that ends a recorded server still moves when the port stays held`() {
+        // The other half: ending the recorded process does not release a socket
+        // somebody else is holding, and a note can name a wedged child that never
+        // bound while a foreign process took the port. The stub keeps the port
+        // through the reap, which is what that looks like, so the cold start has to
+        // fall back to the move it has always made, and the spawn must not be
+        // recorded as doomed, because the port it goes to is free by construction.
+        val killed = mutableListOf<Int>()
+        manager.killRecordedProcess = { killed += it }
+        val holder = StubServer(null).also { stub = it }
+        remember(holder.port)
+        val gateway = EditorGateway.instance
+        every { gateway.bind(holder.port) } throws java.net.BindException("Foreign holder")
+        recordEditorServer(pid = 7311, port = holder.port, privateSocket = false)
+
+        val exited = CountDownLatch(1)
+        manager.onServerCrashed = { exited.countDown() }
+        assertTrue(manager.startServer())
+
+        assertEquals(listOf(7311), killed, "the recorded server is ended before the port is given up")
+        assertNotEquals(holder.port, manager.port, "a port still held after the reap is not spawned onto")
+        assertTrue(exited.await(5, TimeUnit.SECONDS), "watchdog never reported the exit")
+    }
+
+    @Test
+    fun `adoption does not charge the user's ceiling for a server it never gave`() {
+        // An adopted server was spawned by a bootstrap that is gone, and it carries
+        // whatever ceiling that bootstrap gave it. Nothing here can learn what that
+        // was. Leaving the flag set from an earlier spawn means the next kill of
+        // this server spends a life belonging to a value it never ran with, and
+        // three of those disable a setting that was never actually tried.
+        //
+        // The flag is put up first, exactly as a previous spawn in this same
+        // ProcessManager instance would leave it. Asserting it without doing that
+        // proves nothing: the field starts false and the assertion passes against a
+        // clear that was deleted.
+        val holder = serving(200)
+        recordEditorServer(pid = 4242, port = holder.port)
+        manager.heapOverrideActiveField = true
+
+        assertTrue(manager.startServer(), "adopting is a successful start")
+        assertTrue(manager.isAdopted(), "the fixture must reach the adoption branch")
+        assertFalse(
+            manager.heapOverrideInEffect(),
+            "an adopted server's ceiling is unknowable, so it must be charged to nobody",
+        )
+    }
+
+    @Test
+    fun `adoption does not report a suspension against a start that read no ceiling`() {
+        // The sibling of the case above, on the flag the running card reads. It is
+        // documented as derived at every spawn, and the adoption branch is the one
+        // start that spawns nothing: [heapCeilingForDevice] is never reached, so a
+        // value left standing describes some earlier process in this same instance
+        // rather than the server being served, and the card would tell the user
+        // their ceiling had just been turned off on a start that never read it.
+        //
+        // Put up first, exactly as a previous spawn would have left it. Asserting
+        // it without that proves nothing.
+        val holder = serving(200)
+        recordEditorServer(pid = 4242, port = holder.port)
+        manager.heapOverrideSuspendedNowField = true
+
+        assertTrue(manager.startServer(), "adopting is a successful start")
+        assertTrue(manager.isAdopted(), "the fixture must reach the adoption branch")
+        assertFalse(
+            manager.heapOverrideIgnored(),
+            "an adopted server was given its ceiling by a bootstrap that is gone, so " +
+                "this start neither honoured nor refused the user's value",
+        )
+    }
+
+    @Test
+    fun `stopping ends the charge as well as the server`() {
+        // A crash report can already be on its way to the service when Stop is
+        // pressed. Nothing of ours is running with the user's number after this
+        // point, so that report must not spend one of its lives.
+        manager.heapOverrideActiveField = true
+        manager.stopServer()
+        assertFalse(manager.heapOverrideInEffect())
+    }
+
+    @Test
+    fun `stopping ends the suspension the running card reports`() {
+        // The sibling flag, cleared here for a different reason: it is read by the
+        // notification, and the notification is built EARLIER in a start than the
+        // spawn that derives it. `NodeService.onStartCommand` promotes to the
+        // foreground before it decides to serve, so a value left standing here
+        // tells the user their ceiling has been turned off on a start that has not
+        // read one yet, until announceReady rebuilds the card.
+        //
+        // Put up first, as an earlier spawn in this same instance would have left
+        // it. Asserting it without that passes against a clear that was deleted.
+        manager.heapOverrideSuspendedNowField = true
+        manager.stopServer()
+        assertFalse(manager.heapOverrideIgnored())
+    }
+
+    @Test
+    fun `a recorded server that is not answering on the port is not adopted`() {
+        // The note is written at the fork, so it names a process that was asked to
+        // bind the port rather than one that did. A server spawned onto a port
+        // something else holds prints EADDRINUSE and then does not exit, so a
+        // bootstrap killed by the OOM killer or the phantom-process limit can
+        // leave behind a child that is alive, is an editor server, and matches the
+        // note perfectly while having never held the port.
+        //
+        // Adopting it is a session that never answers: the adoption watch calls it
+        // lost after two missed probes, the restart reads the same note and adopts
+        // the same process, and the budget runs out with the terminal state
+        // reached and no real spawn ever attempted. Nothing clears that note, so
+        // the next cold start does it again.
+        //
+        // The holder here accepts connections and answers nothing, which is what
+        // the port looks like when the recorded process is not the one on it.
+        val holder = holdingPortSilently()
+        recordEditorServer(pid = 4242, port = holder.port)
+        assertTrue(
+            manager.portHeldByOurEditorServer(),
+            "the note has to pass the ownership test, or the refusal below proves nothing",
+        )
+
+        val exited = CountDownLatch(1)
+        manager.onServerCrashed = { exited.countDown() }
+        assertTrue(manager.startServer(), "declining to adopt still has to start something")
+
+        // Before the latch, deliberately. An adopted start spawns nothing, so the
+        // watchdog never fires and the latch below times out, which would report
+        // this as a stuck watchdog and send the reader to the wrong file. The two
+        // assertions that name the defect go first.
+        assertFalse(
+            manager.isAdopted(),
+            "a recorded server that is not serving on the port is not ours to serve",
+        )
+        assertNotNull(
+            manager.serverProcessField,
+            "declining to adopt has to fall through to a spawn; the alternative is a " +
+                "start that neither adopts nor spawns",
+        )
+
+        // Awaited for the reason ProcessManagerTest's helper gives: /bin/echo exits
+        // at once, and a watchdog thread outliving the test logs through a Logger
+        // mock that unmockkAll() has already torn down.
+        assertTrue(exited.await(5, TimeUnit.SECONDS), "watchdog never reported the exit")
+    }
+
+    @Test
+    fun `a holder serving some other build is not adopted`() {
+        // The path that was left open. The note proves an editor server of ours is
+        // alive; the port proves something is serving there. Neither says they are
+        // the same process, and the read that would say so, /proc/net/tcp, is
+        // refused to an app outright. A child that lost the race for the port wedges
+        // on EADDRINUSE without exiting, so it goes on matching the note perfectly
+        // while a foreign process holds the socket.
+        //
+        // A bare 200 was the whole of the second half, and everything that accepts a
+        // connection and answers something satisfies it. Adopting then points the
+        // WebView at that holder with the connection token in the URL. Asking which
+        // build answered costs the same request and no disclosure.
+        val holder = serving(200, reports = "0000000000000000000000000000000000000000")
+        recordEditorServer(pid = 4242, port = holder.port)
+        manager.killRecordedProcess = { }
+        assertTrue(
+            manager.portHeldByOurEditorServer(),
+            "the note has to pass the ownership test, or the refusal below proves nothing",
+        )
+
+        val exited = CountDownLatch(1)
+        manager.onServerCrashed = { exited.countDown() }
+        assertTrue(manager.startServer(), "declining to adopt still has to start something")
+
+        assertFalse(
+            manager.isAdopted(),
+            "a holder that is not this build is not ours to hand the token to",
+        )
+        assertNotNull(
+            manager.serverProcessField,
+            "declining to adopt has to fall through to a spawn",
+        )
+        val asked = holder.lastRequestLine()
+        assertEquals(
+            "GET /version", asked?.substringBeforeLast(' '),
+            "the identity question is asked on the one route answered before the token check",
+        )
+        assertFalse(
+            asked!!.contains("tkn"),
+            "asking who the holder is must never present the token to it: $asked",
+        )
+        assertTrue(exited.await(5, TimeUnit.SECONDS), "watchdog never reported the exit")
+    }
+
+    @Test
+    fun `a holder that answers without naming a build is not adopted`() {
+        // 200 and an empty body is what a web server on the port gives for free, and
+        // it is exactly what the test accepted before it asked for an identity.
+        val holder = serving(200, reports = "")
+        recordEditorServer(pid = 4242, port = holder.port)
+        manager.killRecordedProcess = { }
+
+        val exited = CountDownLatch(1)
+        manager.onServerCrashed = { exited.countDown() }
+        assertTrue(manager.startServer())
+
+        assertFalse(manager.isAdopted(), "answering is not the same as being ours")
+        assertTrue(exited.await(5, TimeUnit.SECONDS), "watchdog never reported the exit")
+    }
+
+    @Test
+    fun `a tree that records no commit declines to adopt rather than accepting anyone`() {
+        // Fail closed. With nothing to compare against, the identity test would be a
+        // bare 200 again, so a build that cannot say what it is does not adopt at
+        // all. That costs a spawn; the other direction costs the session.
+        File(tempDir, "server/$REH_PRODUCT_FILE").delete()
+        val holder = serving(200)
+        recordEditorServer(pid = 4242, port = holder.port)
+        manager.killRecordedProcess = { }
+
+        val exited = CountDownLatch(1)
+        manager.onServerCrashed = { exited.countDown() }
+        assertTrue(manager.startServer())
+
+        assertFalse(manager.isAdopted(), "an unidentifiable build must not adopt on a status line")
+        assertTrue(exited.await(5, TimeUnit.SECONDS), "watchdog never reported the exit")
+    }
+
+    @Test
+    fun `the ownership test never sends the connection token to the port holder`() {
+        // The defect this replaced: the test built `/?tkn=<token>` and sent it to
+        // whoever held the port, before anything about them was known. Binding a
+        // loopback port on Android needs no permission, so the one party the test
+        // existed to identify was handed the credential first.
+        //
+        // Asserted at the socket rather than by reading the source: the stub
+        // records the request line it received, and there must not be one.
+        val holder = serving(200)
+        recordEditorServer(pid = 4242, port = holder.port)
+
+        assertTrue(manager.portHeldByOurEditorServer())
+        assertNull(
+            holder.lastRequestLine(),
+            "the ownership test must not contact the port holder at all",
+        )
+    }
+
+    @Test
+    fun `a port held by something we have no note for is not adopted`() {
+        // No note: either this app never started a server on this port, or the
+        // note was cleared when the last one exited. Both mean the holder is a
+        // stranger, and a stranger is spawned over rather than adopted.
+        serving(200)
+
+        assertFalse(manager.portHeldByOurEditorServer())
+        manager.startServer()
+        assertFalse(manager.isAdopted(), "an unrecorded holder is not ours to adopt")
+    }
+
+    @Test
+    fun `a note written for a different port does not vouch for this one`() {
+        // Guards the reason the port is written alongside the pid. A server that
+        // is genuinely ours, genuinely alive, and on a different port says nothing
+        // about who holds this one.
+        val holder = holdingPortSilently()
+        recordEditorServer(pid = 4242, port = holder.port + 1)
+
+        assertFalse(manager.portHeldByOurEditorServer())
+    }
+
+    @Test
+    fun `a recorded process that has exited is not adopted`() {
+        val holder = holdingPortSilently()
+        recordEditorServer(pid = 4242, port = holder.port)
+        File(tempDir, "proc/4242").deleteRecursively()
+
+        assertFalse(manager.portHeldByOurEditorServer(), "a dead pid vouches for nothing")
+    }
+
+    @Test
+    fun `a recycled pid running something else is not adopted`() {
+        // Android reuses pids freely, so "the number is still in /proc" is not the
+        // question. What the process IS decides it.
+        val holder = holdingPortSilently()
+        recordEditorServer(pid = 4242, port = holder.port, entry = "some-other-program")
+
+        assertFalse(manager.portHeldByOurEditorServer())
+    }
+
+    @Test
+    fun `an adopted server that stops answering is reported as a crash`() {
+        // The half that makes adoption safe. There is no Process behind an adopted
+        // server, so nothing reports its death for free; without this the class
+        // would report it healthy for as long as it ran.
+        //
+        // Serving, unlike the ownership tests above, because this one is about
+        // readiness after adoption rather than about the adoption decision.
+        val holder = serving(200)
+        recordEditorServer(pid = 4242, port = holder.port)
+        assertTrue(manager.startServer())
+        assertTrue(manager.probeReadiness(), "the fixture must start out serving")
+
+        val crashed = CountDownLatch(1)
+        manager.onServerCrashed = { crashed.countDown() }
+
+        // Stops answering without releasing the port, for the reason
+        // StubServer.status documents. Freeing it here was the same dependency
+        // `nothing listening is not ready` was fixed for, and it was missed
+        // because the sweep matched `x.stop()` and this site reads `stub?.stop()`.
+        stub?.status = null
+
+        assertTrue(
+            crashed.await(30, TimeUnit.SECONDS),
+            "the adopted server went away and nothing noticed",
+        )
+        assertFalse(manager.isReady(), "a server that stopped answering is not serving")
+        assertFalse(manager.isAdopted(), "and it is no longer ours to serve")
+    }
+
+    @Test
+    fun `a healthy listener cannot keep a departed adopted editor ready`() {
+        val holder = serving(200)
+        recordEditorServer(pid = 4242, port = holder.port)
+        assertTrue(manager.startServer())
+        assertTrue(manager.probeReadiness())
+        val reported = AtomicReference<Int?>(null)
+        val crashed = CountDownLatch(1)
+        manager.onServerCrashed = {
+            reported.set(it)
+            crashed.countDown()
+        }
+
+        // The listener survives the recorded editor, so HTTP alone still succeeds.
+        assertTrue(File(tempDir, "proc/4242/cmdline").delete())
+        assertTrue(manager.isServerHealthy(), "the listener must keep answering")
+
+        assertTrue(crashed.await(15, TimeUnit.SECONDS), "the departed editor was never reported")
+        assertEquals(ADOPTED_SERVER_LOST, reported.get())
+        assertFalse(manager.isAdopted())
+        assertFalse(manager.isReady())
+        assertNull(manager.connectionToken, "a departed editor must stop publishing its token")
+    }
+
+    @Test
+    fun `a replacement note cannot migrate an adoption watch to another run`() {
+        val holder = serving(200)
+        recordEditorServer(pid = 4242, port = holder.port, runId = "original")
+        assertTrue(manager.startServer())
+        assertTrue(manager.probeReadiness())
+        val crashed = CountDownLatch(1)
+        manager.onServerCrashed = { crashed.countDown() }
+
+        recordEditorServer(pid = 4242, port = holder.port, runId = "replacement")
+        assertTrue(manager.portHeldByOurEditorServer(), "the replacement note must be valid on its own")
+
+        assertTrue(crashed.await(15, TimeUnit.SECONDS), "the watch followed the replacement run")
+        assertFalse(manager.isAdopted())
+        assertFalse(manager.isReady())
+        assertNull(manager.connectionToken)
+    }
+
+    @Test
+    fun `a live adopted editor remains ready across watch polls`() {
+        val holder = serving(200)
+        recordEditorServer(pid = 4242, port = holder.port)
+        assertTrue(manager.startServer())
+        assertTrue(manager.probeReadiness())
+        val polled = CountDownLatch(2)
+        holder.beforeAnswer = { polled.countDown() }
+        val reported = AtomicReference<Int?>(null)
+        manager.onServerCrashed = { reported.set(it) }
+
+        assertTrue(polled.await(15, TimeUnit.SECONDS), "the watch never checked the surviving editor")
+        assertTrue(manager.isAdopted())
+        assertTrue(manager.isReady())
+        assertEquals(token, manager.connectionToken)
+        assertNull(manager.serverProcessField, "the surviving editor must not need its bootstrap")
+        assertNull(reported.get())
+    }
+
+    @Test
+    fun `a previous adoption watch cannot withdraw a replacement server`() {
+        val holder = serving(200)
+        manager.killRecordedProcess = { }
+        recordEditorServer(pid = 4242, port = holder.port)
+        assertTrue(manager.startServer())
+        assertTrue(manager.probeReadiness())
+        val previousWatch = field("watchdogThread").get(manager) as Thread
+        val missed = CountDownLatch(ADOPTED_WATCH_MISSES)
+        holder.beforeAnswer = { missed.countDown() }
+        holder.status = 403
+        val reported = AtomicReference<Int?>(null)
+        manager.onServerCrashed = { reported.set(it) }
+        try {
+            synchronized(field("readinessLock").get(manager)!!) {
+                assertTrue(missed.await(15, TimeUnit.SECONDS), "the adoption watch never probed")
+                val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5)
+                while (previousWatch.state != Thread.State.BLOCKED && System.nanoTime() < deadline) {
+                    Thread.yield()
+                }
+                assertEquals(Thread.State.BLOCKED, previousWatch.state)
+                manager.stopServer()
+                holder.status = 200
+                recordEditorServer(pid = 4243, port = holder.port)
+                assertTrue(manager.startServer(), "the replacement server must be adopted")
+                assertTrue(manager.probeReadiness())
+            }
+            previousWatch.join(5_000)
+            assertFalse(previousWatch.isAlive, "the previous adoption watch did not finish")
+            assertNull(reported.get(), "the previous watch reported the replacement as lost")
+            assertTrue(manager.isReady(), "the previous watch withdrew replacement readiness")
+            assertTrue(manager.isAdopted(), "the previous watch abandoned the replacement")
+        } finally {
+            stopAndAwaitWatchdog()
+            previousWatch.interrupt()
+            previousWatch.join(5_000)
+        }
+    }
+
+    @Test
+    fun `adoption does not tell the user their network is dead`() {
+        // This case used to assert the opposite, and the opposite used to be true:
+        // the proxy was bound by the bootstrap, so a survivor adopted after that
+        // bootstrap died held the address of a listener that was gone, and the
+        // warning was the only thing connecting a dead gallery and a dead git to
+        // its cause.
+        //
+        // `assets/server.js` now preloads `assets/dns-proxy.js` into the child it
+        // forks, so the listener belongs to the editor server and outlives the
+        // bootstrap that started it. Adoption therefore inherits a working proxy,
+        // and the old warning became advice to restart a session that is fine,
+        // which is worse than silence: the remedy it named costs the user the
+        // open editor it exists to preserve.
+        //
+        // Pinned here rather than left to the absence of a line, because the
+        // warning is cheap to reinstate from the comments around the adoption
+        // branch. The half that makes it wrong lives on the JavaScript side and
+        // is pinned there: scripts/test-server-bootstrap.js asserts the proxy
+        // reaches the child through the joined `--require=` form.
+        val warnings = mutableListOf<String>()
+        every { Logger.w(any(), any()) } answers { warnings += secondArg<String>() }
+        val holder = serving(200)
+        recordEditorServer(pid = 4242, port = holder.port)
+
+        assertTrue(manager.startServer())
+        // The control. Without it this passes by never reaching the adoption
+        // branch at all, which is how a test that asserts an absence rots.
+        assertTrue(manager.isAdopted(), "the fixture must actually adopt")
+
+        assertTrue(
+            warnings.none { it.contains("HTTPS_PROXY") },
+            "adoption claimed the proxy is dead; it now outlives the bootstrap: $warnings",
+        )
+    }
+
+    @Test
+    fun `a restart does not spawn a second server while one is adopted`() {
+        // The start guard's other half. `isRunning()` answers false for an adopted
+        // server because there is no Process, so without consulting adoption this
+        // would spawn onto a port that is still held.
+        val holder = serving(200)
+        recordEditorServer(pid = 4242, port = holder.port)
+        assertTrue(manager.startServer())
+
+        assertFalse(manager.startServer(), "a second start must be refused while one is adopted")
+        assertNull(manager.serverProcessField)
+    }
+
+    @Test
+    fun `stopping ends the adopted server rather than leaving it running`() {
+        // This used to be "say plainly that it cannot be stopped", which was honest and
+        // still cost an idle Node process for the life of the app, holding its heap and
+        // one of the 32 slots the phantom-process limit allows. No Process handle exists
+        // for a server this instance did not spawn; the note names its pid, which is the
+        // way in.
+        val killed = mutableListOf<Int>()
+        manager.killRecordedProcess = { killed += it }
+        val holder = serving(200)
+        recordEditorServer(pid = 4242, port = holder.port)
+        assertTrue(manager.startServer())
+
+        stopAndAwaitWatchdog()
+
+        assertEquals(listOf(4242), killed, "the stop must end the process the note names")
+        assertFalse(manager.isAdopted(), "the stop must also end our relationship with it")
+    }
+
+    @Test
+    fun `an adopted pid reused by another editor run is left alone`() {
+        val killed = mutableListOf<Int>()
+        manager.killRecordedProcess = { killed += it }
+        val holder = serving(200)
+        recordEditorServer(pid = 4242, port = holder.port)
+        assertTrue(manager.startServer())
+        File(tempDir, "proc/4242/environ").writeText("VSCODROID_SERVER_RUN_ID=replacement\u0000")
+
+        stopAndAwaitWatchdog()
+
+        assertTrue(killed.isEmpty(), "a different editor run was killed through an old note")
+    }
+
+    /**
+     * The direction that costs someone else something. A pid is recycled the moment its
+     * process exits, and the kernel refuses a kill across uids, so what stays reachable is
+     * this app's own processes: a terminal the user is typing in, a language server.
+     * Nothing but the cmdline separates those from the server this means to end.
+     */
+    @Test
+    fun `a recycled pid that is no longer an editor server is left alone`() {
+        val killed = mutableListOf<Int>()
+        manager.killRecordedProcess = { killed += it }
+        val holder = serving(200)
+        recordEditorServer(pid = 4242, port = holder.port)
+        assertTrue(manager.startServer())
+        // Recycled between adoption and the stop, into something of ours that is not it.
+        File(tempDir, "proc/4242/cmdline").writeText("/lib/libbash.so -i ")
+
+        stopAndAwaitWatchdog()
+
+        assertTrue(killed.isEmpty(), "a pid that is not an editor server must not be signalled")
+    }
+
+    @Test
+    fun `a pid that has already gone is not signalled`() {
+        val killed = mutableListOf<Int>()
+        manager.killRecordedProcess = { killed += it }
+        val holder = serving(200)
+        recordEditorServer(pid = 4242, port = holder.port)
+        assertTrue(manager.startServer())
+        File(tempDir, "proc/4242/cmdline").delete()
+
+        stopAndAwaitWatchdog()
+
+        assertTrue(killed.isEmpty(), "nothing to signal once the process is gone")
+    }
+
+    @Test
+    fun `the note is consumed even when nothing is killed`() {
+        // Otherwise a pid this declines to kill is reconsidered on every later call, and
+        // the note goes on vouching for a process that is not there.
+        manager.killRecordedProcess = { }
+        val holder = serving(200)
+        recordEditorServer(pid = 4242, port = holder.port)
+        assertTrue(manager.startServer())
+        File(tempDir, "proc/4242/cmdline").writeText("/lib/libbash.so -i ")
+
+        stopAndAwaitWatchdog()
+
+        assertFalse(
+            File(tempDir, "server/editor-server.pid").exists(),
+            "the note must not survive the attempt",
+        )
+    }
+
+    /**
+     * What the reap does to the spawn that follows it. The flag exists so the
+     * service can tell a server that will never bind from one that is merely
+     * slow, and it was answered from the state before the reap: a start that
+     * had just taken this app's own holder off the port recorded its
+     * replacement as born doomed, and a healthy server slower than the
+     * readiness budget was killed once for nothing, out of the restart budget.
+     *
+     * Driven through the port question rather than a socket, because the
+     * verdict reads the port and a socket's disappearance is not the same
+     * claim on every JVM: closing a listener while another thread sits in
+     * accept() lands at different moments on different ones, and a test that
+     * races its own fixture proves nothing about the code under it. The
+     * question's own semantics, including what TIME_WAIT remnants do to it,
+     * are pinned in [PortFinderTest]; what this pins is the verdict's
+     * arithmetic: held at the first ask, freed by the reap, therefore slow-
+     * allowed rather than doomed.
+     */
+    @Test
+    fun `a start onto a port the reap just freed is not recorded as doomed`() {
+        val killed = mutableListOf<Int>()
+        val holder = holdingPortSilently()
+        recordEditorServer(pid = 7311, port = holder.port, privateSocket = false)
+        manager.killRecordedProcess = { killed += it }
+        val asked = intArrayOf(0)
+        mockkObject(PortFinder)
+        // First ask: the holder is there. Second ask, after the reap: not.
+        every { PortFinder.isPortAvailable(holder.port) } answers {
+            asked[0]++ > 0
+        }
+
+        manager.startServer()
+
+        assertEquals(2, asked[0], "the legacy reap must wait until the port becomes free")
+        assertEquals(listOf(7311), killed, "the setup is the reap case or the flag proves nothing")
+    }
+
+    /**
+     * The other half, and the half that keeps the reap from buying silence: a
+     * signalled pid is not the only thing that can hold the port. The recorded
+     * server can be a wedged child that never bound it, because the bootstrap
+     * writes the note at the fork and a foreign process took the port first,
+     * and a reap that ends that child leaves the foreign holder exactly where
+     * it was. Treating the signal as the release then records the replacement
+     * as healthy while it wedges on EADDRINUSE without exiting, and the
+     * liveness-bounded wait that follows never ends: the failure the budget
+     * used to report becomes a "still starting" that says nothing, for as long
+     * as the app runs. The port question here never changes its answer, which
+     * is what a holder the reap cannot reach looks like.
+     */
+    @Test
+    fun `a start onto a port something else still holds stays doomed after a reap`() {
+        val killed = mutableListOf<Int>()
+        manager.killRecordedProcess = { killed += it }
+        val holder = holdingPortSilently()
+        recordEditorServer(pid = 7311, port = holder.port, privateSocket = false)
+        mockkObject(PortFinder)
+        every { PortFinder.isPortAvailable(holder.port) } returns false
+
+        manager.startServer()
+
+        assertEquals(listOf(7311), killed, "the reap must have run for this to mean anything")
+    }
+
+    /**
+     * The window between the signal and the socket, which decides which of the two
+     * cases above an ordinary reap is read as.
+     *
+     * A kill returns when the signal is QUEUED: the kernel closes the dead
+     * process's listening socket afterwards, while it runs `do_exit`, and for a
+     * Node process with a large descriptor table that is not instantaneous. The
+     * single bind test that used to follow the reap ran microseconds later on the
+     * same thread, so the ordinary reap answered "still held" and recorded a
+     * replacement that binds perfectly well half a second later as one that can
+     * never serve. That flag is what promotes a slow start into
+     * `LaunchOutcome.CANNOT_BIND`, so the cost was a healthy server killed and a
+     * restart spent on it.
+     *
+     * The fixture holds the port for the first few asks after the signal and then
+     * releases it, which is what the kernel does. Nothing here sleeps on the test's
+     * behalf: the grace inside the start is what turns the extra asks into an
+     * answer.
+     */
+    @Test
+    fun `a port the reap frees a moment later is not recorded as doomed`() {
+        val killed = mutableListOf<Int>()
+        val holder = holdingPortSilently()
+        recordEditorServer(pid = 7311, port = holder.port, privateSocket = false)
+        manager.killRecordedProcess = { killed += it }
+        val asked = intArrayOf(0)
+        mockkObject(PortFinder)
+        // Held at the first ask and at the two after the signal; free on the next.
+        every { PortFinder.isPortAvailable(holder.port) } answers { asked[0]++ >= 3 }
+
+        manager.startServer()
+
+        assertEquals(listOf(7311), killed, "the setup is the reap case or the flag proves nothing")
+        assertTrue(
+            asked[0] > 2,
+            "the port must be asked again after the first refusal, or the grace is not " +
+                "there; it was asked ${asked[0]} time(s)",
+        )
+    }
+
+    /**
+     * The other call site. A server of ours that holds the port and answers nothing is
+     * refused adoption just above, and leaving it there guarantees the spawn hits
+     * EADDRINUSE: that child does not exit, so the launch ends with two processes where
+     * the user wanted one, and the survivor outlives every retry.
+     */
+    @Test
+    fun `a server of ours holding the port without serving is ended before spawning`() {
+        val killed = mutableListOf<Int>()
+        manager.killRecordedProcess = { killed += it }
+        val holder = holdingPortSilently()
+        recordEditorServer(pid = 7311, port = holder.port)
+
+        manager.startServer()
+
+        assertEquals(
+            listOf(7311),
+            killed,
+            "a recorded server that answers nothing must be ended, not spawned over",
+        )
+    }
+
+    @Test
+    fun `an adopted server counts as a live server even though no process exists`() {
+        // What every "is it merely slow" decision in NodeService asks. Both of them
+        // used to ask `isRunning()`, which is `serverProcess?.isAlive` and is
+        // structurally false here: the adoption branch returns without ever
+        // assigning a Process, because there is none to assign. A slow adopted
+        // server was therefore classified DIED_BEFORE_ANSWERING, which the launch
+        // path hands to the crash path as already-reported, so nothing retried it
+        // and the late-readiness loop left on its first turn.
+        val holder = serving(200)
+        recordEditorServer(pid = 4242, port = holder.port)
+        assertTrue(manager.startServer())
+
+        assertFalse(manager.isRunning(), "adoption spawns nothing, or this proves nothing")
+        assertTrue(
+            manager.hasLiveServer(),
+            "an adopted server is a server whose answer can still change",
+        )
+    }
+
+    @Test
+    fun `a healthy adopted server is not killed on the way in`() {
+        // The reap belongs to the stop and to the unresponsive case. Adoption itself must
+        // leave the server serving the user exactly where it is.
+        val killed = mutableListOf<Int>()
+        manager.killRecordedProcess = { killed += it }
+        val holder = serving(200)
+        recordEditorServer(pid = 4242, port = holder.port)
+
+        assertTrue(manager.startServer())
+
+        assertTrue(killed.isEmpty(), "adopting a working server must not end it")
+    }
+
+    @Test
+    fun `adoption publishes its owner and watch under the same lock as Stop`() {
+        val holder = serving(200)
+        recordEditorServer(pid = 4242, port = holder.port)
+        val readinessLock = field("readinessLock").get(manager)!!
+        val entered = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        val stopped = CountDownLatch(1)
+        val paused = AtomicBoolean(false)
+        val publicationHeldLock = AtomicBoolean(false)
+        val capturedWatch = AtomicReference<Thread?>()
+        val killed = Collections.synchronizedList(mutableListOf<Int>())
+        val failure = AtomicReference<Throwable?>()
+        val startResult = AtomicReference<Boolean?>()
+        every { Environment.getServerDir(any()) } answers {
+            if (Thread.currentThread().name == "adoption-starter" && manager.isAdopted() &&
+                paused.compareAndSet(false, true)
+            ) {
+                publicationHeldLock.set(Thread.holdsLock(readinessLock))
+                entered.countDown()
+                check(release.await(5, TimeUnit.SECONDS))
+            }
+            File(tempDir, "server").path
+        }
+        manager.killRecordedProcess = {
+            capturedWatch.compareAndSet(null, field("watchdogThread").get(manager) as Thread?)
+            killed.add(it)
+        }
+        val starter = thread(name = "adoption-starter") {
+            try {
+                startResult.set(manager.startServer())
+            } catch (error: Throwable) {
+                failure.set(error)
+            }
+        }
+        var stopper: Thread? = null
+        try {
+            assertTrue(entered.await(5, TimeUnit.SECONDS), "adoption never reached its recorded-pid read")
+            stopper = thread(name = "adoption-stopper") {
+                try {
+                    manager.stopServer()
+                    manager.stopServer()
+                } catch (error: Throwable) {
+                    failure.set(error)
+                } finally {
+                    stopped.countDown()
+                }
+            }
+            stopped.await(250, TimeUnit.MILLISECONDS)
+            release.countDown()
+            starter.join(5_000)
+            stopper.join(5_000)
+
+            assertFalse(starter.isAlive || stopper.isAlive, "a lifecycle worker outlived the test")
+            failure.get()?.let { throw it }
+            assertNotNull(startResult.get())
+            assertFalse(manager.isAdopted(), "adoption survived both completed stops")
+            assertNull(field("watchdogThread").get(manager), "a watch was published after Stop captured it")
+            assertEquals(listOf(4242), killed.toList())
+            assertTrue(publicationHeldLock.get(), "adoption publication bypassed the Stop lock")
+        } finally {
+            release.countDown()
+            starter.join(5_000)
+            stopper?.join(5_000)
+            val watch = capturedWatch.get() ?: field("watchdogThread").get(manager) as Thread?
+            manager.stopServer()
+            watch?.join(5_000)
+            assertFalse(starter.isAlive || stopper?.isAlive == true || watch?.isAlive == true)
+        }
+    }
+}
+
+/**
+ * A loopback HTTP server small enough to have no dependencies.
+ *
+ * `com.sun.net.httpserver` is not on the Android unit-test compile classpath, and
+ * the probe under test needs so little (a status line and a framed empty body)
+ * that a raw socket says it in fewer lines than working around that would take.
+ *
+ * It records the request line so a test can assert *which* route was asked for,
+ * which is half of what the probe's contract says.
+ */
+private class StubServer(initialStatus: Int?, initialBody: String = "") {
+
+    @Volatile var proofKey: String? = null
+    @Volatile var replayProof = false
+    private var previousProof: String? = null
+    @Volatile var bodyDelayMs = 0L
+    @Volatile var headerDelayMs = 0L
+    @Volatile var rawResponse: String? = null
+
+    /**
+     * What this answers with, or null for a port it holds without serving on.
+     *
+     * Mutable so a test can stop a server answering WITHOUT freeing its port.
+     * Freeing it and then requiring that nothing answers there asserts something
+     * about the whole machine, which a shared runner does not honour.
+     */
+    @Volatile
+    var status: Int? = initialStatus
+
+    /**
+     * The body it answers with, which for `/version` is the commit the holder
+     * claims to be.
+     *
+     * It exists because a status line stopped being the whole answer: adoption
+     * compares this against the commit the packaged tree records, so a stub that
+     * always framed an empty body could only ever stand for a holder that is not
+     * ours.
+     */
+    @Volatile
+    var body: String = initialBody
+
+    /**
+     * Run on the serving thread after the request has been read and before the
+     * answer is written, or null.
+     *
+     * The seam a test needs to act while a probe is definitely still in flight.
+     * The probe blocks for as long as its HTTP timeouts allow, so anything that
+     * has to happen INSIDE that window cannot be timed from the test thread
+     * without racing it; from here the ordering is a statement rather than a bet.
+     */
+    @Volatile
+    var beforeAnswer: (() -> Unit)? = null
+
+    private val socket = ServerSocket(0, 0, InetAddress.getByName("127.0.0.1"))
+    private val requestLine = AtomicReference<String?>(null)
+
+    @Volatile
+    private var running = true
+
+    val port: Int get() = socket.localPort
+
+    /** The request line of the most recent request, or null if there was none. */
+    fun lastRequestLine(): String? = requestLine.get()
+
+    init {
+        thread(name = "stub-http", isDaemon = true) {
+            while (running) {
+                try {
+                    socket.accept().use { client ->
+                        // A null status is a port this holds but does not serve on:
+                        // the connection is accepted and dropped without a reply, so
+                        // the probe's `responseCode` throws and readiness is refused.
+                        // Holding the port is the point -- releasing it and trusting
+                        // that nothing else binds it is a race the CI runner lost.
+                        if (status == null) return@use
+                        val reader = client.getInputStream().bufferedReader()
+                        requestLine.set(reader.readLine())
+                        // Headers to the blank line, so the client sees a
+                        // complete exchange rather than a reset.
+                        while (true) {
+                            val line = reader.readLine()
+                            if (line.isNullOrEmpty()) break
+                        }
+                        beforeAnswer?.invoke()
+                        val challenge = requestLine.get()?.substringAfter("/vscodroid-server-proof/", "")
+                            ?.substringBefore(' ')
+                        val proof = if (proofKey != null && !challenge.isNullOrEmpty()) {
+                            if (replayProof && previousProof != null) previousProof else {
+                                val mac = javax.crypto.Mac.getInstance("HmacSHA256")
+                                mac.init(javax.crypto.spec.SecretKeySpec(proofKey!!.toByteArray(), "HmacSHA256"))
+                                mac.doFinal(challenge.toByteArray()).joinToString("") { "%02x".format(it) }
+                                    .also { previousProof = it }
+                            }
+                        } else null
+                        val payload = (proof ?: body).toByteArray()
+                        client.getOutputStream().apply {
+                            fun bytes(data: ByteArray, delay: Long) {
+                                if (delay == 0L) write(data) else for (byte in data) {
+                                    write(byte.toInt())
+                                    flush()
+                                    Thread.sleep(delay)
+                                }
+                            }
+                            bytes(
+                                (rawResponse ?: ("HTTP/1.1 $status Stub\r\n" +
+                                    "Content-Length: ${payload.size}\r\n" +
+                                    "Connection: close\r\n\r\n")).toByteArray(), headerDelayMs,
+                            )
+                            if (rawResponse == null) bytes(payload, bodyDelayMs)
+                            flush()
+                        }
+                    }
+                } catch (e: Exception) {
+                    if (!running) break
+                }
+            }
+        }
+    }
+
+    fun stop() {
+        running = false
+        try {
+            socket.close()
+        } catch (e: Exception) {
+            // Closing an already-closed socket is the normal path out of accept().
+        }
+    }
+}
+
+/**
+ * The bootstrap reports a killed child as 128 + signal. Before that, every signal
+ * was collapsed to a clean zero, so the branch naming SIGKILL was unreachable and
+ * a server killed for running out of memory was logged as having exited cleanly.
+ */
+class SignalNameTest {
+
+    @Test
+    fun `SIGKILL is the 137 the watchdog already looked for`() {
+        assertEquals("SIGKILL", signalName(137 - 128))
+    }
+
+    @Test
+    fun `the signals that actually end this process are named`() {
+        assertEquals("SIGSEGV", signalName(11))
+        assertEquals("SIGTERM", signalName(15))
+        assertEquals("SIGABRT", signalName(6))
+    }
+
+    @Test
+    fun `an unfamiliar signal is reported rather than hidden`() {
+        assertEquals("signal 31", signalName(31))
+    }
+}
+
+/**
+ * The ceiling was a literal 512 on every device. These assert the shape of the
+ * replacement rather than the constants, because the constants are a budget and
+ * may be retuned; what must not change is that a 2 GB phone and a 16 GB phone
+ * stop getting the same answer.
+ */
+class HeapCeilingTest {
+
+    @Test
+    fun `a four gigabyte device keeps what every device used to get`() {
+        // The value this replaced. Stated so a retune has to notice it moved the
+        // midpoint, rather than discovering it from a bug report.
+        assertEquals(HEAP_CEILING_DEFAULT_MB, heapCeilingMb(4L * 1024, isLowRam = false))
+    }
+
+    @Test
+    fun `a small device gets less than a large one`() {
+        val small = heapCeilingMb(2L * 1024, isLowRam = false)
+        val large = heapCeilingMb(12L * 1024, isLowRam = false)
+        assert(small < large) { "2 GB got $small, 12 GB got $large" }
+    }
+
+    @Test
+    fun `the band holds at both ends`() {
+        assertEquals(HEAP_CEILING_MIN_MB, heapCeilingMb(1L * 1024, isLowRam = false))
+        assertEquals(HEAP_CEILING_MAX_MB, heapCeilingMb(64L * 1024, isLowRam = false))
+    }
+
+    @Test
+    fun `the low-RAM flag takes the floor whatever the total says`() {
+        // The flag as an argument, not as a device. Nothing here reads
+        // ActivityManager.isLowRamDevice, so this says nothing about whether the
+        // OEM's flag ever reaches the derivation: passing a constant false at the
+        // call site leaves it green while every low-RAM phone gets the ceiling its
+        // total earns. `a low-RAM device gets the floor on the command line` is
+        // what covers that wire.
+        assertEquals(HEAP_CEILING_MIN_MB, heapCeilingMb(8L * 1024, isLowRam = true))
+    }
+
+    @Test
+    fun `an unreadable total falls back rather than silently taking the floor`() {
+        // totalMem has been seen reporting 0 on emulators, and 0/8 clamps to the
+        // floor, which would look like a considered decision.
+        assertEquals(HEAP_CEILING_DEFAULT_MB, heapCeilingMb(0, isLowRam = false))
+        assertEquals(HEAP_CEILING_DEFAULT_MB, heapCeilingMb(-1, isLowRam = false))
+    }
+
+    @Test
+    fun `the derived band binds exactly where the arithmetic says`() {
+        // `the band holds at both ends` uses 1 GB and 64 GB, which are far enough
+        // inside each clamp that moving either constant by a few hundred MB leaves
+        // it green. These are the breakpoints themselves, so a retune of the band
+        // has to come here and state the new ones.
+        assertEquals(256, heapCeilingMb(2048, isLowRam = false), "the floor binds at 2048")
+        assertEquals(257, heapCeilingMb(2056, isLowRam = false), "just above it the eighth wins")
+        assertEquals(767, heapCeilingMb(6143, isLowRam = false), "just under the cap the eighth wins")
+        assertEquals(768, heapCeilingMb(6144, isLowRam = false), "the cap binds at 6144")
+    }
+}
+
+/**
+ * The override arm: what a user may ask for, and what they are given instead.
+ *
+ * The clamp is the entire safety argument for exposing this at all, so each bound
+ * has a test that fails when only that bound is removed. Read them together with
+ * [heapOverrideMaxMb]'s documentation, which is where the reasoning lives.
+ */
+class HeapOverrideTest {
+
+    @Test
+    fun `a request below the floor is raised to it`() {
+        // The floor applies to the override in the RAISING direction. Below 256 the
+        // editor cannot open a real project, so a request for less costs the user
+        // the editor and buys them nothing.
+        assertEquals(HEAP_CEILING_MIN_MB, heapCeilingMb(3700, isLowRam = false, requestedMb = 64))
+    }
+
+    @Test
+    fun `on a small device the fraction is what bounds a request`() {
+        // 3700 MiB is a nominal 4 GB phone. A quarter of it is 925, well under the
+        // absolute cap, so this is the case the fraction alone decides. Asking for
+        // the absolute cap here must not get it.
+        assertEquals(925, heapCeilingMb(3700, isLowRam = false, requestedMb = HEAP_OVERRIDE_ABS_MAX_MB))
+    }
+
+    @Test
+    fun `on a large device the absolute cap is what bounds a request`() {
+        // 15500 MiB is a nominal 16 GB tablet, where a quarter is about 3875. The
+        // fraction has stopped protecting: five isolates at 3875 is more V8 old
+        // space than the device can hold beside the renderer, which is why the
+        // absolute bound exists on top of it.
+        assertEquals(
+            HEAP_OVERRIDE_ABS_MAX_MB,
+            heapCeilingMb(15500, isLowRam = false, requestedMb = 4096),
+        )
+    }
+
+    @Test
+    fun `the override ceiling never sits below what the device would get anyway`() {
+        // The property this name states, asserted instead of a number, and that is
+        // a change of intent rather than of wording. It used to assert
+        // HEAP_CEILING_MAX_MB, 768, at 2000 MiB, on the premise that 768 is "what
+        // the device would get anyway" there. It is not: the derived arm is
+        // clamp(T / 8, 256, 768), so a 2 GB phone gets 256, which `the derived band
+        // binds exactly where the arithmetic says` already pins. The floor was
+        // therefore the derived arm's MAXIMUM standing in for its VALUE, and it
+        // swallowed the fraction on every device below 3072 MiB, where a flat 768
+        // is five isolates of 768 on a device that holds 2048.
+        //
+        // Written as a comparison against the derived arm so it cannot go stale the
+        // same way: whatever either arm is retuned to, the ordering between them is
+        // what the name promises.
+        for (total in listOf(512L, 800L, 1024L, 2000L, 2048L, 3072L, 3700L, 6144L, 15500L)) {
+            assertTrue(
+                heapOverrideMaxMb(total) >= heapCeilingMb(total, isLowRam = false),
+                "at $total MiB a user asking for more than the derived value would be handed " +
+                    "less than it",
+            )
+        }
+    }
+
+    @Test
+    fun `below three gigabytes the fraction is what bounds a request`() {
+        // A 2 GB phone derives 256 and a quarter of it is 500, so 500 is the most a
+        // request may reach there. Not the 768 the old floor allowed: the flag is
+        // per-isolate, so 768 authorises roughly three times that of V8 old space
+        // on a device that holds 2048.
+        //
+        // `on a small device the fraction is what bounds a request` uses 3700,
+        // where a quarter already exceeds 768 and the floor never bound, so it
+        // stayed green throughout. This is the range the defect lived in.
+        assertEquals(500, heapOverrideMaxMb(2000))
+        assertEquals(500, heapCeilingMb(2000, isLowRam = false, requestedMb = 1200))
+    }
+
+    @Test
+    fun `the floor still binds where a quarter falls under the editor's minimum`() {
+        // Under 1 GiB a quarter is below HEAP_CEILING_MIN_MB, and heapCeilingMb
+        // coerces a request into [256, heapOverrideMaxMb(T)]. A maximum under that
+        // minimum is an empty range and coerceIn throws, inside heapCeilingForDevice's
+        // try, where it is swallowed into the flat default with a line naming the
+        // wrong cause. So the floor is not only about what the user is owed; it is
+        // what keeps the range it feeds legal, and a bare fraction would not.
+        assertEquals(HEAP_CEILING_MIN_MB, heapOverrideMaxMb(800))
+        assertEquals(HEAP_CEILING_MIN_MB, heapCeilingMb(800, isLowRam = false, requestedMb = 1200))
+    }
+
+    @Test
+    fun `a low-RAM device ignores the request entirely`() {
+        // The OEM flag is the manufacturer saying totalMem overstates what this
+        // device can spare, and a user cannot know better than the OEM about their
+        // own hardware. Ordering, not arithmetic: this passes only while the flag is
+        // tested ABOVE the override arm.
+        assertEquals(
+            HEAP_CEILING_MIN_MB,
+            heapCeilingMb(2000, isLowRam = true, requestedMb = 1024),
+        )
+    }
+
+    @Test
+    fun `an unknown total ignores the request entirely`() {
+        // Also ordering. The override's only protection is a clamp computed from the
+        // total, so with no total there is nothing to clamp against and honouring a
+        // request there would be honouring it unbounded.
+        assertEquals(
+            HEAP_CEILING_DEFAULT_MB,
+            heapCeilingMb(0, isLowRam = false, requestedMb = 1024),
+        )
+    }
+
+    @Test
+    fun `a request may lower as well as raise`() {
+        // This exists to stop a defensive `coerceAtLeast(derived)` being added later
+        // as an obvious safety improvement. It would take away the only thing a user
+        // on a struggling device can do from here, and nothing else would go red.
+        assertEquals(400, heapCeilingMb(15500, isLowRam = false, requestedMb = 400))
+    }
+
+    @Test
+    fun `no request leaves every existing device on exactly the derived value`() {
+        // The backward-compatibility claim, asserted rather than assumed: an install
+        // with no key in settings.json must produce a byte-identical command line.
+        for (total in listOf(1024L, 2048L, 3700L, 6144L, 7600L, 15500L)) {
+            assertEquals(
+                heapCeilingMb(total, isLowRam = false),
+                heapCeilingMb(total, isLowRam = false, requestedMb = null),
+                "a null request changed the answer at $total MiB",
+            )
+        }
+    }
+}
+
+/**
+ * Reading the requested value out of the user's settings.json.
+ *
+ * settings.json is JSONC, it belongs to the user, and this is a text search over
+ * it rather than a parse. The case that matters most is the commented-out one.
+ */
+class HeapOverrideReaderTest {
+
+    @Test
+    fun `the key is read from a document shaped like the one this app writes`() {
+        val doc = """
+            {
+                "terminal.integrated.defaultProfile.linux": "bash",
+                "vscodroid.server.heapCeilingMb": 1024,
+                "extensions.verifySignature": false,
+            }
+        """.trimIndent()
+        assertEquals(1024, heapOverrideFromSettings(doc))
+    }
+
+    @Test
+    fun `a commented-out key is not honoured`() {
+        // The negative control this reader exists to survive. Without the (?m)^\s*
+        // anchor an example a user left in their file, or one this project could put
+        // there itself, is read as a setting, and nothing looks wrong until the
+        // device starts dying. 8192 is chosen so a regression is unmistakable in the
+        // failure message rather than a plausible number.
+        val doc = """
+            {
+                // "vscodroid.server.heapCeilingMb": 8192,
+                "extensions.verifySignature": false,
+            }
+        """.trimIndent()
+        assertNull(heapOverrideFromSettings(doc), "a commented-out example was honoured")
+    }
+
+    @Test
+    fun `a key inside a block comment is not honoured`() {
+        // The other comment form, and the one the anchor does not see: a key on a
+        // line of its own inside `/* ... */` starts that line exactly as a live
+        // one does. A user who blocked out an experiment to switch it off got the
+        // raised ceiling anyway, a start summary saying "user override", and after
+        // three kills a card telling them a setting they believed was off had been
+        // suspended. 8192 for the reason the case above gives.
+        val doc = """
+            {
+                /*
+                "vscodroid.server.heapCeilingMb": 8192,
+                */
+                "extensions.verifySignature": false,
+            }
+        """.trimIndent()
+        assertNull(heapOverrideFromSettings(doc), "a key inside a block comment was honoured")
+    }
+
+    @Test
+    fun `a block comment elsewhere does not hide a live key`() {
+        // The control for the case above, and the reason the span is matched
+        // shortest-first: a greedy `/\*.*\*/` over a document with two comments
+        // eats everything between the first `/*` and the last `*/`, the live key
+        // included, and the user silently gets the derived ceiling.
+        val doc = """
+            {
+                /* the derived value was too small for this workspace */
+                "vscodroid.server.heapCeilingMb": 1024,
+                /* "extensions.verifySignature": false, */
+            }
+        """.trimIndent()
+        assertEquals(1024, heapOverrideFromSettings(doc))
+    }
+
+    @Test
+    fun `a glob in a value does not swallow a live key`() {
+        // The document this app itself writes plants three comment openers, inside
+        // the `<node_internals>` globs of its default `launch` block, and no closer
+        // at all. `launch` is the last property and the workbench appends new keys
+        // after the last one, so the user's key lands after all three openers, and
+        // the first exclude glob they add on the same settings tab supplies the
+        // closer. Everything between, the key included, read as one comment and the
+        // user silently got the derived ceiling, which for a value they had lowered
+        // is the larger of the two numbers. A delimiter inside a string value is
+        // text, and the reader has to know the difference.
+        val doc = """
+            {
+                "launch": {
+                    "version": "0.2.0",
+                    "configurations": [
+                        {
+                            "name": "Attach to Node.js",
+                            "type": "node",
+                            "skipFiles": ["<node_internals>/**"]
+                        }
+                    ]
+                },
+                "vscodroid.server.heapCeilingMb": 1024,
+                "files.exclude": { "**/node_modules": true },
+            }
+        """.trimIndent()
+        assertEquals(1024, heapOverrideFromSettings(doc), "a glob was read as a comment")
+    }
+
+    @Test
+    fun `a stray quote in a line comment does not hide a block comment`() {
+        // The cost of knowing strings from delimiters, and the reason line comments
+        // are recognised too. A `//` comment is prose, so an unbalanced quote in one
+        // is ordinary; left to be read as opening a string it would run to the next
+        // quote in the file, carry the block opener after it inside, and hand the
+        // commented-out key straight back to the anchor. 8192 for the reason the
+        // cases above give.
+        val doc = """
+            {
+                // careful with "this
+                /*
+                "vscodroid.server.heapCeilingMb": 8192,
+                */
+                "extensions.verifySignature": false,
+            }
+        """.trimIndent()
+        assertNull(heapOverrideFromSettings(doc), "a key inside a block comment was honoured")
+    }
+
+    @Test
+    fun `a comment closed early by a glob is a known and accepted miss`() {
+        // The mirror of the case above, pinned here so nobody later reads this suite
+        // as claiming it is closed. It is not a misreading: a block comment ends at
+        // the first closer, quotes inside it notwithstanding, exactly as it does in
+        // C, so a comment carrying an exclude glob has already ended by the time the
+        // key is reached and the document is no longer valid JSONC. A real JSONC
+        // scanner reads it the same way. What keeps it harmless is what keeps every
+        // misreading here harmless: [heapCeilingMb] clamps whatever comes out, and a
+        // value that keeps killing the server spends its budget and is dropped.
+        val doc = """
+            {
+                /* ignore "**/build" for now */
+                "vscodroid.server.heapCeilingMb": 1536,
+            }
+        """.trimIndent()
+        assertEquals(1536, heapOverrideFromSettings(doc))
+    }
+
+    @Test
+    fun `a key that is only mentioned inside another value is not honoured`() {
+        // The other half of the anchor: a key name appearing mid-line, here inside a
+        // string somebody wrote, is not a setting either. On its own line, so the
+        // line-start anchor is not what rejects it and the quoting is.
+        val doc = """
+            {
+                "note": "set \"vscodroid.server.heapCeilingMb\": 4096 to tune it",
+            }
+        """.trimIndent()
+        assertNull(heapOverrideFromSettings(doc))
+    }
+
+    @Test
+    fun `a document written on one line is a known and accepted miss`() {
+        // Stated rather than hidden, because it is the price of the anchor and
+        // somebody will eventually meet it. A settings.json collapsed onto one line
+        // is not read, and the user silently gets the derived ceiling.
+        //
+        // Accepted for two reasons. Nothing writes this file that way: the
+        // workbench's settings editor and FirstRunSetup.insertSetting both put one
+        // key per line. And the failure direction is the safe one, where honouring
+        // a commented-out example is not. If this ever has to change, it must
+        // change without letting `a commented-out key is not honoured` go green on
+        // a comment.
+        assertNull(heapOverrideFromSettings("""{"vscodroid.server.heapCeilingMb": 1024}"""))
+    }
+
+    @Test
+    fun `an absent key reads as absent`() {
+        assertNull(heapOverrideFromSettings("""{ "extensions.verifySignature": false }"""))
+        assertNull(heapOverrideFromSettings(""))
+    }
+
+    @Test
+    fun `a value of the wrong type reads as absent rather than as a number`() {
+        // A quoted number is a mistake, and the safe reading of a mistake is the
+        // derived value. Relaxing `\d+` to something that accepts it would also
+        // start accepting the quotes as part of the number.
+        //
+        // Each on its own line, so a failure here means the type check failed and
+        // not that the anchor did the work.
+        assertNull(heapOverrideFromSettings("{\n    \"vscodroid.server.heapCeilingMb\": \"1024\",\n}"))
+        assertNull(heapOverrideFromSettings("{\n    \"vscodroid.server.heapCeilingMb\": true,\n}"))
+        assertNull(heapOverrideFromSettings("{\n    \"vscodroid.server.heapCeilingMb\": null,\n}"))
+    }
+
+    @Test
+    fun `a fractional value is read as its whole part and then clamped`() {
+        // Not a null, and worth pinning rather than leaving to be discovered.
+        // `\d+` stops at the point, so 1024.9 reads as 1024 and 10.5 reads as 10,
+        // which the floor then raises to 256. Both are safe: the clamp is what
+        // stands between any misreading here and the device, which is the reason
+        // the reader is allowed to be this simple.
+        assertEquals(1024, heapOverrideFromSettings("{\n    \"vscodroid.server.heapCeilingMb\": 1024.9,\n}"))
+        assertEquals(
+            HEAP_CEILING_MIN_MB,
+            heapCeilingMb(3700, isLowRam = false, requestedMb = 10),
+        )
+    }
+}
+
+/**
+ * The latch that turns a user's value off when it keeps killing the server.
+ *
+ * All three predicates are pure so they can be pinned without a Context, which is
+ * what lets the boundary cases below be stated as arithmetic rather than as a
+ * sequence of fake crashes.
+ */
+class HeapOverrideLatchTest {
+
+    @Test
+    fun `the budget boundary is the pair, not one side of it`() {
+        assertFalse(heapOverrideSuspended(HEAP_OVERRIDE_KILL_BUDGET - 1))
+        assertTrue(heapOverrideSuspended(HEAP_OVERRIDE_KILL_BUDGET))
+        assertTrue(heapOverrideSuspended(HEAP_OVERRIDE_KILL_BUDGET + 1))
+    }
+
+    @Test
+    fun `only a SIGKILL with the value in effect spends a life`() {
+        // 137 is 128 + SIGKILL, which is what a low-memory kill reaches the watchdog
+        // as. The other three cases are the ones a looser rule would swallow.
+        assertEquals(2, heapKillsAfter(137, overrideRaisedCeiling = true, current = 1))
+        assertEquals(
+            1, heapKillsAfter(137, overrideRaisedCeiling = false, current = 1),
+            "a derived ceiling, and a ceiling the user lowered, must not spend a " +
+                "budget nobody is using",
+        )
+        assertEquals(
+            1, heapKillsAfter(134, overrideRaisedCeiling = true, current = 1),
+            "134 is V8's own heap-limit abort: the ceiling working, not failing",
+        )
+        assertEquals(
+            1, heapKillsAfter(ADOPTED_SERVER_LOST, overrideRaisedCeiling = true, current = 1),
+            "an adopted server never ran with this value",
+        )
+    }
+
+    @Test
+    fun `only a raise has lives to spend`() {
+        // The direction the latch had no notion of at all. Its remedy is the
+        // derived ceiling, which for a lowered value is the LARGER number, so
+        // charging one and then suspending it raises the ceiling on the device
+        // that was already being killed.
+        //
+        // 6144 MiB derives 768 and allows a request up to 1536.
+        val total = 6L * 1024
+        assertEquals(768, heapCeilingMb(total, isLowRam = false), "fixture: the derived arm")
+
+        assertTrue(
+            heapOverrideRaisesCeiling(total, isLowRam = false, requestedMb = 1024),
+            "a value above the derived one is what the latch exists for",
+        )
+        assertFalse(
+            heapOverrideRaisesCeiling(total, isLowRam = false, requestedMb = 384),
+            "a lowered ceiling cannot be the cause of the kill the latch answers",
+        )
+        assertFalse(
+            heapOverrideRaisesCeiling(total, isLowRam = false, requestedMb = 768),
+            "a request that lands on the derived value changes nothing to disable",
+        )
+        assertFalse(
+            heapOverrideRaisesCeiling(total, isLowRam = false, requestedMb = null),
+            "no request, nothing to charge",
+        )
+        assertFalse(
+            heapOverrideRaisesCeiling(total, isLowRam = true, requestedMb = 1024),
+            "a low-RAM device never ran with the request, whatever its direction",
+        )
+        assertFalse(
+            heapOverrideRaisesCeiling(0, isLowRam = false, requestedMb = 1024),
+            "an unreadable total ignores the request, so there is nothing in effect",
+        )
+    }
+
+    @Test
+    fun `a clamped raise is still a raise`() {
+        // The value that reaches the command line is what matters, not the number
+        // in settings.json. A request of 4096 on a 6 GB device arrives as 1536,
+        // which is still twice the derived 768 and is exactly the case the budget
+        // is for.
+        assertTrue(heapOverrideRaisesCeiling(6L * 1024, isLowRam = false, requestedMb = 4096))
+        // And a request BELOW the floor is raised to it, which on a large device is
+        // still a lowering: 256 against a derived 768.
+        assertFalse(heapOverrideRaisesCeiling(6L * 1024, isLowRam = false, requestedMb = 64))
+    }
+
+    @Test
+    fun `changing the value hands back a full budget`() {
+        // Without this the count is permanent, and a value disabled after three
+        // kills could never be re-enabled by lowering it. The only way out would be
+        // clearing app data, which destroys filesDir and with it the user's
+        // projects, toolchains and extensions.
+        assertEquals(3, heapKillsForValue(storedValue = 1024, storedKills = 3, currentValue = 1024))
+        assertEquals(0, heapKillsForValue(storedValue = 1024, storedKills = 3, currentValue = 900))
+        assertEquals(0, heapKillsForValue(storedValue = 0, storedKills = 3, currentValue = 1024))
+    }
+}

@@ -1,0 +1,1264 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  # A build the signed artifacts can be exercised by without publishing one.
+  # Nothing else in this repository builds `assembleRelease` or `bundleRelease`
+  # with the real keystore: r8.yml runs the shrinker against a stub tree and
+  # stops short of signing, and build.yml builds debug. So the whole
+  # release-only half -- validateSigningRelease, packageRelease, bundleRelease,
+  # checkBundleSize, the symbol zip, the toolchain ZIPs and their digest
+  # manifest -- was reachable only by pushing a tag, which is to say only by
+  # publishing. A failure there is discovered on the one build that cannot be
+  # taken back.
+  #
+  # It cannot publish. `github-release` is the only job that writes anything
+  # outward, and it is gated on `github.event_name == 'push'`; the tag/version
+  # gate at the top of build-release is gated the same way, because there is no
+  # tag on this path to compare against. The gate is on the TRIGGER and not on
+  # the ref, and that distinction is the whole guarantee: a workflow_dispatch
+  # can be aimed at a tag ref, so `startsWith(github.ref, 'refs/tags/v')` would
+  # be true for a dispatched run and would publish from one. The ref test is
+  # kept beside it as the second half rather than the first.
+  #
+  # Its cost is a runner-hour and the artifacts it uploads expire; it holds the
+  # signing secrets, which is why it takes the same write access to start as
+  # pushing a tag does.
+  workflow_dispatch:
+
+# Read by default, raised to write on the one job that publishes. build-release
+# holds the signing secrets and runs by far the most foreign code in the
+# repository (Gradle plugins, npm postinstalls, Termux and Alpine downloads), and
+# none of it needs to write anything back here.
+permissions:
+  contents: read
+
+# Serialised, so two runs for one tag cannot interleave. A tag that moves starts
+# a second run against the same release, and assets are replaced one file at a
+# time, so a run killed midway leaves some files from this build and some from
+# the last with nothing on the release saying which is which. Measured
+# 2026-08-16: a cancelled re-run left a release holding a versionCode the store
+# had already consumed, and the only way to tell which commit each run built was
+# to ask the Actions API. cancel-in-progress would make that the normal case.
+#
+# Two things this does NOT do, both worth stating because the setting's name
+# invites the opposite reading.
+#
+# It does not keep a half-written release out of sight; the publish step below
+# does, and only on the run that creates the release. With no `prerelease:`
+# input the pinned action ignores its own `draft:` default and creates the
+# release as a draft: `createRelease` in src/github.ts reads
+# `const draft = prerelease === true ? config.input_draft === true : true`.
+# `finalizeRelease` is what clears the flag, and `run` in src/run.ts awaits
+# every upload before calling it, so a first publish killed mid-upload leaves a
+# draft rather than a public release missing half its assets.
+#
+# The window that is left is on a second run, the one the paragraph above
+# measures: a moved tag takes the update path, which passes
+# `draft: existingRelease.draft`, so an already-published release stays public
+# while each same-named asset is deleted and re-uploaded one at a time. Closing
+# that means unpublishing or deleting the release before the run, which takes it
+# out of `releases/latest` for the duration, and that is where every non-Play
+# install resolves its toolchain ZIPs. So it stays open deliberately: it needs a
+# tag to move, while the pointer is read on every sideloaded install. What
+# reaches it is narrower than it was: the version gate below refuses a tag
+# re-aimed at a different commit, so a second run is one re-pushed at the same
+# commit, which rebuilds the same tree.
+# `draft: true` is no shortcut to it either, because `finalizeRelease` returns
+# early when that input is set and the release would never be published at all.
+#
+# It does not mean nothing in this group is ever cancelled. Per GitHub's
+# documented behaviour, a group holds at most one pending run: a third push
+# cancels the one already waiting, in progress or not. So a rapid sequence of
+# force-pushed tags can still skip a build. Not measured here, unlike the rest
+# of this comment.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-release:
+    name: Build Release
+    runs-on: ubuntu-latest
+    # Two Gradle release builds plus ~450 MB of toolchain downloads, ~90 MB of
+    # them the C/C++ toolchain's. Raised before the first tag rather than after
+    # one times out at 90%.
+    timeout-minutes: 90
+    env:
+      # The addons, the glibc shim, the exec interceptor, the trampoline and
+      # the Claude shim in a release are compiled with this one. build.yml pins
+      # the same version, and check-build-steps.py fails the two drifting
+      # apart: an APK built against another NDK is a different binary from the
+      # one every gate ran over.
+      NDK_VERSION: "27.2.12479018"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Tags and history are needed to compare this release against the
+          # previous one, and to find the server-<version> tag the server check
+          # below compares against. The default shallow fetch has neither, and
+          # the comparison would quietly pass by finding nothing.
+          fetch-depth: 0
+          # This job runs Gradle plugins, npm postinstalls and several download
+          # scripts, and it holds the signing secrets. It never pushes: the one
+          # step that reaches GitHub asks the API with GH_TOKEN scoped to itself,
+          # and the git commands here only read local history. A persisted token
+          # would be readable by all of that for ninety minutes. Where checkout
+          # stores it is deliberately not named here: it has moved between major
+          # versions, and this setting is right whatever the location is.
+          persist-credentials: false
+
+      # A tag that does not name the version it builds makes every later question
+      # about what a device is running unanswerable: the tag is the only durable
+      # record tying a published artefact to a tree. Setup itself no longer rests
+      # on the name alone, FirstRunSetup.setupIsStale compares the versionCode
+      # too, but the release notes, the store listing and any bug report still
+      # say the name, and a tag that disagrees with it points them all at the
+      # wrong commit.
+      - name: Check the tag matches the app version
+        # Tag path only, because every question it asks needs a tag: the name to
+        # compare against versionName, the predecessor to compare versionCode
+        # against, and the CHANGELOG heading that has to have been renamed by
+        # the moment of tagging. On a dispatched run `github.ref_name` is a
+        # branch, so the first `case` would refuse it, and the CHANGELOG rule
+        # would refuse every branch that correctly still says Unreleased --
+        # which is the reason the step's own comment gives for not running it on
+        # a pull request. Nothing is lost: no dispatched run publishes, so there
+        # is no artefact for a wrong version to end up on.
+        if: github.event_name == 'push'
+        env:
+          TAG: ${{ github.ref_name }}
+          # What the ref pointed at before this push and what it points at now.
+          # Every other check here compares this tree against OTHER tags, so none
+          # of them can see the tag itself being re-aimed: by the time the runner
+          # has the checkout, the tag is simply on this commit and git holds no
+          # record of where it used to be. The push event does, and reading it
+          # costs neither a token nor a call to the API.
+          TAG_WAS: ${{ github.event.before }}
+          TAG_NOW: ${{ github.event.after }}
+        run: |
+          # Through the environment and validated before use: the tag reaches a
+          # git command below, and the workflow's v* filter is a match rule, not
+          # a guarantee about the rest of the name.
+          case "$TAG" in
+            v[0-9]*) ;;
+            *) echo "::error::Refusing tag $TAG; expected v followed by the version, such as v1.6.0"; exit 1 ;;
+          esac
+
+          # A tag that already existed and now names a different commit satisfies
+          # every check below, because all of them still describe the release that
+          # was cut from the old commit: versionName still matches the tag,
+          # versionCode still beats the version before it, and the three CHANGELOG
+          # rules were all satisfied when the tag was first taken. The run then
+          # rebuilds, re-signs and replaces the assets of a release that is
+          # already public, with a tree of everything merged since, still
+          # labelled the same versionName and versionCode.
+          # FirstRunSetup.setupIsStale compares
+          # exactly those two fields, so every device already on that version
+          # installs the new tree and skips extraction and migrations entirely.
+          #
+          # Forty zeros means the tag is new. TAG_WAS equal to TAG_NOW means it
+          # was re-pushed at the same commit, which rebuilds the same tree and is
+          # how a run cancelled or killed midway is retried. A push event
+          # carrying no `before` at all is allowed through rather than blocking a
+          # release on the shape of a payload.
+          #
+          # This is a guardrail and not a wall, deliberately: deleting the tag and
+          # pushing it again presents as a new tag and is allowed, which is the
+          # right way back when the earlier run never published anything. What it
+          # stops is the one-line accident, `git tag -f` followed by `git push
+          # -f`, which is indistinguishable from a normal release everywhere else.
+          case "$TAG_WAS" in
+            ""|0000000000000000000000000000000000000000|"$TAG_NOW") ;;
+            *) echo "::error::Tag $TAG pointed at $TAG_WAS and now points at $TAG_NOW." \
+                    "Re-aiming a tag republishes the assets of a release users already" \
+                    "have, under a versionName and versionCode that did not change, so" \
+                    "their next install skips setup. Cut a new version; if nothing was" \
+                    "published, delete the tag and push it again."
+               exit 1 ;;
+          esac
+
+          # A tag publishes: it creates the release and moves what `releases/latest`
+          # resolves to, which every sideloaded install reads. Everything below
+          # describes the tree at the tag and none of it says the tree is on main, so
+          # a tag taken on a branch commit passed all of it. Compared against the
+          # remote-tracking ref, which a full-history checkout carries for each branch.
+          git rev-parse --verify -q refs/remotes/origin/main >/dev/null || {
+            echo "::error::This checkout has no origin/main, so whether $TAG is on main" \
+                 "was not checked."
+            exit 1
+          }
+          if ! git merge-base --is-ancestor HEAD refs/remotes/origin/main; then
+            echo "::error::$TAG is not on main. A tag publishes a release and moves" \
+                 "releases/latest for every sideloaded install; merge the commit to" \
+                 "main first, then tag it."
+            exit 1
+          fi
+
+          gradle_file=android/app/build.gradle.kts
+          # Anchored to the start of a line. That file is majority comment, and
+          # its comments quote the code they describe -- the lint block, the
+          # BuildConfig block and the setup-staleness invariant all discuss
+          # versionCode and versionName in prose. An unanchored -m1 takes
+          # whichever line comes first, so one explanatory comment written above
+          # the declaration would compare the tag against a number lifted out of
+          # a sentence, and the case this gate exists to catch (a versionCode
+          # that does not increase, so the release's migrations run for nobody)
+          # is exactly the one it would then wave through.
+          #
+          # Each value is cut out of its own declaration: the first quoted string, and
+          # the digits that follow the equals sign. Stripping every non-digit from the
+          # line instead turned `versionCode = 16 // v1.5.0` into 16150, and the
+          # greedy quote match took the last quoted string on a line that carries a
+          # comment, so either one made the comparison below about a number that was
+          # never declared.
+          version_name=$(grep -m1 -E '^[[:space:]]*versionName = ' "$gradle_file" | sed -n -E 's@^[[:space:]]*versionName = "([^"]*)"[[:space:]]*(//.*)?$@\1@p')
+          version_code=$(grep -m1 -E '^[[:space:]]*versionCode = ' "$gradle_file" | sed -n -E 's@^[[:space:]]*versionCode = ([0-9]+)[[:space:]]*(//.*)?$@\1@p')
+          tag_version=${TAG#v}
+
+          case "$version_code" in *[!0-9]*) version_code="" ;; esac
+          if [ -z "$version_name" ] || [ -z "$version_code" ]; then
+            echo "::error::Could not read versionName/versionCode from $gradle_file." \
+                 "The declaration moved or changed shape; this gate compared nothing."
+            exit 1
+          fi
+
+          echo "tag          : $TAG"
+          echo "versionName  : $version_name"
+          echo "versionCode  : $version_code"
+
+          if [ "$tag_version" != "$version_name" ]; then
+            echo "::error::Tag $TAG does not match versionName $version_name in $gradle_file." \
+                 "Existing installs gate first-run setup on versionName, so releasing this" \
+                 "would skip extraction and migrations for every upgrading user."
+            exit 1
+          fi
+
+          # versionCode is what migrations threshold against; a repeat means a
+          # migration written for this release runs for nobody. The 'v[0-9]*'
+          # filter keeps build-vscode-oss.yml's server-* tags out of "previous":
+          # those land on arbitrary commits, and comparing against one either
+          # fails a legitimate tag or lets a repeated versionCode through.
+          #
+          # The highest released version, not the nearest tag behind this commit.
+          # `git describe ... "$TAG^"` answered a question about ancestry, and a
+          # tag does not have to be cut on top of the last one: aim v1.3.0 at a
+          # branch taken before v1.2.0 and the nearest tag behind it is v1.1.0,
+          # so v1.2.0's versionCode is never compared against and the store gets
+          # a build it will refuse or a device gets one whose migrations do not
+          # run. Play requires versionCode to rise across every upload, not along
+          # one line of history, so the whole tag list is the right comparison.
+          # The tag being placed is excluded because it is already on this commit
+          # by the time the runner sees it, and comparing a tree against itself
+          # would fail every release.
+          previous=$(git tag --list 'v[0-9]*' --sort=-v:refname | grep -vFx "$TAG" | head -1 || true)
+          if [ -n "$previous" ]; then
+            previous_code=$(git show "$previous:$gradle_file" 2>/dev/null \
+              | grep -m1 -E '^[[:space:]]*versionCode = ' \
+              | sed -n -E 's@^[[:space:]]*versionCode = ([0-9]+)[[:space:]]*(//.*)?$@\1@p' || echo "")
+            case "$previous_code" in *[!0-9]*) previous_code="" ;; esac
+            if [ -z "$previous_code" ]; then
+              echo "::error::Could not read versionCode in $previous; refusing an unchecked release."
+              exit 1
+            fi
+            if [ "$version_code" -le "$previous_code" ]; then
+              echo "::error::versionCode $version_code is not greater than $previous_code in $previous." \
+                   "Migrations threshold on versionCode and would not run."
+              exit 1
+            fi
+            echo "previous tag : $previous (versionCode $previous_code)"
+          fi
+
+          # The published release notes come from `generate_release_notes: true`
+          # below, so nothing on the release path reads CHANGELOG.md and a tag
+          # taken with the heading still saying Unreleased leaves the repository
+          # with no section naming the version a user installed. Checked here
+          # rather than on a pull request because a branch that correctly leaves
+          # the section open would fail every such check; the tag is the one
+          # moment the heading has to have been renamed, and this step already
+          # holds the version to look for.
+          if ! grep -q "^## \[$version_name\]" CHANGELOG.md; then
+            echo "::error::CHANGELOG.md has no '## [$version_name]' section." \
+                 "Rename the Unreleased heading to this version before tagging," \
+                 "and open a fresh empty Unreleased above it."
+            exit 1
+          fi
+
+          # The heading is a reference-style link, so renaming it alone leaves it
+          # pointing at nothing and leaves [Unreleased] comparing against the tag
+          # before this one. Both definitions live at the foot of the file, both
+          # have been missed by hand, and neither is visible in the rendered page
+          # until someone clicks the heading.
+          if ! grep -q "^\[$version_name\]: " CHANGELOG.md; then
+            echo "::error::CHANGELOG.md has no '[$version_name]: ' link definition." \
+                 "Add it at the foot of the file beside the others."
+            exit 1
+          fi
+          if ! grep -q "^\[Unreleased\]: .*compare/$TAG\.\.\.HEAD" CHANGELOG.md; then
+            echo "::error::CHANGELOG.md's [Unreleased] link does not compare against $TAG." \
+                 "Point it at compare/$TAG...HEAD so the next section starts from this release."
+            exit 1
+          fi
+
+      # This workflow builds no server. It ships the server-<version> asset that
+      # build-vscode-oss.yml published, and the fetch step below compares only the
+      # pin, patches/ and branding/product.json with it: an edit to
+      # build-vscode-oss.sh or patch-js-debug-env.py passes, and the tag ships the
+      # tree the earlier script built. A patch edit is refused there, but only
+      # once the tag exists. This asks first, before anything is built, whether a
+      # file that decides the tree differs from the commit the server tag points
+      # at, which each publish moves to the commit it built.
+      #
+      # No `if:`, so a dispatched dry run answers the way the tag would.
+      - name: Check the published server was built from the same inputs
+        run: python3 scripts/check-server-published.py
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@77dd5b2ce225ea11469928ac317850245a74ae78 # v6.2.0
+        with:
+          java-version: "17"
+          distribution: "temurin"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@be39fa834029ff78f1a44aa3bb0819b8fc2bd8fd # v4.0.4
+
+      - name: Set up NDK
+        run: |
+          sdkmanager "ndk;${NDK_VERSION}" --channel=0
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/${NDK_VERSION}" >> "$GITHUB_ENV"
+          # The Android plugin ignores ANDROID_NDK_HOME and picks its own default
+          # NDK, which this image may not have: it then packaged every library
+          # unstripped and extracted no symbols. See ndkVersion in app/build.gradle.kts.
+          echo "VSCODROID_NDK_VERSION=${NDK_VERSION}" >> "$GITHUB_ENV"
+
+      - name: Set up Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "24"
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@8da46b539cd8fe6ab27ca75128919a18d757604c # v6.4.1
+        with:
+          # Pinned to a non-commercial value, not left to the default.
+          #
+          # gradle/actions v6 added cache-provider and defaults it to 'enhanced',
+          # which the action's own description calls "the full-featured commercial
+          # caching service (gradle-actions-caching)". This project drops
+          # dependencies over their licences and publishes a source offer, so a
+          # dependency bump does not get to move it onto a commercial service.
+          # Naming the value also means a later default change cannot move it.
+          #
+          # `external` rather than `basic`: this action saves its cache even when
+          # the job failed (its post step runs unless cancelled), and the basic
+          # provider keeps the first entry written under a key, with no restore
+          # keys and no overwrite. A job that failed before Gradle had downloaded
+          # anything saved an empty entry (444 bytes, 2026-11-08), and every later
+          # job with the same Gradle files restored it and downloaded everything
+          # again. The Gradle home is restored by the step below and saved by
+          # the CI jobs in build.yml, lint.yml and r8.yml.
+          cache-provider: external
+
+      - name: Restore the Gradle user home
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          # Read only. A tag's own cache is never read again, and the entries
+          # this restores are the ones main's CI jobs save under the same key.
+          key: gradle-home-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('android/**/*.gradle.kts', 'android/gradle/**') }}
+          restore-keys: |
+            gradle-home-${{ runner.os }}-${{ runner.arch }}-
+
+      # The gates lint.yml and build.yml run, applied here to the tree actually
+      # being published. Both of those fire on pull_request and on push to main;
+      # neither fires on a tag, and a tag is free to name a commit that reached
+      # main through neither path. So a tagged build passes them only because
+      # this block runs them again, on the one build type that also runs R8.
+      #
+      # Before the downloads on purpose. Each reads committed source only, and
+      # failing in twenty seconds beats failing after six minutes of fetching.
+      # device-test.sh --self-check derives its Python expectation from the
+      # assets tree and reports it as skipped when there is none, so it is
+      # honest this early rather than wrong.
+      - name: Check the documented build steps match the workflows
+        run: python3 scripts/check-build-steps.py
+
+      # Reaches workflows this trigger never runs, which is the point:
+      # build-vscode-oss.yml is workflow_dispatch only, so a malformed step in it
+      # would otherwise surface once per VS Code bump, long after the commit.
+      - name: Check every workflow step is runnable and pinned
+        run: python3 scripts/check-workflow-steps.py
+
+      - name: Check the bridge API spec matches the registered signatures
+        run: python3 scripts/check-bridge-api-spec.py
+
+      - name: Check local network access survives the targetSdk in use
+        run: python3 scripts/check-local-network-permission.py
+
+      # The privacy policy is the one document here that makes a closed statement
+      # about permissions, and nothing measured it: it said four and no others
+      # while the installed app declared six, because the two extras are folded in
+      # by the manifest merger and appear in no committed file. A bare checkout has
+      # no merged manifest, so this covers the committed half and says so; the
+      # merged half runs from the checkPermissionClaims Gradle task on a real build.
+      - name: Check the privacy policy matches the permissions that ship
+        run: python3 scripts/check-permission-claims.py
+
+      - name: Check no user-facing text is stranded in Kotlin
+        run: python3 scripts/check-translatable-strings.py
+
+      - name: Check the lint baseline has not grown
+        run: python3 scripts/check-lint-baseline.py
+
+      - name: Check the welcome screen states nothing that goes stale
+        run: python3 scripts/check-welcome-claims.py
+
+      # The committed half of it: the extension list against the notices table.
+      # The half that reads an extracted tree runs later anyway, from
+      # download-extensions.sh, so failing on a mismatched notices row costs
+      # seconds here instead of a download.
+      - name: Check the bundled extensions match the notices
+        run: python3 scripts/check-bundled-extensions.py
+
+      - name: Check no document offers a withdrawn toolchain
+        run: python3 scripts/check-toolchain-claims.py
+
+      # Also in lint.yml, and here for the reason the block's header gives: a tag
+      # may name a commit that reached neither pull_request nor push to main, and
+      # this was the one committed-source check such a tree could skip. The set
+      # build.yml runs is held to a subset of this block by check-build-steps.py;
+      # lint.yml's set is not, so the omission was silent rather than caught.
+      - name: Check the tree writes plain punctuation
+        run: python3 scripts/check-plain-punctuation.py
+
+      - name: Check the device-test checklist accounts for its own rows
+        run: python3 scripts/check-checklist-totals.py
+
+      # With the rest of this block, for the reason its header gives. This one
+      # covers the suite a person is told to run before tagging: its README is
+      # the only account of what it covers, and a tag is the moment that account
+      # is being acted on.
+      - name: Check the instrumented suite matches what documents it
+        run: python3 scripts/check-instrumented-inventory.py
+
+      # This job runs Gradle four times, so it is a place the wrapper actually
+      # downloads a distribution. Presence only: a sum that is present and wrong
+      # is refused by the wrapper itself on the next invocation, while an absent
+      # one runs whatever the URL serves and looks exactly like a pinned tree.
+      - name: Check the Gradle distribution is pinned to a digest
+        run: |
+          props=android/gradle/wrapper/gradle-wrapper.properties
+          if ! grep -q '^distributionSha256Sum=[0-9a-f]\{64\}$' "$props"; then
+            echo "::error file=$props::no distributionSha256Sum; the wrapper would" \
+                 "run whatever $(grep -m1 '^distributionUrl=' "$props") serves." \
+                 "Take the digest from that URL with .sha256 appended."
+            exit 1
+          fi
+          grep '^distributionUrl=\|^distributionSha256Sum=' "$props"
+
+      # Needs real history, which both this job and lint.yml now take: in
+      # actions/checkout's default single-commit clone `git log -1 -- <file>`
+      # reports the tip for everything it can see, and the check refuses a
+      # shallow clone rather than skipping, so a wrong placement fails loudly
+      # instead of reporting a pass it never earned. It ran here alone until a
+      # punctuation sweep restaled both dates and nothing said so until the tag
+      # was pushed and this job aborted on it.
+      - name: Check the shipped documents are not dated before their contents
+        run: python3 scripts/check-document-dates.py
+
+      - name: Check the device suite can still read what it asserts
+        run: bash scripts/device-test.sh --self-check
+
+      - name: Check release version declarations are read exactly
+        run: python3 scripts/test-release-versions.py
+
+      - name: Check packaging and device maintenance commands offline
+        run: python3 scripts/test-maintenance-scripts.py
+
+      - name: Check native shim behavior
+        run: python3 scripts/test-native-shims.py
+
+      - name: Check the bundled JavaScript runtime
+        run: |
+          node scripts/test-dns-proxy.js
+          node scripts/test-process-monitor.js
+          node scripts/test-platform-fix.js
+          node scripts/test-server-bootstrap.js
+          node scripts/test-server-run-proof.js
+          node scripts/test-process-monitor-extension.js
+          node scripts/test-bridge-relay.js
+          node scripts/test-auth-callback-provider.js
+          node scripts/test-saf-mirror-usage.js
+          node scripts/test-server-startup.js
+          node scripts/test-ui-scale.js
+          node scripts/test-plain-text-page.js
+          node scripts/test-download-capture.js
+          node scripts/test-arrow-edge-guard.js
+          node scripts/test-modifier-release.js
+          node scripts/test-composing-enter.js
+          node scripts/test-leave-curtain.js
+          node scripts/test-status-bar-scroll.js
+          node scripts/test-keyboard-guard.js
+          node scripts/test-caret-drag.js
+          node scripts/test-serve-network.js
+          node scripts/test-welcome.js
+          node scripts/test-workbench-layout.js
+          node scripts/test-run-file.js
+          node scripts/test-auth-bootstrap.js
+          python3 scripts/check-extension-updates.py
+          node scripts/test-xdg-open.js
+          node scripts/test-page-scripts.js
+          node scripts/test-server-serve-file.js
+
+      # What lint.yml runs beyond the block above, for the reason its header gives: a tag may
+      # name a commit that reached main through neither pull_request nor push. These ask the
+      # gates this job relies on to refuse what they exist to refuse, and the build helpers to
+      # behave offline. Plain Python and the runner's own compiler, as they are there.
+      - name: Check the gates still refuse what they exist to refuse
+        run: |
+          python3 scripts/check-workflow-steps.py --self-test
+          python3 scripts/verify-android-elf.py --self-test
+          python3 scripts/verify-server-tree.py --self-test
+          python3 scripts/check-patch-fingerprints.py --self-test
+          python3 scripts/check-editcontext-sync.py --self-test
+          python3 scripts/patch-venv-home.py --self-test
+          python3 scripts/gen-glibc-forwarders.py --self-test
+          python3 scripts/test-language-detection.py
+
+      - name: Check the build helpers offline
+        run: |
+          python3 scripts/test-download-extensions.py
+          python3 scripts/test-copilot-compile-guard.py
+          python3 scripts/test-patch-sysroot-paths.py
+          python3 scripts/test-exec-trampoline.py
+          python3 scripts/test-check-server-published.py
+          python3 scripts/test-extension-updates.py
+
+      - name: Install system dependencies
+        # See build.yml: the runner's baked apt index goes stale as Ubuntu drops
+        # superseded versions from the pool, so refresh it before installing.
+        # Bounded and retried for the reason given there, which applies harder
+        # here: this job's budget is 90 minutes, so an unbounded stall costs an
+        # hour and a half of a release before anything says why.
+        timeout-minutes: 8
+        run: |
+          for attempt in 1 2 3; do
+            if sudo timeout 120 apt-get update; then
+              break
+            fi
+            echo "  apt-get update stalled or failed (attempt $attempt of 3)"
+          done
+          # gnupg named explicitly: verify-termux-index.sh refuses to run without
+          # it, and a release is the worst place to discover a runner image
+          # changed what it bakes in.
+          sudo apt-get install -y --no-install-recommends libarchive-tools zstd zip gnupg
+
+      # Cache downloaded tarballs/debs
+      #
+      # See build.yml: the .deb entry pointed one directory above the files and
+      # cached nothing, so every release refetched all 72 packages against a
+      # freshly resolved index, which is most of why re-running a tag could
+      # ship different binaries. The path list below is a literal block: a `#`
+      # line inside it is a path, not a comment.
+      - name: Cache download intermediates
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            server/*.tar.gz
+            toolchains/termux-packages/debs/*.deb
+            toolchains/termux-packages/Packages
+            toolchains/build/npm/
+            toolchains/extensions/
+            toolchains/musl/
+          key: downloads-${{ hashFiles('VSCODE_VERSION', 'VSCODE_COMMIT', 'patches/**', 'branding/**', 'scripts/build-vscode-oss.sh', 'scripts/patch-js-debug-env.py', 'scripts/patch-language-detection.py', 'scripts/test-language-detection.py', '.github/workflows/build-vscode-oss.yml', 'scripts/fetch-vscode-oss.sh', 'scripts/verify-server-tree.py', 'scripts/lib/termux-packages.sh', 'scripts/download-termux-tools.sh', 'scripts/download-node.sh', 'scripts/patch-default-shell.py', 'scripts/download-npm.sh', 'scripts/download-python.sh', 'scripts/download-extensions.sh', 'scripts/download-musl-loader.sh', 'scripts/verify-termux-index.sh', 'scripts/termux-repo-key.asc', 'scripts/alpine-devel-616ae350.rsa.pub', 'scripts/verify-android-elf.py') }}
+          restore-keys: |
+            downloads-
+
+      # Download and prepare all core assets
+      # Built from the MIT source by build-vscode-oss.yml and published as a
+      # server-<version> release; this only downloads and checks it. Before the
+      # pivot the tree came pre-built from Microsoft's update CDN, which is
+      # covered by the Microsoft pre-release licence rather than MIT and so could
+      # not be modified and redistributed inside an APK.
+      - name: Fetch Code - OSS server
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash scripts/fetch-vscode-oss.sh
+
+      - name: Copy the server into assets
+        # The same copy scripts/package-assets.sh performs, called rather than
+        # restated. Two definitions of "packaging the server" stood here and in
+        # that script with nothing comparing them, while three Gradle failure
+        # messages told their reader to run `fetch-vscode-oss.sh &&
+        # package-assets.sh` as though it were the step CI takes. It is now.
+        run: bash scripts/package-assets.sh
+
+      # Reads out/nls.keys.json and out/nls.messages.json from the tree the step
+      # above just wrote, so it cannot run any earlier, and Gradle sizes the
+      # assets directory at configuration time (EXTRACTED_ASSET_BYTES), so it
+      # cannot run any later. Nothing in this job caches the assets tree, so
+      # unlike build.yml there is no cache key to keep in step with it here; a
+      # release that skipped it would publish an APK offering thirteen display
+      # languages and serving English for every one of them.
+      - name: Build the translated string bundles
+        run: python3 scripts/build-nls-bundles.py
+
+      - name: Download Termux tools
+        run: bash scripts/download-termux-tools.sh
+
+      - name: Download npm
+        run: bash scripts/download-npm.sh
+
+      - name: Download Python
+        run: bash scripts/download-python.sh
+
+      - name: Download extensions
+        run: bash scripts/download-extensions.sh
+
+      # Claude Code is no longer bundled: the user installs the extension from
+      # the marketplace and the CLI comes inside it, so nothing of Anthropic's is
+      # redistributed here and the version is theirs to update. What this ships
+      # is musl's loader, which is the only way that CLI starts on Android.
+      - name: Download musl loader
+        run: bash scripts/download-musl-loader.sh
+
+      # Before the native addons on purpose: build-native-addons.sh pairs its
+      # headers against the runtime this step installs, and fails closed when
+      # nothing is there to pair against. With the addons built first that gate
+      # can never fire in CI: there is no runtime to compare the headers to yet,
+      # so the pairing it exists to enforce is skipped rather than checked.
+      - name: Fetch Node runtime
+        run: bash scripts/download-node.sh
+      - name: Build native addons
+        run: bash scripts/build-native-addons.sh
+
+      # libnode.so is Termux's nodejs-lts, not a hand-cross-compiled binary kept
+      # as a release asset. The old one ran but segfaulted inside the Claude Code
+      # CLI's subcommands, and there was no way to debug a build we could not
+      # reproduce. Its version also decides which VS Code releases are reachable.
+      # After the server tree is in place and after download-termux-tools.sh,
+      # which wipes assets/usr/lib before repopulating it -- the stubs live there
+      # and would not survive being built first.
+      #
+      # Scans for addons that were built against glibc and generates stub
+      # libraries so Bionic's loader will accept them. Objects needing libstdc++
+      # are reported and skipped: Android ships libc++, and the two are not two
+      # spellings of the same library.
+      - name: Build the glibc compatibility shim
+        env:
+          ANDROID_NDK_HOME: ${{ env.ANDROID_NDK_HOME }}
+        run: |
+          bash scripts/build-glibc-shim.sh \
+            --scan android/app/src/main/assets/vscode-reh \
+            --scan android/app/src/main/assets/extensions
+
+      # The library the terminals preload so a program under the app's own
+      # storage, which SELinux will not execve, starts through the system
+      # linker instead. Built from termux-exec's source with the repository's
+      # patch, into assets/usr/lib, so after the wipe like the shim.
+      - name: Build the exec interceptor
+        env:
+          ANDROID_NDK_HOME: ${{ env.ANDROID_NDK_HOME }}
+        run: bash scripts/build-termux-exec.sh
+
+      # The one binary this repository compiles for the app itself. It is what
+      # puts a downloaded toolchain's commands on PATH as real files, so anything
+      # that resolves a bare name and execve's the result -- an extension
+      # spawning `ruby`, a make recipe under mksh, a "type": "process" task --
+      # can start them at all. Nothing this job caches covers jniLibs, so unlike
+      # build.yml there is no cache key to keep in step with it here.
+      - name: Build the execution trampoline
+        env:
+          ANDROID_NDK_HOME: ${{ env.ANDROID_NDK_HOME }}
+        run: bash scripts/build-exec-trampoline.sh
+
+      - name: Build the Claude Code seccomp shim
+        env:
+          ANDROID_NDK_HOME: ${{ env.ANDROID_NDK_HOME }}
+        run: bash scripts/build-claude-shim.sh
+
+      # Runs where the libraries actually exist, which lint.yml is not: it
+      # builds stub assets, and a stub tree has nothing to attribute. Berkeley
+      # DB shipped under AGPL-3.0 for every release before this check existed,
+      # having arrived as a transitive Kerberos dependency that no step looked
+      # at.
+      #
+      # This run covers the base APK only. The toolchain packs do not exist yet
+      # they are downloaded further down, so it runs again after them.
+      - name: Check every shipped library is attributed
+        run: python3 scripts/check-library-attribution.py
+
+      # The wheels pip is offered are pinned for one Python minor version, and
+      # the interpreter is resolved from the Termux index at build time, so a
+      # bump can arrive without anyone deciding. Here rather than in lint.yml
+      # because it reads the asset tree, which lint.yml stubs.
+      - name: Check the wheelhouse matches the bundled Python
+        run: python3 scripts/check-wheelhouse-abi.py
+
+      - name: Verify assets
+        run: |
+          echo "=== Assets ==="
+          ls -la android/app/src/main/assets/ || true
+          echo ""
+          echo "=== jniLibs ==="
+          ls -la android/app/src/main/jniLibs/arm64-v8a/ || true
+          echo ""
+          # Both files, the same pair build.yml weighs. This step checked
+          # libnode.so alone, on the one build that gets published, and the
+          # missing half is the one that matters: the four Gradle packaging
+          # gates that would notice an absent server tree are all armed by
+          # `onlyIf { entryPoint.isFile }` on this very file, so a tree without
+          # it does not fail them, it SKIPS them, and what is left weighs a
+          # runtime.
+          #
+          # The build no longer gets that far: app/build.gradle.kts asks the
+          # same question of any task graph that packages assets, which covers
+          # `./gradlew bundleRelease` and scripts/build-aab.sh as well, neither
+          # of which passes through a workflow. This stays because it answers
+          # here, before the toolchain downloads, the unit tests and lint,
+          # rather than when `assembleRelease` further down is the first
+          # invocation whose task graph packages an asset tree.
+          server=android/app/src/main/assets/vscode-reh/out/server-main.js
+          libnode=android/app/src/main/jniLibs/arm64-v8a/libnode.so
+          # One translated bundle stands for the thirteen. They are built by a
+          # step of their own, from a pinned vscode-loc commit, and their absence
+          # is the quietest failure in this job: the APK installs, opens, and is
+          # in English in every language, with nothing failing to say so.
+          nls=android/app/src/main/assets/nls/fr.json
+          for f in "$server" "$libnode" "$nls"; do
+            if [ ! -f "$f" ]; then
+              echo "::error::$f is missing; this build would install and open with nothing in it."
+              exit 1
+            fi
+          done
+          # The lint and unit-test jobs write a 64-byte libnode.so so Gradle
+          # will configure. Reaching a packaging job it would mean the real
+          # download never ran.
+          libnode_size="$(wc -c < "$libnode")"
+          if [ "$libnode_size" -lt 1000 ]; then
+            echo "::error::libnode.so is $libnode_size bytes -- that is the stub, not a runtime."
+            exit 1
+          fi
+          echo "server-main.js present; libnode.so $libnode_size bytes"
+
+      # Reads the packaged jniLibs, so it belongs here rather than with the
+      # source-only checks: the directory is empty until the download scripts
+      # above have run, and the gate refuses an empty one rather than passing
+      # over it. Deliberately not in lint.yml, which stubs the tree with a single
+      # 64-byte libnode.so so Gradle will run.
+      - name: Check the documented binary lists match what is packaged
+        run: python3 scripts/check-binary-lists.py
+      # Needs the assets in place, so it runs here rather than with the checks
+      # above: it walks the packaged extensions tree.
+      - name: Check the monitor recognises the language servers that ship
+        run: |
+          python3 scripts/check-langserver-patterns.py \
+            android/app/src/main/assets/vscode-reh/extensions
+
+      # The toolchains are fetched once, here, and feed two outputs that have to
+      # agree: download-*.sh fills android/toolchain_*/src/main/assets, which is
+      # what bundleRelease packs into the AAB for Play Asset Delivery, and
+      # package-toolchains.sh zips those same directories for the GitHub Release
+      # that non-Play installs download from. Fetched separately they can differ:
+      # the versions come from the Termux index at fetch time, so one app version
+      # could ship one Ruby through Play and a newer one through GitHub.
+      - name: Download toolchain assets
+        run: |
+          bash scripts/download-ruby.sh
+          bash scripts/download-java.sh
+          bash scripts/download-cpp.sh
+
+      # The unit suite ran on every pull request and on no tag, which put the
+      # published build on the wrong side of it. Before the signing keystore is
+      # decoded, so a failure here never reaches a step handling a secret.
+      #
+      # And after the toolchain download, which used to sit below it. One case
+      # in ToolchainRegistryTest measures each pack's real tree against the size
+      # the registry records, because an understated figure admits a device to an
+      # install it cannot finish -- and that has shipped once, when download-java.sh
+      # stopped deleting the JDK's legal/ and the constant stayed where it was.
+      # The pack trees are gitignored, so with the download below this step the
+      # case found nothing and assumed itself out of the run on every job that has
+      # ever executed it. A JUnit skip prints nothing in Gradle's console output,
+      # so the figure that decides the storage pre-flight was measured by nobody.
+      - name: Run unit tests
+        working-directory: android
+        run: ./gradlew testDebugUnitTest
+
+      # The other half of what lint.yml is for. The block above re-runs its
+      # python and node gates on a tag, and stopped short of the task the
+      # workflow is named after: `./gradlew lint` appears in exactly one place,
+      # lint.yml, which fires on pull_request and on push to main and not on a
+      # tag. Fatal-severity issues are covered on this path already, because
+      # lintVital sits in the assembleRelease graph and checks nothing else, so
+      # what was missing is errors and warnings, which `abortOnError` and
+      # `warningsAsErrors` in android/app/build.gradle.kts make fail a build. A
+      # tag cut from a hotfix branch that reached neither trigger met none of it.
+      #
+      # Before the keystore, with the rest of the re-run block, so a failure here
+      # never reaches a step handling a secret.
+      - name: Run lint
+        working-directory: android
+        run: ./gradlew lint
+
+      # The last thing build.yml does that a tag did not. Nothing runs the
+      # instrumented suite -- no runner measured here can, see
+      # androidTest/README.md -- so compiling it is the whole of what CI can
+      # offer, and that compile lived in build.yml's test job alone, which fires
+      # on pull_request and on push to main. A tag cut from a branch that
+      # reached neither got a signed build whose on-device suite may not even
+      # build, and the person told to run that suite before tagging finds out
+      # after the tag exists.
+      #
+      # Cheap here. The androidTest APK carries none of the bundled tree, which
+      # is measurable rather than assumed: its merged-asset directory
+      # (app/build/intermediates/assets/debugAndroidTest) is 0 B against 832 MB
+      # for the debug and release variants, and the APK it produces is 1.7 MB
+      # against the app's 334. The debug classes it compiles against were
+      # already compiled by the unit-test step above.
+      #
+      # Not measured: whether Gradle still schedules the app's own 832 MB asset
+      # merge as a dependency of this task even though nothing here consumes it.
+      # If it does, the cost is one more local copy of a tree this job already
+      # merges twice, for assembleRelease and bundleRelease, inside a 90 minute
+      # budget.
+      #
+      # Before the keystore, with the rest of the re-run block, so a failure
+      # here never reaches a step handling a secret.
+      - name: Compile the instrumented tests
+        working-directory: android
+        run: ./gradlew assembleDebugAndroidTest
+
+      # Decode signing keystore from base64 secret
+      #
+      # The emptiness test is the whole of the addition, and it is not
+      # theoretical: an unset or cleared KEYSTORE_BASE64 makes base64 read empty
+      # input, exit 0, and leave a zero-byte keystore.jks. The first complaint
+      # then comes from validateSigningRelease inside assembleRelease below,
+      # naming a keystore format rather than the secret, an hour into a release.
+      # A malformed secret already fails here: `base64 -d` is the last command
+      # of the pipeline, so its status is the pipeline's.
+      - name: Decode keystore
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+        run: |
+          printf '%s' "$KEYSTORE_BASE64" | base64 -d > android/keystore.jks
+          if [ ! -s android/keystore.jks ]; then
+            echo "::error::KEYSTORE_BASE64 decoded to nothing. The repository" \
+                 "secret is unset or empty; the signing key is not in this build."
+            exit 1
+          fi
+
+      - name: Build signed APK
+        working-directory: android
+        env:
+          VSCODROID_KEYSTORE_FILE: ${{ github.workspace }}/android/keystore.jks
+          VSCODROID_KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          VSCODROID_KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          VSCODROID_KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: ./gradlew assembleRelease
+
+      # The same gate as above, and this is the run that can see the toolchains.
+      # Their manifests are written by "Download toolchain assets" and are
+      # gitignored, so the earlier run reported "0 toolchain libraries" on a tag
+      # that was about to attach two packs to the release, and a new
+      # transitive dependency in any of them would have shipped unattributed with
+      # a green log. That is how libdb-18.1.so arrived in the first place: as a
+      # transitive dependency nobody was asked about.
+      #
+      # Before the ZIPs are packaged, so an unattributed library stops the
+      # release rather than being caught after the artifacts exist.
+      - name: Check every shipped toolchain library is attributed
+        run: python3 scripts/check-library-attribution.py
+
+      # The step above answers "is every binary attributed" out of a table
+      # written by hand, and until now nothing asked whether the table was
+      # right. This reads Termux's own TERMUX_PKG_LICENSE back for each package
+      # and prints the differences. It fails on one of them only: a component
+      # recorded permissive where Termux declares copyleft ships with no offer
+      # of source, and the step above cannot see it, because it reads the same
+      # table. Everything else is reported, including a package upstream has no
+      # build.sh for, because Termux repackaging is ordinary upstream activity
+      # and a gate that failed on it would be switched off. A host that will not
+      # answer at all, an outage or a rate limit, ends in a printed skip rather
+      # than a failure; a run that could read hardly any of the map fails, since
+      # that is the package names having moved and not the network. Its answers
+      # are cached on disk but stay out of the download cache above on purpose:
+      # a cache belongs to the ref that wrote it, so no tag can restore another
+      # tag's, and the key this job restores under is written on the default
+      # branch, where nothing runs this. Every release reads upstream cold.
+      - name: Compare recorded licences against Termux
+        run: python3 scripts/check-termux-licenses.py
+
+      # The one place both trees exist at once. The base runtime and the packs
+      # are filled by different download scripts and nothing compares them
+      # until the whole bundle is assembled, where bundletool answers a shared
+      # entry by refusing the AAB outright; that cost a tag minutes before
+      # publishing once, over libffi.so that the base already shipped for
+      # Python's _ctypes when Ruby's fiddle asked for it again.
+      - name: Refuse an asset the base module and a pack both ship
+        run: python3 scripts/check-pack-overlap.py
+
+      # Last step that can see what this build resolved, so it runs here rather
+      # than in the release job, which only ever sees the artifacts.
+      #
+      # Every Termux component is resolved from a live index at fetch time and
+      # nothing recorded the answer, so re-running this workflow on the same tag
+      # could ship different binaries with nothing to say so, and a bug report
+      # against a released version could not be tied to the binaries it shipped.
+      # A record, not a lock: Termux drops superseded .deb files from its pool,
+      # so a hard pin would break on every upstream bump.
+      - name: Record what this build resolved
+        run: |
+          python3 scripts/write-build-manifest.py -o build-manifest.txt
+          cat build-manifest.txt
+
+      # Built here rather than on a maintainer's machine. While the server was a
+      # pre-built download the host made no difference; building Code - OSS from
+      # source, it decides the contents (@vscode/ripgrep's postinstall branches on
+      # os.platform() and node-gyp takes its flavour from the host), so an AAB
+      # produced on macOS could differ from the APK that passed CI with no step
+      # anywhere failing.
+      #
+      # The Play size check runs inside this step, not after it: checkBundleSize
+      # is `finalizedBy` on bundleRelease, and a second whenReady block asserts
+      # that pairing against the live graph, so the gate cannot detach without
+      # failing the build. A duplicate of it stood below the symbol-packaging
+      # step, opening the same 333 MiB zip a second time to reach the same
+      # verdict; the assertion is what makes the duplicate unnecessary rather
+      # than merely redundant.
+      - name: Build signed AAB
+        working-directory: android
+        env:
+          VSCODROID_KEYSTORE_FILE: ${{ github.workspace }}/android/keystore.jks
+          VSCODROID_KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          VSCODROID_KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          VSCODROID_KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: ./gradlew bundleRelease
+
+      # The merged half of the permission check, asked of the artefact rather
+      # than of a task name. The step before the downloads runs the same script
+      # on a bare checkout, where only the committed manifest exists; this one
+      # runs after the merger has written the release manifest, and
+      # --require-merged makes an absent one a failure instead of the note it is
+      # everywhere else.
+      #
+      # Not the same redundancy as the duplicate size check that stood below the
+      # symbol-packaging step and was removed. That one re-opened a 333 MiB zip
+      # to repeat a verdict whose gate is attached to `bundleRelease`, a name
+      # this workflow invokes, so a rename of it fails the invocation. The gate
+      # for this check is attached to `processReleaseMainManifest`, which
+      # nothing outside app/build.gradle.kts names: an AGP rename detaches it in
+      # silence and the graph assertion cannot see it, because the producer it
+      # would test for is gone from the graph too. This step costs a fraction of
+      # a second and depends on no task name at all.
+      - name: Check the shipped permissions against the privacy policy
+        run: python3 scripts/check-permission-claims.py --require-merged
+
+      # The native debug symbols Play asks for. ndk.debugSymbolLevel stays
+      # on in build.gradle.kts and AGP embeds whatever it finds into the
+      # bundle before signing, which is the documented channel and the only
+      # one that touches the artifact at a legitimate moment: a bundle
+      # modified after signing carries unsigned entries, and Play rejects it
+      # with exactly that wording. Measured locally before it cost anything:
+      # one appended metadata entry turns a verified bundle into one with
+      # entries that are not integrity-checked.
+      #
+      # What AGP finds is read back out of the finished bundle and joined
+      # with the glibc shim, which ships as an asset AGP never sees and now
+      # carries the GNU build-id its link stamps for the console's pairing.
+      # The exec interceptor, also compiled here into the assets, is not in
+      # the zip: only programs a terminal starts load it, never the app's
+      # own process. The result is a standalone zip for the console's
+      # manual upload; the bundle itself leaves this step untouched.
+      - name: Package the native debug symbols
+        run: |
+          set -euxo pipefail
+          BUNDLE=android/app/build/outputs/bundle/release/app-release.aab
+          OUT=android/app/build/outputs/bundle/release/app-release-symbols.zip
+          META=BUNDLE-METADATA/com.android.tools.build.debugsymbols
+          test -f "$BUNDLE"
+          rm -rf pulled symbols
+          rm -f "$OUT"
+          unzip -o -q "$BUNDLE" "$META/*" -d pulled/ || test $? -eq 11
+          mkdir -p symbols/arm64-v8a
+          # At least one symbol table has to come from the bundle: several of the
+          # bundled libraries still carry one, and an empty pull means the Android
+          # plugin could not find the NDK it strips with, which until now left
+          # the zip with the shim alone and the build green.
+          ls pulled/"$META"/arm64-v8a/*.sym >/dev/null
+          cp pulled/"$META"/arm64-v8a/*.sym symbols/arm64-v8a/
+          cp android/app/src/main/assets/usr/lib/libglibc-shim.so \
+             symbols/arm64-v8a/libglibc-shim.so.sym
+          ( cd symbols && zip -qr "$GITHUB_WORKSPACE/$OUT" arm64-v8a )
+          echo "--- standalone:"
+          unzip -l "$OUT"
+
+      - name: Package toolchain ZIPs
+        run: |
+          bash scripts/package-toolchains.sh
+
+          # package-toolchains.sh only fails when it produces nothing, which is
+          # right locally but not here. ToolchainRegistry points every non-Play
+          # install at releases/latest/download/<name>.zip, so a release missing
+          # one ZIP looks entirely normal while that one toolchain fails to
+          # install for every sideloaded user -- including ones already on it.
+          registry=android/app/src/main/kotlin/com/vscodroid/setup/ToolchainRegistry.kt
+
+          # [a-z0-9_] rather than [a-z]: every name in the registry today is
+          # all letters, so the narrower pattern matched every one of them
+          # and looked correct, while a toolchain_java21.zip added tomorrow
+          # would not be extracted and so would never be looked for. A gate that
+          # silently stops covering what it is added to cover is worse than one
+          # that was never written.
+          zips="$(grep -o 'toolchain_[a-z0-9_]*\.zip' "$registry" | sort -u)"
+
+          # grep exits 1 on no match, but a pipeline reports its LAST command,
+          # so `grep | sort` succeeds with nothing in it and the loop below then
+          # checks zero files and passes. The emptiness has to be tested here.
+          if [ -z "$zips" ]; then
+            echo "::error::No toolchain ZIP names found in $registry; the pattern stopped matching."
+            exit 1
+          fi
+
+          missing=0
+          for zip_name in $zips; do
+            if [ ! -f "toolchain-zips/$zip_name" ]; then
+              echo "::error::$registry links to $zip_name but it was not packaged."
+              missing=1
+            fi
+          done
+          [ "$missing" -eq 0 ]
+
+          # The digest manifest every non-Play install verifies against before
+          # it extracts anything. Written here rather than in the release job
+          # because this is the one place the ZIPs sit under the exact names a
+          # device asks for: the release flattens its assets to bare filenames,
+          # so a manifest generated from artifact paths would name files nobody
+          # downloads, and the app would refuse every toolchain.
+          ( cd toolchain-zips && sha256sum *.zip > toolchains.sha256 )
+          cat toolchain-zips/toolchains.sha256
+
+          # The same gate as above, from the other side, and it is load-bearing
+          # rather than tidy. ToolchainManager.publishedDigestFor has no
+          # fallback by design -- a ZIP the manifest does not name cannot be
+          # installed at all -- so a release that packages a ZIP and omits its
+          # digest breaks that toolchain for every sideloaded user, including
+          # ones already on it. Failing here is the cheap end of that.
+          # awk with an exact string compare rather than grep with a pattern.
+          # Every one of these names carries a dot, and to grep a dot is "any
+          # character", so `toolchain_rubyXzip` in the manifest would satisfy
+          # the check for `toolchain_ruby.zip`. False positive only, it can
+          # accept a
+          # wrong name, never reject a right one -- and unreachable while
+          # sha256sum generates this file from the real ZIPs. But a gate is here
+          # to be relied on, and the field is a filename, so compare it as one.
+          for zip_name in $zips; do
+            if ! awk -v n="$zip_name" '$2 == n { found = 1 } END { exit !found }' \
+                 toolchain-zips/toolchains.sha256; then
+              echo "::error::$zip_name is packaged but absent from toolchains.sha256; sideloaded installs would refuse it."
+              exit 1
+            fi
+          done
+
+      # Reporting the sizes was all this did, and `ls a b c | awk` reports awk's
+      # exit status, so a path that stopped matching printed one row fewer and
+      # passed. Nothing further down disagreed: the upload below only warned, the
+      # checksums were taken over whatever arrived, and the release published
+      # without the file. AGP moving an output directory is the ordinary way a
+      # path stops matching, and the first report of it is a user finding no APK
+      # on the release page.
+      #
+      # So it names every file the release has to carry and fails on a missing
+      # one. The toolchain ZIPs are named here as a set only; that the set is
+      # COMPLETE is settled by the step above, against the registry.
+      - name: Require every artifact, and report its size
+        run: |
+          missing=0
+          for f in android/app/build/outputs/apk/release/*.apk \
+                   android/app/build/outputs/bundle/release/*.aab \
+                   android/app/build/outputs/mapping/release/mapping.txt \
+                   toolchain-zips/*.zip \
+                   toolchain-zips/toolchains.sha256 \
+                   android/app/build/outputs/bundle/release/app-release-symbols.zip \
+                   build-manifest.txt; do
+            # A glob that matches nothing survives as itself in bash, so -f is
+            # what decides and the message then names the pattern that found
+            # nothing rather than silently checking one file fewer.
+            if [ -f "$f" ]; then
+              wc -c < "$f" | awk -v f="$f" '{ printf "  %8.1f MiB  %s\n", $1/1048576, f }'
+            else
+              echo "::error::$f was not produced; the release would publish without it."
+              missing=1
+            fi
+          done
+          [ "$missing" -eq 0 ]
+
+      # mapping.txt is in that list because R8 runs on this build type and on no
+      # other (app/build.gradle.kts, buildTypes.release isMinifyEnabled), so every
+      # stack trace a released build produces names a.b.c rather than the class it
+      # came from, and this file is the only thing that reverses it. There is a
+      # chain waiting on it: CrashReporter stores traces on the device, the
+      # bug-report action in MainActivity hands them to the user, and the bridge
+      # exposes both to the web client, so what reaches an issue is
+      # `at a.b.c(Unknown Source)`, from a build whose runner is long gone.
+      #
+      # Regenerating it later is not an option, for the same reason the manifest
+      # above exists: the Termux components resolve from a live index at fetch
+      # time, so a rebuild of this tag is a different tree and its names would not
+      # describe the APK anyone installed. The mapping has to be kept from the run
+      # that produced the bytes, and only this job can keep it.
+      #
+      # r8.yml keeps its own copy, of a build whose output is thrown away. That
+      # one is for reading R8's decisions on a failing run; it is not this one and
+      # cannot stand in for it.
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-artifacts
+          # Catches an upload that carries nothing at all, which is the case the
+          # step above cannot reach: if the workspace is empty for a reason that
+          # predates it, this refuses rather than publishing an empty artifact for
+          # the release job to find. It is NOT the guard for a single missing
+          # file, upload-artifact searches every pattern as one list and tests
+          # the combined result, so five matches and one empty pattern is a
+          # success here. That case belongs to the step above and to
+          # fail_on_unmatched_files in the release job.
+          if-no-files-found: error
+          path: |
+            android/app/build/outputs/apk/release/*.apk
+            android/app/build/outputs/bundle/release/*.aab
+            android/app/build/outputs/mapping/release/mapping.txt
+            toolchain-zips/*.zip
+            toolchain-zips/toolchains.sha256
+            android/app/build/outputs/bundle/release/app-release-symbols.zip
+            build-manifest.txt
+
+  github-release:
+    name: GitHub Release
+    runs-on: ubuntu-latest
+    needs: build-release
+    # The one job that publishes, and the one gate that keeps a dispatched run
+    # from doing so. Everything outward-facing this workflow does happens here:
+    # the release is created, and every asset a device later resolves through
+    # `releases/latest` is attached to it -- the toolchain ZIPs and the
+    # toolchains.sha256 that non-Play installs verify against. So publishing
+    # from an arbitrary branch would not merely add a release, it would move
+    # that pointer for every sideloaded install, including ones already on a
+    # toolchain.
+    #
+    # Both halves are deliberate and neither is sufficient alone.
+    # `github.event_name == 'push'` is the one that holds, because the only
+    # push trigger this workflow declares is the `v*` tag filter; a
+    # workflow_dispatch can be aimed at a tag ref, so the ref test on its own
+    # would let a dispatched run publish. The ref test is kept because the
+    # trigger test alone would start passing the moment a branch push trigger
+    # were added above.
+    #
+    # A skipped job does not fail the run, so a dispatched build reports green
+    # having published nothing, and the write scope below is never granted on
+    # that path.
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    # The only job that writes. It builds nothing and downloads nothing beyond
+    # the artifact build-release produced, so the write scope is held for the
+    # few seconds it is used rather than for the ninety minutes above.
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Nothing here pushes, and the release is created through the API with
+          # its own token. A persisted checkout token would be readable by
+          # anything this job runs, wherever checkout chooses to keep it.
+          persist-credentials: false
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-artifacts
+          path: artifacts
+
+      # Nothing is fetched or built here. Everything the release publishes was
+      # produced by one run of build-release, so the AAB's asset packs and the
+      # ZIPs attached below cannot disagree about which toolchain version this
+      # release ships.
+      - name: Generate checksums
+        run: |
+          cd artifacts
+          # By basename, not by the path inside the artifact. The release
+          # flattens its assets, so a downloader who fetches app-release.apk and
+          # runs `sha256sum -c checksums.sha256` beside it got "No such file or
+          # directory" on every line: each one named
+          # ./android/app/build/outputs/apk/release/app-release.apk. The
+          # toolchain manifest a few steps up is generated from inside its own
+          # directory for exactly this reason, and the reasoning was never
+          # carried across to the file humans use.
+          find . -type f \( -name "*.apk" -o -name "*.aab" -o -name "*.zip" \) \
+            -exec sh -c 'cd "$(dirname "$1")" && sha256sum "$(basename "$1")"' _ {} \; \
+            > checksums.sha256
+          cat checksums.sha256
+
+          # find writes an empty file rather than failing when nothing matches, so
+          # a build that produced no APK, or no AAB, leaves a zero-line
+          # checksums.sha256 that reads as an ordinary one. This is the only place
+          # that sees what actually survived the artifact round trip, so the
+          # assertion belongs here as well as in the build job: the categories are
+          # named separately because losing one of the three is the failure, and a
+          # count of files is satisfied by the other two.
+          for kind in apk aab zip; do
+            if ! grep -q "\.$kind\$" checksums.sha256; then
+              echo "::error::checksums.sha256 lists no .$kind; the release would publish without one."
+              exit 1
+            fi
+          done
+
+          # The manifest is attached by exact path, which assumes the upload put
+          # it at the artifact root. That holds because the artifact root is the
+          # least common ancestor of the uploaded paths and this file sits at the
+          # workspace root -- but if it ever stops holding, the release would be
+          # published without the record and nothing would say so.
+          ls -la
+          test -f build-manifest.txt
+
+      # mapping.txt is attached to the release rather than left as a workflow
+      # artifact, and the reason is lifetime: an artifact expires, 90 days by
+      # default, and retention-days tops out there, while a crash report against
+      # a version arrives whenever someone hits the bug. A release asset lasts as
+      # long as the release it explains, which is the only span that matches.
+      #
+      # Deliberate consequence, not an oversight: the file names every class and
+      # method in the app to anyone who downloads it, which is most of what
+      # minification hid. It costs nothing here because the names come from this
+      # repository and it is public, but the reasoning is that, not "mappings
+      # are harmless", and it would need revisiting the day anything unpublished
+      # ships inside the APK.
+      #
+      # Only mapping.txt. R8 writes seeds/usage/configuration/resources beside it
+      # and those describe its decisions, not a stack trace; r8.yml keeps the
+      # whole directory for exactly that purpose.
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@8a0cd651e5b2365bd640854a3fa5dfc70e4875f3 # v3.0.4
+        with:
+          generate_release_notes: true
+          # Defaults to false, which is how a release publishes one asset short
+          # and stays green. Per pattern rather than per release, the action
+          # fails if ANY glob below matches nothing, which is what these need:
+          # a missing AAB leaves the other six matching, so a release carrying an
+          # APK and no AAB is the case a whole-list test cannot see.
+          fail_on_unmatched_files: true
+          files: |
+            artifacts/**/*.apk
+            artifacts/**/*.aab
+            artifacts/**/*.zip
+            artifacts/**/toolchains.sha256
+            artifacts/**/mapping.txt
+            artifacts/**/app-release-symbols.zip
+            artifacts/checksums.sha256
+            artifacts/build-manifest.txt

@@ -1,0 +1,835 @@
+# VSCodroid Legal Notices
+
+## Disclaimer
+
+VSCodroid is built from the MIT-licensed **Code - OSS** source code (https://github.com/microsoft/vscode).
+
+VSCodroid is **not affiliated with, endorsed by, or sponsored by Microsoft Corporation**.
+
+"Visual Studio Code," "VS Code," and "Visual Studio" are trademarks of Microsoft Corporation. The use of these names in this document is solely for identification and reference purposes.
+
+VSCodroid uses the **Open VSX** extension registry (https://open-vsx.org), not the Microsoft Visual Studio Code Marketplace. The Microsoft Visual Studio Code Marketplace is a separate service with its own terms of use, and is not used by this application.
+
+---
+
+## Open Source Licenses
+
+VSCodroid incorporates the following open source projects. We are grateful to the developers and communities behind each of them.
+
+Versions are given only where this repository actually pins one. Most bundled tools are installed from the Termux package index at build time, so the version a given release shipped is a property of that build, not of this file; stating a number here would only go stale silently. Where a version is pinned, the entry names the file that pins it.
+
+### Code - OSS (VS Code)
+
+- **Project**: https://github.com/microsoft/vscode
+- **License**: MIT License
+- **Copyright**: Copyright (c) 2015 - present Microsoft Corporation
+
+```
+MIT License
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
+
+### VS Code Language Packs (vscode-loc)
+
+The editor's translated interface strings. `scripts/build-nls-bundles.py` merges
+them into the English message array the workbench reads and writes the result to
+`assets/nls/<locale>.json`, which ships in the APK. Those bundles carry no notice
+of their own, so the text below is where this one is handed over.
+
+- **Project**: https://github.com/microsoft/vscode-loc
+- **Version**: the commit pinned in `VSCODE_LOC_COMMIT`
+- **License**: MIT License
+- **Copyright**: Copyright (c) Microsoft Corporation. All rights reserved.
+
+```
+Visual Studio Code Localization Packs
+
+Copyright (c) Microsoft Corporation
+
+All rights reserved.
+
+MIT License
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE
+```
+
+### Node.js
+
+- **Project**: https://nodejs.org
+- **Version**: not pinned here, the `nodejs-lts` package from the Termux index, installed by `scripts/download-node.sh`. The line it must track is set by `remote/.npmrc` at the VS Code tag in `VSCODE_VERSION`, since that is what the server's native modules are built against
+- **License**: MIT License (Node.js core), with additional licenses for bundled dependencies
+- **Copyright**: Copyright Node.js contributors. All rights reserved.
+- **Full license**: https://github.com/nodejs/node/blob/main/LICENSE
+
+Node.js includes V8 (BSD-3-Clause), libuv (MIT), OpenSSL (Apache-2.0), ICU (Unicode License), llhttp (MIT), c-ares (MIT), and other components. See the Node.js LICENSE file for the complete list.
+
+### Python
+
+- **Project**: https://www.python.org
+- **Version**: not pinned here, resolved from the Termux package index at build time by `scripts/download-python.sh`
+- **License**: Python Software Foundation License (PSF-2.0)
+- **Copyright**: Copyright (c) 2001-2024 Python Software Foundation. All rights reserved.
+- **Full license**: https://docs.python.org/3/license.html
+
+### Git
+
+- **Project**: https://git-scm.com
+- **License**: GNU General Public License v2.0 (GPL-2.0-only)
+- **Copyright**: Copyright (c) Junio C Hamano and the Git contributors
+- **Full license**: `licenses/COPYING.GPLv2`, which ships in the app at **About > Licenses > License Texts**; also https://github.com/git/git/blob/master/COPYING
+- **Source availability**: The source code for the Git binary included in VSCodroid is available from the Termux packages repository at https://github.com/termux/termux-packages
+
+### Bash
+
+- **Project**: https://www.gnu.org/software/bash/
+- **Version**: not pinned here, from the Termux package index at build time (`scripts/download-termux-tools.sh`)
+- **License**: GNU General Public License v3.0 (GPL-3.0-or-later)
+- **Copyright**: Copyright (c) Free Software Foundation, Inc.
+- **Full license**: `licenses/COPYING.GPLv3`, which ships in the app at **About > Licenses > License Texts**; also https://www.gnu.org/licenses/gpl-3.0.html
+- **Source availability**: The source code for the Bash binary included in VSCodroid is available from the Termux packages repository at https://github.com/termux/termux-packages
+
+### OpenSSH
+
+- **Project**: https://www.openssh.com
+- **License**: BSD-style license
+- **Copyright**: Copyright (c) 1995 Tatu Ylonen, Espoo, Finland. Portions copyright The OpenBSD Project.
+- **Full license**: https://github.com/openssh/openssh-portable/blob/master/LICENCE
+
+### tmux
+
+- **Project**: https://github.com/tmux/tmux
+- **Version**: not pinned here, from the Termux package index at build time (`scripts/download-termux-tools.sh`)
+- **License**: ISC License
+- **Copyright**: Copyright (c) Nicholas Marriott and contributors
+- **Full license**: https://github.com/tmux/tmux/blob/master/COPYING
+
+### GNU Make
+
+- **Project**: https://www.gnu.org/software/make/
+- **Version**: not pinned here, from the Termux package index at build time (`scripts/download-termux-tools.sh`)
+- **License**: GNU General Public License v3.0 (GPL-3.0-or-later)
+- **Copyright**: Copyright (c) Free Software Foundation, Inc.
+- **Full license**: `licenses/COPYING.GPLv3`, which ships in the app at **About > Licenses > License Texts**; also https://www.gnu.org/licenses/gpl-3.0.html
+- **Source availability**: The source code for the Make binary included in VSCodroid is available from the Termux packages repository at https://github.com/termux/termux-packages
+
+### ripgrep
+
+- **Project**: https://github.com/BurntSushi/ripgrep
+- **License**: The Unlicense / MIT License (dual-licensed)
+- **Copyright**: Copyright (c) Andrew Gallant
+- **Bundled via**: the `@vscode/ripgrep-universal` npm package, whose own `repository` field names https://github.com/microsoft/vscode-ripgrep. The same `rg` is copied into `jniLibs` as `libripgrep.so` by `scripts/fetch-vscode-oss.sh`
+
+### node-pty
+
+- **Project**: https://github.com/microsoft/node-pty
+- **Version**: matches the `node-pty` the server tree ships (see `PTY_VERSION` in `scripts/build-native-addons.sh`; cross-compiled for ARM64 Android)
+- **License**: MIT License
+- **Copyright**: Copyright (c) 2012-2015 Christopher J. Brody, 2016 Daniel Imms
+- **Full license**: https://github.com/microsoft/node-pty/blob/main/LICENSE
+
+### @parcel/watcher
+
+- **Project**: https://github.com/parcel-bundler/watcher
+- **Version**: matches the `@parcel/watcher` the server tree ships (see `WATCHER_VERSION` in `scripts/build-native-addons.sh`; cross-compiled for ARM64 Android)
+- **License**: MIT License
+- **Copyright**: Copyright (c) 2017-present Devon Govett
+- **Full license**: https://github.com/parcel-bundler/watcher/blob/master/LICENSE
+
+### @vscode/sqlite3
+
+- **Project**: https://github.com/microsoft/vscode-node-sqlite3
+- **Version**: matches the `@vscode/sqlite3` the server tree ships (rebuilt for ARM64 Android with the bundled SQLite amalgamation)
+- **License**: BSD-3-Clause (fork of node-sqlite3, Copyright (c) MapBox); SQLite itself is public domain
+- **Full license**: https://github.com/microsoft/vscode-node-sqlite3/blob/main/LICENSE
+
+### zeromq.js
+
+- **Project**: https://github.com/zeromq/zeromq.js, with https://github.com/zeromq/libzmq linked in statically
+- **Version**: zeromq.js `ZEROMQ_VERSION` and libzmq `LIBZMQ_REV` in `scripts/build-native-addons.sh`, the pair the Jupyter extension from Open VSX bundles; built for ARM64 Android, and shipped at `usr/lib/node-addons/zeromq` for that extension, which is not bundled
+- **License**: MIT License (zeromq.js); libzmq is GNU LGPL version 3 or later with a static linking exception, stated at the end of its `COPYING.LESSER`; node-addon-api, compiled in, is MIT
+- **Copyright**: Copyright (c) 2017-2019 Rolf Timmermans (zeromq.js); libzmq contributors as noted in its `AUTHORS` file; Copyright (c) 2017 Node.js API collaborators (node-addon-api)
+- **Full license**: shipped beside the addon: `LICENSE`, `libzmq-COPYING.LESSER`, `libzmq-AUTHORS` and `node-addon-api-LICENSE.md`
+
+### @vscode/native-watchdog
+
+- **Project**: https://github.com/microsoft/node-native-watchdog
+- **Version**: whatever the server tree ships (`node_modules/@vscode/native-watchdog/package.json`)
+- **License**: MIT License
+- **Copyright**: Copyright (c) Microsoft Corporation. All rights reserved.
+- **Ships**: `build/Release/watchdog.node`
+
+### @vscode/deviceid
+
+- **Project**: https://github.com/microsoft/vscode-deviceid
+- **Version**: whatever the server tree ships (`node_modules/@vscode/deviceid/package.json`)
+- **License**: MIT License
+- **Copyright**: Copyright (c) Microsoft Corporation.
+- **Ships**: `build/Release/windows.node`. The name is the package's own and is not a description of the platform; the file in this tree is an ARM64 ELF addon.
+
+### @vscode/sandbox-runtime
+
+- **Project**: https://github.com/anthropic-experimental/sandbox-runtime, as declared by the package's own `repository` field
+- **Version**: whatever the server tree ships (`node_modules/@vscode/sandbox-runtime/package.json`)
+- **License**: Apache License 2.0. The full text ships at `node_modules/@vscode/sandbox-runtime/LICENSE` and carries no filled-in copyright line.
+- **Ships**: JavaScript and the C source of its seccomp helper. `build-vscode-oss.sh` removes `vendor/seccomp/x64/apply-seccomp`, an x86-64 binary.
+
+### @vscode/spdlog
+
+The server's file logger, and the one package here whose own code does not run.
+Its `build/Release/spdlog.node` links `libstdc++.so.6`, which Bionic does not
+have, so `scripts/build-native-addons.sh` deletes the addon and overwrites
+`index.js` with a JavaScript stand-in written in this repository and covered by
+the root `LICENSE`. The package directory still ships, so its notice does too.
+
+- **Project**: https://github.com/microsoft/node-spdlog
+- **Version**: whatever the server tree ships (`node_modules/@vscode/spdlog/package.json`)
+- **License**: MIT License. The full text ships as `LICENSE` inside the package.
+- **Copyright**: Copyright (c) Microsoft Corporation. All rights reserved.
+- **Ships**: no binary, and no upstream JavaScript. `LICENSE`, `package.json` and the package's remaining metadata.
+
+### kerberos (Node addon)
+
+The npm package, not the MIT Kerberos 5 C libraries listed further down. Different
+project, different licence, nearly the same name.
+
+- **Project**: https://github.com/mongodb-js/kerberos
+- **Version**: whatever the server tree ships (`node_modules/kerberos/package.json`)
+- **License**: Apache License 2.0. The full text ships at `node_modules/kerberos/LICENSE`.
+- **Ships**: `build/Release/kerberos.node`, and a second copy under `build/Release/obj.target/`
+
+### @microsoft/mxc-sdk
+
+- **Project**: https://www.npmjs.com/package/@microsoft/mxc-sdk. The package declares no repository.
+- **Version**: whatever the server tree ships (`node_modules/@microsoft/mxc-sdk/package.json`)
+- **License**: MIT License
+- **Copyright**: Copyright (c) Microsoft Corporation.
+- **Ships**: JavaScript only. `build-vscode-oss.sh` removes the package's `bin/` directory (a glibc `lxc-exec`, two Mach-O and ten Windows helpers), none of which can run on Android.
+
+### js-debug
+
+The built-in JavaScript and Node.js debugger extension, produced by the Code - OSS
+build rather than downloaded from a gallery.
+
+- **Project**: https://github.com/microsoft/vscode-js-debug
+- **Version**: whatever the Code - OSS tag in `VSCODE_VERSION` pins
+- **License**: MIT License. The full text and the extension's own `ThirdPartyNotices.txt` ship inside `extensions/ms-vscode.js-debug/`.
+- **Copyright**: Copyright (c) Microsoft Corporation. All rights reserved.
+- **Ships**: `src/chromehash_bg.wasm`, and two `win32-app-container-tokens.win32-*-msvc-*.node` addons. The addons are Windows PE binaries with no use on Android; they are listed because they are redistributed.
+
+### vscode-js-profile-visualizer
+
+The built-in viewer for CPU and heap profiles, produced by the Code - OSS build.
+
+- **Project**: https://github.com/microsoft/vscode-js-profile-visualizer
+- **Version**: whatever the Code - OSS tag in `VSCODE_VERSION` pins
+- **License**: MIT License. The full text and the extension's own `ThirdPartyNotices.txt` ship inside `extensions/ms-vscode.vscode-js-profile-table/`.
+- **Copyright**: Copyright (c) Microsoft Corporation. All rights reserved.
+- **Ships**: two `*.module.wasm` table renderers under `out/`.
+
+### @vscode/tree-sitter-wasm
+
+The incremental parser behind syntax-aware editing, compiled to WebAssembly
+rather than to a native addon. Two copies ship: the server's own, and the one the
+Copilot Chat extension resolves.
+
+- **Project**: https://github.com/microsoft/vscode-tree-sitter-wasm
+- **Upstream**: https://github.com/tree-sitter/tree-sitter, MIT, recorded with its commit in the package's `cgmanifest.json`
+- **License**: MIT License. The full text ships as `LICENSE` inside the package.
+- **Ships**: `tree-sitter.wasm` and the grammar modules beside it (bash, css, ini, powershell, regex, typescript in the server copy).
+
+### web-tree-sitter
+
+tree-sitter's own WebAssembly binding, bundled by the Copilot Chat extension.
+
+- **Project**: https://github.com/tree-sitter/tree-sitter
+- **License**: MIT License. The full text ships as `LICENSE` inside the package.
+- **Copyright**: Copyright (c) 2018-2024 Max Brunsfeld
+- **Ships**: `tree-sitter.wasm`.
+
+### vscode-oniguruma
+
+The regex engine TextMate grammars are matched with, compiled to WebAssembly.
+
+- **Project**: https://github.com/microsoft/vscode-oniguruma
+- **Upstream**: Oniguruma, https://github.com/kkos/oniguruma, **BSD-2-Clause**. The wrapper's licence does not cover the engine inside it, so both are recorded; Oniguruma's own notice ships as `NOTICES.txt` in the package.
+- **License**: MIT License for the wrapper. The full text ships as `LICENSE.txt` inside the package.
+- **Copyright**: Copyright (c) Microsoft Corporation (wrapper); Copyright (c) 2002-2020 K. Kosako (Oniguruma)
+- **Ships**: `release/onig.wasm`.
+
+### @github/blackbird-external-ingest-utils
+
+A WebAssembly helper the Copilot Chat extension uses for code indexing.
+
+- **Project**: https://www.npmjs.com/package/@github/blackbird-external-ingest-utils. The package declares no repository.
+- **Version**: whatever the Copilot Chat extension pins at the Code - OSS tag in `VSCODE_VERSION`
+- **License**: MIT License, declared by the package
+- **Ships**: `external_ingest_utils_bg.wasm`, both inside the package and inlined into the extension's `dist/`.
+
+### GitHub Copilot Chat extension
+
+The extension itself, which is open source and MIT, and a different component
+from the proprietary `@github/copilot` CLI it depends on. Its `dist/` bundle
+carries the tree-sitter grammars and the blackbird WebAssembly listed above,
+inlined by its build.
+
+- **Project**: https://github.com/microsoft/vscode-copilot-chat
+- **Version**: whatever the Code - OSS tag in `VSCODE_VERSION` pins
+- **License**: MIT License. The full text ships as `LICENSE.txt` inside `extensions/copilot/`.
+- **Copyright**: Copyright (c) Microsoft Corporation. All rights reserved.
+- **Ships**: `dist/tree-sitter*.wasm` and `dist/external_ingest_utils_bg.wasm`.
+
+### PSReadLine
+
+Prebuilt .NET assemblies carried by the terminal's PowerShell shell integration.
+Nothing on Android can load them; they are inside the APK, which is the only fact
+the licence turns on.
+
+- **Project**: https://github.com/PowerShell/PSReadLine
+- **Version**: whatever the Code - OSS tag in `VSCODE_VERSION` pins. The server tree's own `ThirdPartyNotices.txt` records it and reproduces the licence text.
+- **License**: BSD-2-Clause License
+- **Copyright**: Copyright (c) 2013, Jason Shirk
+- **Ships**: `Microsoft.PowerShell.PSReadLine.dll`, `Microsoft.PowerShell.Pager.dll` and the two `Microsoft.PowerShell.PSReadLine.Polyfiller.dll` builds, under `out/vs/workbench/contrib/terminal/common/scripts/psreadline/`.
+
+### distlib
+
+Vendored inside the bundled pip. Listed separately from Python because the
+licence is the same but the copyright is not, and PSF-2.0 is precisely the
+licence that asks for the notice to travel with the copy.
+
+- **Project**: https://github.com/pypa/distlib
+- **Version**: recorded in `usr/lib/python*/site-packages/pip/_vendor/vendor.txt`
+- **License**: Python Software Foundation License, Version 2. The full text ships as `LICENSE.txt` inside the package.
+- **Copyright**: Copyright (c) 2012-2024 Vinay Sajip
+- **Ships**: six prebuilt Windows launchers (`t32.exe`, `t64.exe`, `t64-arm.exe`, `w32.exe`, `w64.exe`, `w64-arm.exe`), redistributed unused.
+
+### npm
+
+- **Project**: https://www.npmjs.com
+- **Version**: 11.16.0, declared as `NPM_VERSION` in `scripts/download-npm.sh` and asserted against the nodejs.org tarball, which is the release the bundled Node runtime comes from
+- **License**: Artistic License 2.0
+- **Copyright**: Copyright (c) npm, Inc. and Contributors
+- **Full license**: https://github.com/npm/cli/blob/latest/LICENSE
+
+### libevent
+
+- **Project**: https://libevent.org
+- **License**: BSD-3-Clause License
+- **Used by**: tmux
+
+### utf8proc
+
+- **Project**: https://juliastrings.github.io/utf8proc/
+- **License**: MIT License. The Unicode data tables in it carry Unicode, Inc.'s permission notice; both texts ship in full in `usr/share/doc/utf8proc/copyright`.
+- **Used by**: tmux
+
+### readline
+
+- **Project**: https://tiswww.case.edu/php/chet/readline/rltop.html
+- **License**: GNU General Public License v3.0 (GPL-3.0-or-later)
+- **Full license**: `licenses/COPYING.GPLv3`, which ships in the app at **About > Licenses > License Texts**
+- **Used by**: bash, and Python's `readline` module
+
+### ncurses
+
+- **Project**: https://invisible-island.net/ncurses/
+- **License**: MIT-style (X11) License
+- **Used by**: tmux, libedit, readline, and Python's `curses` modules. bash reaches it through readline rather than directly
+
+### libffi
+
+- **Project**: https://sourceware.org/libffi/
+- **License**: MIT License
+- **Used by**: Python
+
+### OpenSSL
+
+- **Project**: https://www.openssl.org
+- **License**: Apache License 2.0 (OpenSSL 3.x)
+- **Ships**: `libcrypto.so.3` and `libssl.so.3`. BoringSSL is not bundled; the bundled Node links these
+- **Used by**: Node.js, Python, Git, OpenSSH, ldns, libcrypt, libcurl, libssh2 and ngtcp2
+
+Git is GPL-2.0 and reaches OpenSSL through libcurl, and the two licenses are
+read as incompatible when a work combines them. The position taken here, stated
+so that it is a recorded decision rather than an oversight:
+
+- Nothing in this APK links Git against OpenSSL into one binary. They are
+  separate executables shipped side by side, each loading its own dependencies
+  at runtime, which is the same arrangement every Linux distribution ships and
+  the one Termux packages these builds as.
+- GPLv2's system-library exception is written for a system's own components and
+  is not squarely on point for a library an application bundles itself, so it is
+  not being relied on as the whole answer.
+- If a copyright holder disagreed, the remedy is to build Git against a
+  different TLS backend rather than to remove it. That is a build-time
+  substitution in `scripts/download-termux-tools.sh`, not a redesign.
+
+---
+
+## Bundled Native Library Inventory
+
+The shared libraries and executables that sit at the top level of
+`assets/usr/lib` and `jniLibs/arm64-v8a`, with the licence each is distributed
+under. The licence column is taken from Termux's own `TERMUX_PKG_LICENSE`, which
+is what these packages are built from, rather than from upstream project pages
+that may describe a different version. `scripts/check-termux-licenses.py` reads
+that field back on every release and reports where this column and Termux
+disagree, so the sentence before this one is measured rather than promised for
+every package Termux states a licence for and that upstream answered for. Three
+rows come from elsewhere and carry the licence of the source they do come from:
+musl's loader is an Alpine package (`scripts/download-musl-loader.sh`),
+`libripgrep.so` is the `rg` from the Code - OSS server tree, copied into
+`jniLibs` by `scripts/fetch-vscode-oss.sh`, and `libtermux-exec.so` is compiled
+here from termux-exec's own repositories (`scripts/build-termux-exec.sh`). That
+same gate prints the three of them as entries no Termux package accounts for, so
+the exception is named by the run and not only here.
+
+bzip2 is the one row Termux cannot settle: it declares plain `BSD`, which names
+no variant. This document said `BSD-4-Clause` until 2026-08-23, and that variant
+is defined by an advertising clause ("All advertising materials ... must display
+the following acknowledgement") that bzip2's `LICENSE` does not carry; its four
+conditions are retain-notice, do-not-misrepresent-origin, mark-altered-versions
+and no-endorsement. Recording the stricter identifier asserted an obligation
+downstream that bzip2 never imposed, so the row is now `bzip2-1.0.6`, the SPDX
+identifier for bzip2's own licence. Julian Seward's copyright ships on the device
+at `usr/share/doc/libbz2`.
+
+This is not every binary in the APK. Most of
+them are not below: they live deeper in the asset tree and are attributed by the
+sections above. CPython's extension modules under `usr/lib/python*/lib-dynload/`,
+pip's vendored launchers, the server tree's native addons and bundled tools under
+`assets/vscode-reh/`, the zeromq.js addon under `assets/usr/lib/node-addons/`,
+the WebAssembly its editor services load, and the .NET
+assemblies its terminal integration carries. 184 files against the 53 listed
+below, measured on the tree that built this release, redistributed on identical
+terms. `usr/lib/git-core/` was in that list until its eight standalone helpers
+stopped being copied; what is left there is shell text and symlinks, and Git is
+attributed by `libgit.so` and `libgit-remote-curl.so` below.
+
+That figure is a measurement rather than a fixed property, and the gate prints it
+on every run: a Python module leaving `lib-dynload` or a package adding a grammar
+moves it. What has to stay true is that every one of those files is attributed
+somewhere, which is what the gate enforces rather than what this sentence claims.
+
+`scripts/check-library-attribution.py` regenerates the basis for this table from the
+files actually present in the build tree and fails when a shipped binary is absent
+from it, when a copyleft component is missing from the source offer below, or when
+a component's own notice is not among the bytes that reach a device. It
+walks the whole asset tree, recognising a binary by its magic number (ELF,
+WebAssembly, PE or Mach-O) or a `.node` extension, and holds every component it
+finds to both this file and `NOTICE.md`. Formats this device cannot execute are
+counted too: a Windows launcher and a .NET assembly are redistributed on their
+own terms whether or not anything here can load them, so testing ELF magic alone
+would walk past most of what ships.
+It runs on every pull request and every push to `main` (`.github/workflows/build.yml`),
+and twice more at release time, once before the toolchain payloads are downloaded
+and once after (`.github/workflows/release.yml`).
+
+That last check is the one the permissive rows turn on. A name and a URL in a
+table is not the notice: MIT, the BSD family, ISC, NCSA, the ICU licence and
+Apache-2.0 section 4 all require the copyright and permission text to be handed
+over with a binary redistribution, and a link discharges none of it on a device
+with no network. Every component in the table below now ships its own upstream
+notice beside the binaries, almost all of them under
+`usr/share/doc/<termux package>`, placed by `termux_copy_notices` in
+`scripts/lib/termux-packages.sh`. A directory that is absent, or that holds
+nothing over 128 bytes, fails the build. The floor is there because a file being
+present proves nothing: Termux's `libicu` 78.3 ships fourteen bytes reading
+`404: Not Found` where its licence should be.
+
+Four packages are exceptions, each measured rather than assumed:
+
+- **ICU**: those fourteen bytes are replaced with ICU 78.3's own `LICENSE`,
+  kept here as `licenses/LICENSE.ICU` and taken verbatim from `unicode-org/icu`
+  at the tag Termux's own build names. `scripts/download-termux-tools.sh` fails
+  the build when the index moves to an ICU that text no longer describes.
+- **musl**: Alpine's `musl` package carries no notice at all, so
+  `scripts/download-musl-loader.sh` places `licenses/COPYRIGHT.musl`, musl's own
+  `COPYRIGHT` at the tag `ALPINE_BRANCH` pins.
+- **ripgrep**: it arrives with the server tree rather than from Termux, and
+  `@vscode/ripgrep-universal` already carries its `LICENSE` inside the package.
+- **termux-licenses**: downloaded but shipping no component of its own. It
+  carries `usr/share/LICENSES`, the shared texts most Termux packages point their
+  `copyright` symlink at. Neither an asset pack nor a release ZIP can carry a
+  symlink, so the target is resolved out of that package and copied as a real
+  file; without it the copyleft half of the tree would reach a device with a
+  dangling link where its licence should be.
+
+Not listed here, because they are not third-party code: `libglibc-shim.so` and the
+stubs beside it (`libc.so.6`, `libm.so.6`, `libdl.so.2`, `libpthread.so.0`,
+`librt.so.1`, `libutil.so.1`, `libresolv.so.2`, `libcrypt.so.1`, `libgcc_s.so.1`,
+`ld-linux-aarch64.so.1`). They carry glibc's names so a glibc-linked binary can
+resolve against them, but contain none of glibc's code; they are built from
+`scripts/glibc-shim.c` and `scripts/gen-glibc-forwarders.py` in this repository and
+are covered by the root `LICENSE`. `libexec-trampoline.so` is excluded for the
+same reason: it is built from `scripts/exec-trampoline.c` here, and it is what
+lets a downloaded toolchain command start from a bare name on `PATH`. So are
+`libclaude-launch.so` and `libseccomp-shim.so`, built here from
+`scripts/claude-launch.c` and `scripts/seccomp-shim.c`; the second is
+freestanding and links against no library at all, so there is nothing in it to
+attribute but this project's own source.
+
+One row below is built here rather than downloaded: `libtermux-exec.so` is
+compiled by `scripts/build-termux-exec.sh` from termux-exec-package 2.5.0 and
+the termux-core-package commit it links in statically, both fetched as pinned
+upstream tarballs, with the changes in `scripts/termux-exec.patch` applied
+first. Upstream's DEP-5 `LICENSE` files make termux-exec Apache-2.0 and
+termux-core MIT unless a file says otherwise, and three of the files linked in
+do: termux-core's `Canonicalize.c`, which comes from AOSP's libcore (Oracle and
+stargateoss), is GPL-2.0-only with the Classpath Exception, so the component
+has a source offer below; its `UnixSafeStrerror.c` (The Chromium Authors) and
+termux-exec's `ExecVariantsIntercept.c` (The Regents of the University of
+California) are BSD-3-Clause. All of it ships at `usr/share/doc/termux-exec`:
+the Apache-2.0 text and the two MIT notices beside the `LICENSE` files that say
+which covers what (their relative links are upstream's and do not resolve
+there; the licence each names is readable in the link text), the three files'
+own headers as written, and the Chromium `LICENSE` that `UnixSafeStrerror.c`
+refers to. Each patched source file opens with the modification notice
+Apache-2.0 section 4(b) asks for, and the build stops if the set of linked
+files that carry terms of their own changes.
+
+| Component | Licence | Copyleft | Files shipped |
+|---|---|---|---|
+| [Bash](https://www.gnu.org/software/bash/) | GPL-3.0 | **yes** | `libbash.so` |
+| [bzip2](https://sourceware.org/bzip2/) | bzip2-1.0.6 | no | `libbz2.so.1.0` |
+| [c-ares](https://c-ares.org) | MIT | no | `libcares.so` |
+| [Expat](https://libexpat.github.io) | MIT | no | `libexpat.so.1` |
+| [gdbm](https://www.gnu.org.ua/software/gdbm/) | GPL-3.0 | **yes** | `libgdbm.so`, `libgdbm_compat.so` |
+| [Git](https://git-scm.com) | GPL-2.0 | **yes** | `libgit-remote-curl.so`, `libgit.so` |
+| [GNU Make](https://www.gnu.org/software/make/) | GPL-3.0 | **yes** | `libmake.so` |
+| [ICU](https://icu.unicode.org) | ICU | no | `libicudata.so.78`, `libicui18n.so.78`, `libicuuc.so.78` |
+| [Kerberos 5](https://web.mit.edu/kerberos/) | MIT | no | `libcom_err.so.3`, `libgssapi_krb5.so.2`, `libk5crypto.so.3`, `libkrb5.so.3`, `libkrb5support.so.0` |
+| [ldns](https://www.nlnetlabs.nl/projects/ldns/) | BSD-3-Clause | no | `libldns.so` |
+| [libandroid-glob](https://github.com/termux/libandroid-glob) | BSD-3-Clause | no | `libandroid-glob.so` |
+| [libandroid-posix-semaphore](https://github.com/termux/libandroid-posix-semaphore) | MIT | no | `libandroid-posix-semaphore.so` |
+| [libandroid-support](https://github.com/termux/libandroid-support) | Apache-2.0, MIT | no | `libandroid-support.so` |
+| [libc++](https://libcxx.llvm.org) | NCSA | no | `libc++_shared.so` |
+| [libcrypt](http://michael.dipperstein.com/crypt/) | BSD-2-Clause | no | `libcrypt.so` |
+| [libcurl](https://curl.se) | MIT | no | `libcurl.so` |
+| [libedit](https://thrysoee.dk/editline/) | BSD-3-Clause | no | `libedit.so` |
+| [libevent](https://libevent.org) | BSD-3-Clause | no | `libevent-2.1.so`, `libevent_core-2.1.so` |
+| [libffi](https://sourceware.org/libffi/) | MIT | no | `libffi.so` |
+| [libiconv](https://www.gnu.org/software/libiconv/) | LGPL-2.1, GPL-3.0 | **yes** | `libiconv.so` |
+| [libresolv-wrapper](https://cwrap.org) | BSD-3-Clause | no | `libresolv_wrapper.so` |
+| [libssh2](https://libssh2.org) | BSD-3-Clause | no | `libssh2.so` |
+| [musl libc](https://musl.libc.org) | MIT | no | `libldmusl.so` |
+| [ncurses](https://invisible-island.net/ncurses/) | MIT | no | `libncursesw.so.6`, `libpanelw.so.6` |
+| [nghttp2](https://nghttp2.org) | MIT | no | `libnghttp2.so` |
+| [nghttp3](https://github.com/ngtcp2/nghttp3) | MIT | no | `libnghttp3.so` |
+| [ngtcp2](https://github.com/ngtcp2/ngtcp2) | MIT | no | `libngtcp2.so`, `libngtcp2_crypto_ossl.so` |
+| [Node.js](https://nodejs.org) | MIT | no | `libnode.so` |
+| [OpenSSH](https://www.openssh.com) | BSD | no | `libssh-keygen.so`, `libssh.so` |
+| [OpenSSL](https://www.openssl.org) | Apache-2.0 | no | `libcrypto.so.3`, `libssl.so.3` |
+| [PCRE2](https://www.pcre.org) | BSD-3-Clause | no | `libpcre2-8.so` |
+| [Python](https://www.python.org) | PSF-2.0 | no | `libpython.so`, `libpython3.14.so` |
+| [readline](https://tiswww.case.edu/php/chet/readline/rltop.html) | GPL-3.0 | **yes** | `libreadline.so.8` |
+| [ripgrep](https://github.com/BurntSushi/ripgrep) | MIT | no | `libripgrep.so` |
+| [SQLite](https://sqlite.org) | Public Domain | no | `libsqlite3.so` |
+| [termux-exec](https://github.com/termux/termux-exec-package) | Apache-2.0, MIT, BSD-3-Clause, GPL-2.0-only WITH Classpath-exception-2.0 | **yes** | `libtermux-exec.so` |
+| [tmux](https://github.com/tmux/tmux) | ISC | no | `libtmux.so` |
+| [utf8proc](https://juliastrings.github.io/utf8proc/) | MIT | no | `libutf8proc.so.3` |
+| [xz / liblzma](https://tukaani.org/xz/) | LGPL-2.1, GPL-2.0, GPL-3.0 | **yes** | `liblzma.so.5` |
+| [zlib](https://zlib.net) | Zlib | no | `libz.so.1` |
+| [Zstandard](https://facebook.github.io/zstd/) | GPL-2.0 | **yes** | `libzstd.so.1` |
+
+---
+
+## Proprietary Redistributed Components
+
+### @github/copilot (GitHub Copilot CLI)
+
+The built-in GitHub Copilot Chat extension depends on GitHub's `@github/copilot` package. Unlike everything listed above, this component is **not open source**: it is redistributed under GitHub's own terms.
+
+- **Publisher**: GitHub, Inc.
+- **License**: GitHub Copilot CLI License. The full text ships with the copy in the server tree; read it at `extensions/copilot/node_modules/@github/copilot/LICENSE.md`. It is not reproduced here.
+- **Version**: whatever the Copilot extension pins at the Code - OSS tag in `VSCODE_VERSION`.
+
+**What is redistributed.** One copy, produced by the Code - OSS build:
+
+| Location in the server tree | Version | What it is |
+|---|---|---|
+| `extensions/copilot/node_modules/@github/copilot` | 1.0.73 | The SDK copy the extension resolves |
+
+Releases 1.1.0 to 1.4.0 (Code - OSS 1.133.0) also carried the chat agent host's copy of the CLI: a loader at `node_modules/@github/copilot` and its runtime at `node_modules/@github/copilot-linux-arm64`, both 1.0.79-6, the runtime being the CLI application as JavaScript run by the bundled Node. Code - OSS 1.139.1 no longer lists `@github/copilot` among the server's dependencies, so neither ships.
+
+**Why we believe redistribution is permitted.** Section 1 of the license grants the right to reproduce and redistribute unmodified copies of the Software as part of an application or service, subject to the five conditions in Section 2. Our position on each:
+
+| Condition (§2) | Assessment |
+|---|---|
+| Distributed only in unmodified form | **Judgment call (see below).** |
+| Redistributed solely as part of an application providing material functionality beyond the Software | Met. VSCodroid is a full IDE; the Copilot package is a dependency of one built-in extension. |
+| Not distributed standalone or as a primary product | Met. It is not separately installable, not advertised, and not reachable except through the extension, and the standalone executable form is not part of it. |
+| A copy of the license is included and notices retained | Met. `LICENSE.md` travels with the copy in the tree, and `NOTICE.md` attributes the component. |
+| The application is licensed independently of the Software | Met. VSCodroid's own source is MIT; the root `LICENSE` covers only that. |
+
+**The judgment call on "unmodified form".** The question is not whether the tree matches npm exactly (it does not) but what the differences actually are. Measured file by file against the upstream tarballs:
+
+*The SDK copy* (`@github/copilot@1.0.73`, the version the extension also pins at 1.139.1): 67 files in the tree built from 1.133.0, five of them re-rooted under `sdk/`. Its content differences from the upstream platform package are `package.json`, rewritten by the extension's own `postinstall` (renamed, given an `exports` map, platform constraints dropped), and the bundled `ripgrep` binary, replaced with the editor's own by the upstream packaging step `prepareBuiltInCopilotRipgrepShim`, which also writes a `shims.txt` marker. That replacement is byte-identical to `@vscode/ripgrep-universal`'s `rg`, sha256 `e152ea689d6e8420357e592f0d8253b96476c164118ca3e6e13074fa1705ddda`, measured in the shipped tree.
+
+Pruning follows the upstream build's own `build/.moduleignore` and `build/lib/copilot.ts`.
+
+Every one of these transformations is performed by GitHub's or Microsoft's own build tooling, which VSCodroid runs unmodified; none is a VSCodroid intervention. The single patch this project applies to that area, `patches/0010-moduleignore-keep-copilot-sdk-entry.patch`, only narrows a pruning rule. From 1.139 upstream's `.moduleignore` strips the extension's whole `@github/copilot` package, `LICENSE.md` included; the patch puts back the per-directory list 1.138 used, minus its line for `sdk/index.js`, so the native and optional payload directories are still stripped and the rest is kept. The result is closer to the published package than upstream's rule would leave it, not further from it.
+
+We read "unmodified form" as directed at the redistributor altering the Software, not at the vendor's own build tooling producing the embedded shape it was designed to produce. To be precise about which mode of that tooling is in play: Microsoft's own CI does **not** compile this extension; it downloads it as a VSIX from an internal feed, and `compile-copilot-extension-build` is described upstream as the path "used by non-CI local builds where copilot is not downloaded as a VSIX" (`gulpfile.extensions.ts:288`). That is the path this build takes, and it is a mode Microsoft ships for building from source; it is not the identical pipeline behind their released desktop binaries.
+
+The weakest point in our reading is the `ripgrep` substitution, because a binary component is replaced rather than merely omitted.
+
+**This is a reasoned engineering position, not legal advice.** It records how the maintainers understand the terms and why the component is bundled. Anyone redistributing VSCodroid, or building a product on it, should reach their own conclusion and take their own advice.
+
+---
+
+## Mirrored Python Wheels
+
+`pip` on the device is pointed at a page listing prebuilt Android wheels that VSCodroid re-hosts on the `wheels-<python-version>-<n>` prereleases of this repository. `wheelhouse.json` pins each one and records where it came from. They are not bundled in the APK; pip downloads one only when a user installs that package.
+
+| Wheel | Built by | Licence | Notices |
+|---|---|---|---|
+| numpy 2.5.0 | Termux User Repository | BSD-3-Clause, with OpenBLAS and LAPACK (BSD-3-Clause) | Inside the wheel |
+| pandas 3.0.5 | Termux User Repository | BSD-3-Clause, with vendored UltraJSON, klib, pyperclip and others | pandas' own inside the wheel; the vendored components' in `pandas-3.0.5-THIRD-PARTY-NOTICES.txt` beside it on the release, taken from pandas' source distribution |
+| pydantic-core 2.41.5 | Termux User Repository | MIT, with statically linked Rust crates | Inside the wheel, as upstream ships it: its licence and a CycloneDX SBOM |
+| psutil 7.2.2 | Termux (`python-psutil`), repacked into a wheel | BSD-3-Clause | Inside the wheel |
+
+## Termux Project Attribution
+
+Many of the command-line tools bundled with VSCodroid (Node.js, Python, Bash, Git, tmux, Make, OpenSSH, and their dependencies) are built from recipes and patches maintained by the **Termux** project.
+
+- **Project**: https://termux.dev
+- **Repository**: https://github.com/termux/termux-packages
+- **License**: Apache License 2.0 (build scripts and patches)
+- **Copyright**: Copyright (c) 2015-2024 Fredrik Fornwall and Termux contributors
+
+We thank the Termux community for their extensive work in porting these tools to Android. Without their efforts, projects like VSCodroid would be significantly more difficult to build.
+
+## Open VSX Attribution
+
+VSCodroid uses the **Open VSX** registry for its extension marketplace.
+
+- **Project**: https://open-vsx.org
+- **Operated by**: Eclipse Foundation
+- **Repository**: https://github.com/eclipse/openvsx
+- **License**: Eclipse Public License 2.0 (EPL-2.0)
+
+Open VSX is an open, vendor-neutral alternative to the Microsoft Visual Studio Code Marketplace. Extensions available on Open VSX are published by their respective authors and may have their own licenses.
+
+## Android SDK and NDK
+
+VSCodroid is built using the Android SDK and NDK provided by Google.
+
+- **Android SDK**: Subject to the Android SDK License Agreement
+- **Android NDK**: Subject to the Android NDK License Agreement
+- **Full terms**: https://developer.android.com/studio/terms
+
+## Google Play Asset Delivery
+
+On Play Store installs, on-demand toolchain packs (Ruby, Java, C/C++) are delivered via Google Play Asset Delivery, a feature of Google Play. On installs that did not come from the Play Store, the same packs are downloaded as ZIPs from this project's GitHub Releases (https://github.com/rmyndharis/VSCodroid/releases), which the terms below do not govern.
+
+- **Terms**: https://play.google.com/about/developer-distribution-agreement.html
+
+---
+
+## GPL Source Code Availability
+
+VSCodroid bundles binaries licensed under the GNU General Public License (GPL). In compliance with the GPL, the complete corresponding source code for these binaries is available:
+
+- **Bash** (GPL-3.0): Source available at https://github.com/termux/termux-packages (package: `bash`)
+- **Git** (GPL-2.0): Source available at https://github.com/termux/termux-packages (package: `git`)
+- **GNU Make** (GPL-3.0): Source available at https://github.com/termux/termux-packages (package: `make`)
+- **readline** (GPL-3.0): Source available at https://github.com/termux/termux-packages (package: `readline`)
+- **libiconv** (LGPL-2.1 / GPL-3.0): Source available at https://github.com/termux/termux-packages (package: `libiconv`), linked by Bash and by every Git executable
+- **gdbm** (GPL-3.0): Source available at https://github.com/termux/termux-packages (package: `gdbm`), linked by Python's `dbm` and `gdbm` modules
+- **xz / liblzma** (LGPL-2.1 / GPL-2.0 / GPL-3.0): Source available at https://github.com/termux/termux-packages (package: `liblzma`), linked by Python's `lzma` module
+- **Zstandard** (GPL-2.0 as packaged by Termux; dual-licensed BSD-3-Clause upstream): Source available at https://github.com/termux/termux-packages (package: `zstd`), linked by Python's `zstd` module
+- **GMP** (LGPL-3.0): Source available at https://github.com/termux/termux-packages (package: `libgmp`). Shipped inside the Ruby toolchain pack, not the base app, so it reaches only devices where Ruby was installed
+- **OpenJDK 21** (GPL-2.0 with the Classpath Exception): Source available at https://github.com/termux/termux-packages (package: `openjdk-21`), built from https://github.com/openjdk/jdk21u. Shipped inside the Java toolchain pack, not the base app, so it reaches only devices where Java was installed. The Classpath Exception grants an additional permission and removes none of the obligations above.
+- **Linux kernel interface headers** (GPL-2.0 WITH Linux-syscall-note): the sanitized copies of the kernel's UAPI headers that the C/C++ toolchain pack installs as `ndk-sysroot`'s `usr/include/linux`, `asm-generic`, `drm`, `sound` and the other kernel header directories. They are plain header files and nothing is compiled from them into the pack, so the source is the files themselves. Android generates them from the kernel with the tool at https://android.googlesource.com/platform/bionic/+/refs/heads/main/libc/kernel/, and Termux repackages them (https://github.com/termux/termux-packages, package: `ndk-sysroot`). The Linux-syscall-note exception states that programs which use the kernel through its system call interface are not derived works of it, which is the only use these headers are installed for. Shipped inside the C/C++ toolchain pack, not the base app.
+- **zeromq.js** (MIT; the libzmq linked into it is LGPL-3.0-or-later with libzmq's static linking exception): Source available at https://github.com/zeromq/libzmq/archive/20de92ac0a2b2b9a1869782a429df68f93c3625e.tar.gz and https://registry.npmjs.org/zeromq/-/zeromq-6.0.0-beta.16.tgz; the build options and compile command are `scripts/build-native-addons.sh` in this repository, which pins both by sha256. Shipped in the base app.
+- **termux-exec** (Apache-2.0 and MIT; the termux-core `Canonicalize.c` linked into it is GPL-2.0-only with the Classpath Exception, and two other files are BSD-3-Clause): Source available at https://github.com/termux/termux-exec-package/archive/refs/tags/v2.5.0.tar.gz and https://github.com/termux/termux-core-package/archive/63bf9286ad86603f9a58de73e4c740926c88f5e3.tar.gz, with `scripts/termux-exec.patch` in this repository applied to the first; `scripts/build-termux-exec.sh` pins both by sha256 and holds the compile and link commands. Shipped in the base app. The Classpath Exception grants an additional permission and removes none of the obligations above.
+
+Every entry from readline to GMP reaches the app as a dependency of something
+else rather than as a tool of its own, and each is dynamically linked and
+shipped as its own `.so`, so the LGPL's relinking condition is satisfied by
+replacing the file. libzmq is the exception: it is linked statically into the
+zeromq.js addon, and what permits that is libzmq's own exception, which lets it
+be linked with an independent module and the result distributed under terms of
+the distributor's choice, provided each linked module's own licence is met,
+relieving LGPL-3.0 sections 4 and 5 and GPL-3.0 section 6. A modified libzmq
+must carry the same exception; the one here is configured with CMake options
+and not patched. `Canonicalize.c` in `libtermux-exec.so` is the other static
+case, and the Classpath Exception is what permits it: it lets the file be
+linked with independent modules and the result distributed under terms of the
+distributor's choice, provided each module's own licence is met. The written
+offer in this section applies to all of them regardless.
+
+You may also request a copy of the source code by contacting us (see contact information below). Source code will be provided for a period of three years from the date of distribution of the corresponding binary, for a charge no more than the cost of physically performing the distribution.
+
+---
+
+## GPL and LGPL License Texts
+
+The offer above is one obligation; a copy of the licence itself is the other. GPL-2.0 section 1, GPL-3.0 section 4, LGPL-2.1 section 1 and LGPL-3.0 section 4 each require the licence to reach whoever receives the binary, and a link to gnu.org is not a copy of it, least of all on a device with no network. So the texts ship:
+
+| Licence | Text | Components it covers |
+|---|---|---|
+| GPL-2.0 | `licenses/COPYING.GPLv2` | Git, `git-remote-curl`, Zstandard, xz / liblzma, Java (OpenJDK), termux-exec (its `Canonicalize.c`), the Linux kernel interface headers (C/C++ toolchain pack) |
+| GPL-3.0 | `licenses/COPYING.GPLv3` | Bash, GNU Make, readline, gdbm, libiconv, xz / liblzma |
+| LGPL-2.1 | `licenses/COPYING.LGPLv2.1` | libiconv, xz / liblzma |
+| LGPL-3.0 | `licenses/COPYING.LGPLv3` | GMP (Ruby toolchain pack), libzmq (inside zeromq.js) |
+
+The first three are the Free Software Foundation's texts as shipped in Termux's `liblzma` package, which is one of the packages this app redistributes. LGPL-3.0 is the FSF's own publication at https://www.gnu.org/licenses/lgpl-3.0.txt, because no Termux package here carries it; libzmq's copy, with its exception appended, also ships beside the zeromq.js addon. All four are verbatim, and `NoticesTest` pins the sha256 of each: a licence text that has been reflowed, re-wrapped or truncated is no longer the licence, so none of them may be edited.
+
+They reach the device through the same `bundleNotices` task as this document, and are read straight out of the APK at **About > Licenses > License Texts**. They sit behind that chooser rather than inside the notices body because 85 KiB of licence in front of the attribution and the source offer would bury the part a reader opened that screen for.
+
+Java arrives in an on-demand pack rather than in the base app, and the text covering it ships in the base app, which every device installing that pack already holds. Its licence is GPL-2.0 with the Classpath Exception, an additional permission that grants rights rather than requiring a copy of anything to travel; the exception is stated at https://openjdk.org/legal/gplv2+ce.html.
+
+OpenJDK's own notice set travels inside the Java pack, at `usr/lib/jvm/java-21-openjdk/legal`, beside the binaries it describes: the GPLv2 text it ships, the Assembly Exception, the Classpath Exception statement, and the third-party notices for the Apache, MPL, W3C, Unicode, ICU, BSD and MIT components inside it. Those components are not listed individually here, for the same reason the toolchain trees are not: the notices upstream wrote are what discharge their terms, and they ship. `scripts/download-java.sh` refuses to build the pack without them, and refuses one in which they arrived as symbolic links, because neither an asset pack nor the release ZIP can carry a link.
+
+GMP is the other component that arrives in a pack rather than in the base app, and it is why LGPL-3.0 is in the table. The libzmq inside zeromq.js is listed there too, but its exception relieves section 4, so that copy goes beyond what libzmq requires, as does the `COPYING.LESSER` shipped beside the addon. LGPL-3.0 is drafted as additional permissions on top of GPL-3.0 and its section 4 asks for both documents, so the GPL-3.0 text already bundled for Bash and Make answers half of it and `COPYING.LGPLv3` answers the rest. The Ruby pack ships GMP's own copy of that text beside the library, at `usr/share/doc/libgmp/copyright`, but the pack has no licences screen: the base app's dialog is the only route a reader has to it.
+
+---
+
+## Toolchain Libraries
+
+Shipped inside an on-demand toolchain pack rather than the base app, so they reach
+only devices where that toolchain was installed. The obligations are the same;
+only the audience is smaller.
+
+`scripts/check-library-attribution.py` reads these from the toolchain manifests in
+`android/toolchain_*/src/main/assets/`, rather than from disk, because the packs
+are built by CI and are absent from a working tree; a disk scan would find
+nothing and report success.
+
+| Component | Licence | Shipped with | Source |
+|---|---|---|---|
+| GMP | LGPL-3.0 | Ruby | https://github.com/termux/termux-packages (package: `libgmp`) |
+| libyaml | MIT | Ruby | https://pyyaml.org/wiki/LibYAML |
+| libruby | BSD-2-Clause | Ruby | https://www.ruby-lang.org |
+| libandroid-execinfo | BSD-2-Clause | Ruby | https://github.com/termux/libandroid-execinfo |
+| libandroid-shmem | BSD-3-Clause | Java | https://github.com/termux/libandroid-shmem |
+| libandroid-spawn | BSD-2-Clause | Java | https://github.com/termux/libandroid-spawn |
+| LLVM | Apache-2.0 WITH LLVM-exception, NCSA | C/C++ | https://github.com/termux/termux-packages (package: `libllvm`), built from https://github.com/llvm/llvm-project |
+| libxml2 | MIT | C/C++ | https://github.com/termux/termux-packages (package: `libxml2`), built from https://gitlab.gnome.org/GNOME/libxml2 |
+| ndk-sysroot | NCSA as declared by Termux; see below | C/C++ | https://github.com/termux/termux-packages (package: `ndk-sysroot`) |
+
+GMP is the only copyleft library here. Its written source offer sits with the
+others under **GPL Source Code Availability** above, and the LGPL-3.0 text it
+requires is bundled in the base app under **GPL and LGPL License Texts**.
+
+LLVM is `libLLVM.so` and `libclang-cpp.so`. The clang driver, clangd, lld, the `llvm-*`
+tools and the compiler-rt builtins archive are built from the same source tree,
+so one `LICENSE.TXT` answers for all of them; it ships as
+`usr/share/doc/libllvm/LICENSE.TXT`. Its terms are Apache-2.0 with the LLVM
+exceptions, and Termux additionally declares NCSA for the files that have not
+been relicensed. The libc++ headers under `usr/include/c++/v1` are the same
+project's and say so in the comment that opens each header.
+
+ndk-sysroot is a mixture, and the licence Termux declares for the package, NCSA,
+is the one its `copyright` file carries and the one that is bundled:
+
+- the bionic C library headers are BSD-2-Clause, BSD-3-Clause, ISC-style,
+  Apache-2.0 or MIT as each file's own header says, and a few are public domain;
+- the libc++ headers are Apache-2.0 WITH LLVM-exception, as above;
+- the kernel interface headers are GPL-2.0 WITH Linux-syscall-note, and are
+  offered under **GPL Source Code Availability**;
+- `libpthread.so`, `librt.so` and `libutil.so` are one-line linker scripts
+  (`INPUT(-lc)`) that make `-lpthread`, `-lrt` and `-lutil` resolve to the
+  system libc, and the crt objects and `libunwind.a` beside them come from the
+  same package.
+
+The pack also installs Python's C headers under `usr/include/python3.14` so pip
+can build an extension. They are PSF-2.0 and the licence text is the one the
+base app already carries at `usr/share/doc/python/LICENSE`.
+
+Every one of these nine ships its own upstream notice inside the pack, under
+`usr/share/doc/<termux package>`, on the same terms as the base module's tree.
+`scripts/download-ruby.sh`, `scripts/download-java.sh` and
+`scripts/download-cpp.sh` refuse a pack holding a symbolic link anywhere in it:
+neither delivery path can carry one, and a dangling link where a licence should
+be is worse than an absent file.
+
+---
+
+## On-Demand Toolchain Licenses
+
+The following toolchains are available as optional downloads and have their own licenses:
+
+### Ruby
+
+- **Project**: https://www.ruby-lang.org
+- **License**: Ruby License / BSD-2-Clause (dual-licensed)
+- **Copyright**: Copyright (c) Yukihiro Matsumoto and Ruby contributors
+- **Full license**: https://www.ruby-lang.org/en/about/license.txt
+
+### Java (OpenJDK)
+
+- **Project**: https://openjdk.org
+- **License**: GNU General Public License v2.0 with Classpath Exception (GPL-2.0 WITH Classpath-exception-2.0)
+- **Copyright**: Copyright (c) Oracle and/or its affiliates
+- **Full license**: `licenses/COPYING.GPLv2`, which ships in the app at **About > Licenses > License Texts**; the Classpath Exception that modifies it is stated at https://openjdk.org/legal/gplv2+ce.html
+
+### C/C++ (LLVM)
+
+- **Project**: https://llvm.org (clang, clangd, lld, compiler-rt and libc++, packaged by Termux)
+- **License**: Apache License v2.0 with LLVM Exceptions (Apache-2.0 WITH LLVM-exception); Termux also declares NCSA for the files not yet relicensed
+- **Copyright**: Copyright (c) LLVM Project contributors
+- **Full license**: `LICENSE.TXT`, which ships inside the pack at `usr/share/doc/libllvm/LICENSE.TXT`, and https://llvm.org/LICENSE.txt
+
+---
+
+## Trademark Notices
+
+- **Visual Studio Code**, **VS Code**, and **Visual Studio** are registered trademarks of Microsoft Corporation in the United States and/or other countries.
+- **Android** is a trademark of Google LLC.
+- **GitHub** is a trademark of GitHub, Inc.
+- **Node.js** is a trademark of the OpenJS Foundation.
+- **Python** is a trademark of the Python Software Foundation.
+- **npm** is a trademark of npm, Inc.
+- **Java** and **OpenJDK** are trademarks of Oracle Corporation.
+- **Ruby** is a trademark of Yukihiro Matsumoto.
+- **Google Play** is a trademark of Google LLC.
+
+All other trademarks are the property of their respective owners. The use of these trademarks in this document is for identification purposes only and does not imply endorsement.
+
+---
+
+## Contact
+
+For questions about licenses, trademarks, or legal notices:
+
+- **Email**: yudhi@rmyndharis.com
+- **GitHub**: https://github.com/rmyndharis/VSCodroid
+
+---
+
+_This document was last updated on November 5, 2026._

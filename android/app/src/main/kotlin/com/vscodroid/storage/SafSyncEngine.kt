@@ -1,0 +1,7542 @@
+package com.vscodroid.storage
+
+import android.annotation.SuppressLint
+import android.content.Context
+import android.net.Uri
+import android.os.FileObserver
+import android.os.SystemClock
+import android.provider.DocumentsContract
+import com.vscodroid.util.Logger
+import com.vscodroid.util.StorageManager
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import java.io.Closeable
+import java.io.File
+import java.io.IOException
+import java.io.InputStream
+import java.io.OutputStream
+import java.io.PushbackInputStream
+import java.nio.channels.Channels
+import java.nio.file.FileAlreadyExistsException
+import java.nio.file.Files
+import java.nio.file.LinkOption
+import java.nio.file.NoSuchFileException
+import java.nio.file.OpenOption
+import java.nio.file.Path
+import java.nio.file.SecureDirectoryStream
+import java.nio.file.StandardOpenOption
+import java.nio.file.attribute.BasicFileAttributeView
+import java.nio.file.attribute.BasicFileAttributes
+import java.nio.file.attribute.FileTime
+import java.security.DigestInputStream
+import java.security.MessageDigest
+import java.util.Base64
+import java.util.UUID
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.ConcurrentLinkedQueue
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.locks.LockSupport
+import java.util.concurrent.locks.ReentrantLock
+import kotlin.concurrent.thread
+
+/**
+ * Bidirectional sync engine between SAF content:// URIs and local mirror directories.
+ *
+ * ## Initial Sync (SAF → local)
+ * Recursively walks the SAF document tree via [DocumentsContract] and copies
+ * all files to a local mirror directory, preserving the folder structure.
+ *
+ * ## Write-back (local → SAF)
+ * Watches the mirror with one [FileObserver] per directory. When a file is modified,
+ * created, or deleted locally (by VS Code), the change is synced back to the original
+ * SAF location via [ContentResolver]. One observer over the root is not enough: inotify
+ * watches a directory rather than a tree, so a saved file one level down would update
+ * the mirror and never reach the device.
+ *
+ * ## Conflict Resolution
+ * The later modification time wins, with length deciding a tie: the mirror is replaced
+ * when it is absent, when the source is newer, or when the two match in time and differ
+ * in size. A source carrying no timestamp is decided by the synced record instead,
+ * because there is no clock to compare; see [shouldOverwriteMirror] for what that costs.
+ * That rule alone would let a device edit overwrite a save the write-back never
+ * delivered, so before such a replacement the mirror copy is set aside under a
+ * `.local-<time>` name; [setAsideDivergedMirror] says exactly when. The other
+ * direction has the same guard: a device edit made since the last sync is set aside
+ * under a `.device-<time>` name before a newer mirror copy is written over it;
+ * [setAsideDeviceCopy] says when. While the folder is open, a save that would replace
+ * a device document changed since this engine last read or wrote it keeps the device's
+ * copy as `.device-<time>` first; see [keepsDeviceEdit]. A delete of one is declined;
+ * see [keepsDeviceDocument].
+ * External changes are picked up the next time the folder is opened, which is
+ * the only refresh that exists: there is no "Refresh from device" action, and the one
+ * in-app action on a mirror, "VSCodroid: Manage Device Folder Storage", removes the
+ * copy rather than refreshing it. Reopening also removes mirror files for documents
+ * deleted on the device, under the conditions [reconcileDeletions] spells out, and
+ * puts onto the device the files only the mirror has, under the conditions
+ * [uploadMirrorOnlyDocuments] spells out.
+ */
+class SafSyncEngine(private val context: Context) {
+
+    private val tag = "SafSyncEngine"
+    /**
+     * The write-back of the folder being watched: its queue of jobs and its thread.
+     *
+     * Replaced, never mutated, by [startWatching] and [stopWatching]. A drain that
+     * outlives its stop keeps the object it was started with, so the folder opened next
+     * hands its jobs to a different queue and no two threads ever poll one.
+     */
+    @Volatile
+    internal var session = WatchSession()
+        private set
+
+    @Volatile private var isWatching = false
+
+    /**
+     * Held across a whole [startWatching], [stopWatching] or [shutdown].
+     *
+     * The three decide between them whether this engine is live, and each of them takes
+     * several steps to say so: [startWatching] publishes a session, sets [isWatching] and
+     * then registers up to [MAX_WATCHED_DIRECTORIES] watches, and it opens by calling
+     * [stopWatching], which blocks up to [DRAIN_GRACE_MS] joining the previous drain.
+     * Run against each other those interleave, and the outcome is decided by whichever
+     * of the two [isWatching] writes lands last: a stop finishing inside a start's inner
+     * drain leaves observers registered, a worker polling and [isWatching] true, on an
+     * engine whose owner is gone. The Activity serialises its own three calls, but the
+     * one in `onDestroy` runs on a detached thread deliberately outside that mutex, so
+     * the serialisation has to be here, where every caller passes.
+     *
+     * Reentrant, which [startWatching] relies on: it calls [stopWatching] while holding
+     * this, and Java monitors admit the thread that already owns them.
+     */
+    private val lifecycleLock = Any()
+
+    /**
+     * Whether [shutdown] has been called, after which no start is honoured again.
+     *
+     * Ordering the calls is not enough on its own. The Activity's teardown is the last
+     * word about an engine nothing can reach afterwards -- the replacement Activity
+     * builds its own [SafSyncEngine], so its stop cannot reach this one -- and a start
+     * that arrives after it belongs to a coroutine of the Activity that has gone. It is
+     * refused rather than run late, because there is no one left to stop what it starts.
+     */
+    @Volatile private var shutDown = false
+
+    /**
+     * One observer per watched directory, keyed by that directory.
+     *
+     * Holding them here is not only bookkeeping: [FileObserver]'s shared ObserverThread
+     * refers to each observer through a [java.lang.ref.WeakReference], so one that
+     * nothing else references stops delivering events as soon as it is collected.
+     */
+    private val watchers = mutableMapOf<File, DirectoryObserver>()
+    private val watchersLock = Any()
+
+    /**
+     * Cache: relativePath → document ID. Built during [initialSync] and used for
+     * O(1) write-back lookups instead of walking the tree for each event.
+     *
+     * Four threads reach it: [initialSync] on Dispatchers.IO, [resolveDocumentUri] from
+     * an observer thread, [createInSaf] from the write-back thread, and [stopWatching]
+     * from whichever thread closes the folder. A plain map rehashing under a concurrent
+     * read loses entries or spins, so the map itself carries the synchronization.
+     *
+     * Every read and write that turns on [cacheTree] goes through [cachedDocId],
+     * [cacheDocId] and [resetCache], which hold the map's own monitor across the label
+     * test and the access. The map being concurrent does not make the pair atomic: an
+     * event still inside its provider round trips when the folder was switched used to
+     * test the label, walk the provider, and then write its answer into a cache the next
+     * folder's sync had relabelled and was filling in between, so that folder's phase 2b
+     * read the previous folder's directory for a same-named path. Where one granted
+     * folder sits inside another, that directory is writable, and the write opens it
+     * with "wt". The monitor is held for a map access and never across a provider call.
+     */
+    private val docIdCache = ConcurrentHashMap<String, String>()
+
+    /**
+     * Mirror paths the device holds a document for that this sync never read.
+     *
+     * A document skipped for size, or one whose copy failed, leaves no trace in
+     * the mirror, so "absent from the mirror" means both "not on the device" and
+     * "on the device with content this app has never seen". Every write-back path
+     * resolves that ambiguity the destructive way, by design: `createOneInSaf`
+     * exists to write into an existing document rather than fork it, so a local
+     * file appearing at that name opens the device's document with truncation and
+     * a 60 MB archive becomes whatever was just typed.
+     *
+     * Absolute paths, like the upload journal's entries and for the same reason:
+     * one engine serves every folder in turn. A file by its own path, and a directory by
+     * its own path only where this sync read nothing of it (its name is skipped, or its
+     * enumeration failed); a question about any other directory is answered by prefix, in
+     * [handleMirrorEvent]. Both follow a directory rename ([renameDeviceMemoryUnder]).
+     */
+    private val unfetched = ConcurrentHashMap.newKeySet<String>()
+
+    /** Files vouched for by this open, even when an ancestor listing was incomplete. */
+    private val fetchedPaths = ConcurrentHashMap.newKeySet<String>()
+
+    /** Successful uploads made during an open, retained in its final record. */
+    private val deliveredDuringSync = ConcurrentHashMap<String, String>()
+
+    /**
+     * Mirror paths a refusal has already been announced for.
+     *
+     * The refusal fires on every inotify MODIFY, so an editor autosaving a file whose
+     * device document this sync could not read reaches it on every save. Announcing each
+     * one would be a wall of the same notice, and worse: the manager's throttle is one
+     * timer for the whole folder, so the wall would swallow an unrelated write-back
+     * failure for as long as it lasted. One notice per path carries the whole fact,
+     * which is that this file is not reaching the device folder.
+     *
+     * Absolute paths and scoped per mirror in [initialSync], next to [unfetched] and for
+     * the same reason: one engine serves every folder in turn.
+     *
+     * "One notice per path" is therefore per ENGINE, not per device, and the
+     * difference is reachable: an activity recreated mid-open leaves two engines
+     * over one mirror, both of them announcing through a lambda that closes over
+     * the application context, so one file can be announced twice. That is left
+     * as it is deliberately. Moving the set to the companion object, the shape
+     * [mirrorCopiesInFlight] and its siblings use, would let the engine whose
+     * notice the manager's own per-activity throttle swallowed spend the other
+     * engine's budget, and the failure would be silence about a save that is not
+     * reaching the device folder. A duplicate of the same sentence is the cheaper
+     * way to be wrong, and two is not the wall this set exists to stop.
+     */
+    private val refusalsAnnounced = ConcurrentHashMap.newKeySet<String>()
+
+    /**
+     * What the device reported for each document, as (COLUMN_LAST_MODIFIED, COLUMN_SIZE)
+     * by absolute mirror path, when this engine last read it ([initialSync] phase 2) or
+     * wrote it (every write-back), with the SHA-256 of what phase 2 fetched, of the mirror
+     * copy it kept, taken from the record or read by [digestKeptCopies], or of what a landed
+     * write streamed. A save may replace exactly that and nothing newer; [keepsDeviceEdit]
+     * is what asks. Where phase 2 could not place what the device holds there is no stamp,
+     * only the digest of the copy the previous record vouched for at that path, and none
+     * either once a stamp has moved past what this engine read and the bytes did not show
+     * the same version, until a read does or a write lands ([deviceMovedPast]). A read that
+     * finds the digested bytes at a moved stamp makes that stamp the one compared next, and
+     * where the provider did not answer the stamp query, a placeholder no answer equals,
+     * (0, [UNANSWERED_SIZE]), so the next answer is read against the bytes again.
+     *
+     * A stable completed upload also records the delivered mirror identity through
+     * [recordDeliveredCopy], so a later device deletion can remove that disposable copy.
+     * Scoped per mirror in
+     * [initialSync] like [unfetched], and for the same reason: a switch that fails partway
+     * restores the previous folder's watcher on this engine, and its entries must survive
+     * that. Follows a directory rename, as [unfetched] does ([renameDeviceMemoryUnder]): the
+     * device holds the same documents under the new name, and an entry left at the old one
+     * leaves every file below the directory unguarded until the next open.
+     */
+    private val deviceSeen = ConcurrentHashMap<String, DeviceState>()
+    private val mirrorGenerations = ConcurrentHashMap<String, Any>()
+
+    /**
+     * How long a write to the device waits for another write to the same mirror to finish
+     * before it gives up and is announced as kept inside the app.
+     */
+    internal var outboundTurnWaitMs: Long = OUTBOUND_TURN_WAIT_MS
+
+    /**
+     * How long a delete, a create or a rename waits for another folder's write to the same
+     * provider before it is refused. See [claimProviderMutationWithin].
+     */
+    internal var providerClaimWaitMs: Long = PROVIDER_CLAIM_WAIT_MS
+
+    private fun outboundAccess(root: File, generation: Any? = null): OutboundAccess {
+        val access = mirrorAccess.computeIfAbsent(root.absolutePath) { MirrorAccess() }
+        val observed = generation
+            ?: mirrorGenerations.computeIfAbsent(root.absolutePath) { access.generation }
+        return OutboundAccess(access, observed, outboundTurnWaitMs)
+    }
+
+    private fun <T> withCurrent(access: OutboundAccess?, action: () -> T): T? =
+        if (access == null) action() else access.run(action)
+
+    private fun <T> withCurrentMemory(access: OutboundAccess?, action: () -> T): T? =
+        if (access == null) action() else access.update(action)
+
+    /**
+     * Saves [keepsDeviceEdit], [writeLocalToSaf], or an open arm held back, by absolute
+     * mirror path: the document each was going to, and when [retryHeldBack] tries it again.
+     *
+     * A held-back save used to wait for the next save of that file or the next open of the
+     * folder, so on a provider that reads only while it is online, Nextcloud among them, the
+     * save stayed inside the app for as long as the user did neither, long after the network
+     * came back. Tried again as the save it was, through every guard a save goes through, so
+     * what decides is what is known of the device's bytes, never the time that has passed.
+     *
+     * Scoped per mirror in [initialSync] like [deviceSeen], because an open that reads file
+     * times settles the mirror's newer copy as it settles any save the watcher did not
+     * deliver. One with no time to compare leaves a file whose two copies differ as they
+     * are, so it keeps that file's hold, the one thing saying the mirror's copy was never
+     * sent. One that skips the file for its size puts back no hold, since it refuses the
+     * file's saves until an open finds the document smaller, and nor does one that cannot
+     * list the folder, or the directory holding the file, which leaves the file no stamp
+     * either; saves stay blocked until a later open reads it. A hold the closing folder's drain
+     * records after the open has cleared the folder's holds, its read having outlasted the
+     * stop, is refused like a save of the file where the open could not read the device
+     * copy; see [processWriteBack]. In memory only, on an engine that lives as long as the
+     * activity whose [SafStorageManager] built it (see [shutdown]): once that activity is
+     * destroyed, as swiping the app from Recents does while the process goes on serving, the
+     * next activity's open of a folder with no clock sends nothing, and the next save of the
+     * file is what goes out. Tried only by the loop watching that mirror, so nothing is
+     * written into a folder that is closed. A hold ends at [keepsDeviceEdit]'s next answer
+     * for its file, at any write of the file, which sends what the hold was waiting to send
+     * (a create writes a document it has just made without asking [keepsDeviceEdit]), at a
+     * refusal of it, or once the file is deleted or gone from the mirror. It does not follow
+     * a directory rename and ends there ([renameDeviceMemoryUnder]): the hold names the
+     * document by the URI it had, and a provider whose ids are paths gives that URI to
+     * whatever is made at the old path next, so a try at the new name could write the
+     * renamed file into another document.
+     *
+     * The waits are read off the monotonic clock, never wall time, for the reason
+     * `SafStorageManager.onWriteBackFailed` gives about its throttle: a wall clock corrected
+     * backwards, by NTP after a drifted RTC or by the user setting the date, left every wait
+     * unfinished until the clock caught up, and the save inside the app until then.
+     */
+    private val heldBack = ConcurrentHashMap<String, HeldBackSave>()
+
+    /**
+     * Prior wait of a [heldBack] entry that [keepsDeviceEdit] or [initialSync] just
+     * settled, so a [writeLocalToSaf] that declines for an in-flight write in the same
+     * turn doubles the prior wait rather than restarting at [HELD_BACK_RETRY_FIRST_MS].
+     */
+    private val settledHeldWait = ConcurrentHashMap<String, Long>()
+
+    /**
+     * Mirror paths of files whose delete [keepsDeviceDocument] declined because the device
+     * document had moved past what this engine last read or wrote, so the device holds there
+     * a version nothing here has read.
+     *
+     * Asked by both delete guards of a directory, beside [unfetched], because `rm -r`
+     * deletes a directory right after the files in it and `deleteDocument` on the directory
+     * takes whatever it still holds: without this, the file kept on the device went with its
+     * directory a moment later, under a notice saying it was kept. Not [unfetched] itself,
+     * which also refuses a file made again under the name until the next open, where
+     * [keepsDeviceEdit] can keep the device's version and send the new file at once.
+     *
+     * Ends at a landed write of the path, after which the device holds this app's bytes
+     * there, past whatever [keepsDeviceEdit] kept first. Follows a directory rename and is
+     * scoped per mirror in [initialSync], as [unfetched] is.
+     */
+    private val keptOnDevice = ConcurrentHashMap.newKeySet<String>()
+
+    /**
+     * How many bytes [digestKeptCopies] reads per open, [KEPT_COPY_DIGEST_BYTES]. A seam
+     * because no JVM test can hold that much in kept copies.
+     */
+    internal var keptCopyDigestBytes = KEPT_COPY_DIGEST_BYTES
+
+    /**
+     * The tree [docIdCache]'s entries were resolved against. The cache is cleared
+     * and refilled per folder, and a write-back drain can outlive its folder, so
+     * anything resolving at processing time has to know whether the cache still
+     * speaks for the tree the job belongs to before it reads an answer from it.
+     *
+     * Moved only by [resetCache], which [initialSync] calls before it fills the cache.
+     * An event for any other tree resolves against the provider and caches nothing: it
+     * used to adopt the cache for its own tree instead, which is the interleaving the
+     * note on [docIdCache] describes.
+     */
+    @Volatile
+    private var cacheTree: Uri? = null
+
+    /** The cached document id for [relativePath], or null when the cache does not speak for [treeUri]. */
+    private fun cachedDocId(treeUri: Uri, relativePath: String): String? =
+        synchronized(docIdCache) { if (cacheTree == treeUri) docIdCache[relativePath] else null }
+
+    /** Remembers [docId] for [relativePath], unless the cache speaks for another tree by now. */
+    private fun cacheDocId(treeUri: Uri, relativePath: String, docId: String) {
+        synchronized(docIdCache) { if (cacheTree == treeUri) docIdCache[relativePath] = docId }
+    }
+
+    /**
+     * Empties the cache and labels it for [treeUri]: the state [initialSync] puts it in
+     * before filling it, and the only way the label moves.
+     *
+     * Internal so a test can hand an engine the folder a sync would have handed it
+     * without running one. No JVM test can drive [startWatching], so the event tests
+     * call [handleMirrorEvent] directly, and an engine that never synced speaks for no
+     * tree at all: every one of their resolutions would go to the provider, and a case
+     * about what the cache must not answer would pass with nothing in it.
+     */
+    internal fun resetCache(treeUri: Uri) {
+        synchronized(docIdCache) {
+            docIdCache.clear()
+            cacheTree = treeUri
+        }
+    }
+
+    /**
+     * Directories that have just left the mirror and may be the first half of a rename.
+     *
+     * inotify reports a rename as MOVED_FROM on the old name and MOVED_TO on the new one
+     * and pairs the two with a cookie, which [FileObserver] does not expose, so the
+     * halves arrive here as an unrelated delete and create. This is what carries the
+     * first half across to the second: [renameSourceFor] decides whether a MOVED_TO may
+     * claim one, and a claim turns the create into a rename of the device's own document.
+     *
+     * Entries expire on their own ([RENAME_PAIR_WINDOW_MS]); nothing acts when one does.
+     * An unclaimed entry therefore costs the behaviour that would have happened anyway.
+     */
+    private val vanishedDirectories = mutableListOf<VanishedDirectory>()
+    private val vanishedLock = Any()
+
+    // -- Initial Sync --
+
+    /**
+     * Performs a full sync from SAF tree URI to the local mirror directory.
+     *
+     * @param safUri The tree URI granted by the SAF folder picker.
+     * @param mirrorDir The local directory to mirror into.
+     * @param onProgress Callback with (filesDone, totalFiles).
+     * @throws FolderBusyException when another sync of this mirror, or a save, delete or
+     *   rename still being sent to the provider, holds it: the mirror is left as it was, and
+     *   the caller says the folder is busy.
+     */
+    suspend fun initialSync(
+        safUri: Uri,
+        mirrorDir: File,
+        onProgress: (Int, Int) -> Unit
+    ) = withContext(Dispatchers.IO) {
+        val access = mirrorAccess.computeIfAbsent(mirrorDir.absolutePath) { MirrorAccess() }
+        if (access.lock.isHeldByCurrentThread || !access.lock.tryLock()) {
+            synchronized(access.stateLock) {
+                if (mirrorGenerations[mirrorDir.absolutePath] !== access.generation) {
+                    unfetched.add(mirrorDir.absolutePath)
+                }
+            }
+            throw FolderBusyException()
+        }
+        try {
+            synchronized(access.stateLock) {
+                access.syncing = true
+                access.generation = Any()
+                mirrorGenerations[mirrorDir.absolutePath] = access.generation
+            }
+            initialSyncHoldingMirror(safUri, mirrorDir, onProgress)
+        } finally {
+            synchronized(access.stateLock) { access.syncing = false }
+            access.lock.unlock()
+        }
+    }
+
+    private fun initialSyncHoldingMirror(
+        safUri: Uri,
+        mirrorDir: File,
+        onProgress: (Int, Int) -> Unit,
+    ) {
+        reclaimInboundScratch()
+        // By mirror name rather than by tree URI: the URI spells the user's own
+        // directory path, and Logger.i is not gated on a debuggable build. See
+        // SafStorageManager.persistPermission for the whole of that reasoning.
+        Logger.i(tag, "Starting initial sync of ${mirrorDir.name}")
+        val startTime = System.currentTimeMillis()
+
+        // A closing watcher may still drain while provider reads are in flight.
+        unfetched.add(mirrorDir.absolutePath)
+        // Clear cache for fresh sync
+        resetCache(safUri)
+        // Scoped rather than cleared: this engine serves one folder at a time, and
+        // a switch that fails partway must not drop the protection the previous
+        // folder's mirror is still relying on.
+        unfetched.removeAll { it.startsWith(mirrorDir.absolutePath + File.separator) }
+        fetchedPaths.removeAll { it.startsWith(mirrorDir.absolutePath + File.separator) }
+        deliveredDuringSync.keys.removeAll { it.startsWith(mirrorDir.absolutePath + File.separator) }
+        refusalsAnnounced.removeAll { it.startsWith(mirrorDir.absolutePath + File.separator) }
+        deviceSeen.keys.removeAll { it.startsWith(mirrorDir.absolutePath + File.separator) }
+        // Taken aside rather than dropped: phase 2's no-clock arm puts back the hold of a
+        // file it leaves as it is, the one save this open does not settle.
+        val heldBefore =
+            heldBack.filterKeys { it.startsWith(mirrorDir.absolutePath + File.separator) }
+        heldBack.keys.removeAll { it.startsWith(mirrorDir.absolutePath + File.separator) }
+        settledHeldWait.keys.removeAll { it.startsWith(mirrorDir.absolutePath + File.separator) }
+        for ((path, held) in heldBefore) {
+            settledHeldWait[path] = held.wait
+        }
+        keptOnDevice.removeAll { it.startsWith(mirrorDir.absolutePath + File.separator) }
+
+        // Phase 1: Enumerate all documents in the tree
+        val documents = mutableListOf<DocumentInfo>()
+        val rootDocId = DocumentsContract.getTreeDocumentId(safUri)
+        cacheDocId(safUri, "", rootDocId)  // root entry
+        val skippedDirs = mutableListOf<String>()
+        val enumerationComplete = walkTree(safUri, rootDocId, "", documents, skippedDirs)
+        // Device content this sync deliberately did not read, which is what
+        // `unfetched` means. An unread directory guards its descendants as well
+        // as deletion of itself or an ancestor. Scrubbed with the rest of the mirror's
+        // prefix at the top of this function, so a folder that stops holding one
+        // stops being held back by it.
+        for (relative in skippedDirs) {
+            unfetched.add(File(mirrorDir, relative).absolutePath)
+        }
+
+        // What phase 2 is about to fetch, against what there is room for. Nothing is
+        // refused on the strength of it: these are the sizes the provider reported, and a
+        // folder that opens is worth more than a prediction. It decides one thing, which
+        // notice the user gets if a copy does fail, and that is the difference between a
+        // message they can act on and one they cannot. What does refuse a fetch is the
+        // floor in [copyDocumentToLocal], which reads the disk rather than the provider.
+        val toFetch = bytesToFetch(documents, mirrorDir)
+        val room = usableSpaceOf(mirrorDir)
+        val outOfRoom = toFetch > room
+        if (outOfRoom) {
+            Logger.w(
+                tag,
+                // Decimal, like every other MB this app prints. A maintainer
+                // reading this beside the storage screen or the low-storage
+                // message is comparing the same unit; see
+                // StorageManager.formatSize, which decides it once.
+                "Opening ${mirrorDir.name} needs ${toFetch / 1_000_000} MB and " +
+                    "${room / 1_000_000} MB is free; some documents will not be copied",
+            )
+        }
+
+        val totalFiles = documents.count { !it.isDirectory }
+        var filesDone = 0
+        var skippedLarge = 0
+        var failedCopies = 0
+        var keptLocal = 0
+        var setAside = 0
+        /*
+         * What the mirror holds, for the files this sync can vouch for. Filled only where
+         * the mirror copy is known to correspond to the device document (it was just
+         * written, or it was found identical), and where a fetch that did not happen left
+         * the copy an earlier sync vouched for exactly as it was, whose line is carried.
+         *
+         * An allowlist, and that is the whole point. The previous version recorded every
+         * enumerated path and then subtracted the ways that could be wrong, which meant a
+         * way nobody had thought of defaulted to "safe to delete". Four were found that
+         * way, each a separate patch. Here a branch that does not record leaves its path
+         * out, so an unforeseen one defaults to "never a candidate".
+         */
+        val recorded = mutableListOf<String>()
+        // The digest of the copy each [recorded] line names, where this open took one:
+        // phase 2's fetches and [digestKeptCopies]. Written onto the line with the record.
+        val digests = HashMap<String, ByteArray>()
+        var uploadsDone = 0
+
+        Logger.i(tag, "Enumerated ${documents.size} items ($totalFiles files)")
+
+        // Loaded once, before any doc is considered: the uploads a previous
+        // session started and nothing finished. Their documents' timestamps are
+        // this app's own interrupted writes, and phase 2 below has to know that
+        // before it asks the clock anything.
+        val unfinishedUploads = uploadsInFlight().toMutableSet()
+
+        // Loaded for the same reason and read the same way: what the last sync wrote,
+        // as (path, mtime, size) lines, each with the digest of its copy where an open
+        // took one. Four readers, each of which needs it only in a
+        // case it can rule out cheaply first: [shouldOverwriteMirror] for providers that
+        // omit COLUMN_LAST_MODIFIED, where there is no clock to compare;
+        // [setAsideDivergedMirror] when a device document is strictly newer than the
+        // mirror copy it is about to replace; [deviceChangedSinceRecord] when a mirror
+        // copy is strictly newer than the device document it is about to replace; and
+        // [uploadMirrorOnlyDocuments] when the mirror holds a file the enumeration did
+        // not return. A fifth comes after phase 2: [digestKeptCopies], which takes a kept
+        // copy's digest from its line rather than reading the copy again. A sixth is the
+        // no-clock arm that finds the two sides apart, through [previousLineFor]. A seventh
+        // is phase 3, which carries a line's digest from it wherever this open took none.
+        // Read once here rather than per document; [reconcileDeletions] reads the same file
+        // again in phase 3, after phase 2 may have changed what is on disk.
+        //
+        // `by lazy`, and it takes both halves to make that true. This was passed to
+        // [shouldOverwriteMirror] by value, and Kotlin evaluates arguments before the
+        // call, so the first ordinary file forced the read whether or not its provider
+        // reported a time: the deferral the word promised never happened on any folder
+        // with a file in it. Every reader takes a function now and invokes it only from
+        // the branch that needs an answer, so a folder that nothing has changed since
+        // the last sync does not hold one string per mirrored file through phase 2 for a
+        // question no branch is going to ask.
+        //
+        // Note the scope carefully: it is this binding that is deferred, not the file.
+        // [reconcileDeletions] opens the same record again in phase 3 on every sync
+        // that enumerates anything, whatever the provider reports, so the saving is the
+        // live map across phase 2, never "the record is not read". Nor the parse, once a
+        // copy was kept: [digestKeptCopies] asks after it for every copy kept without a
+        // digest, which on a folder nothing has changed since the last sync is every file.
+        //
+        // Null rather than an empty set when there is no record to read, and that
+        // distinction is the whole of what the readers below disagree about. A record
+        // that is absent, unreadable, or written in a format this build does not know
+        // says NOTHING about any path; a record that parsed and lists nothing says the
+        // last sync could vouch for no file. Collapsing the two into "empty" left
+        // [uploadMirrorOnlyDocuments] reading silence as evidence: with no usable
+        // record every mirror file the enumeration did not return became an upload
+        // candidate, so a document the user deleted on the device was put straight back
+        // onto it -- the one thing that pass documents as never allowed. The header
+        // arrived after a build that wrote records without one, so a record this build
+        // cannot verify is in the field and reachable on upgrade.
+        val previousRecord: Map<String, ByteArray?>? by lazy {
+            readSyncedRecord(File(mirrorDir.path + SYNCED_RECORD_SUFFIX)).let { lines ->
+                if (lines.firstOrNull() == RECORD_HEADER) {
+                    lines.drop(1).associate { splitRecordLine(it) }
+                } else {
+                    null
+                }
+            }
+        }
+        val previouslyRecorded: Set<String>? by lazy { previousRecord?.keys }
+        // The previous record's line for a path, whatever copy it names, by the path as the
+        // record spells it. Built only once a no-clock open finds the two sides apart.
+        val previousLineFor: Map<String, String>? by lazy {
+            previousRecord?.keys?.associateBy { it.substringBefore('\t') }
+        }
+
+        // Where the mirror ends, resolved rather than compared lexically, and the one
+        // thing phase 2 refuses to write outside. Every outbound path in this engine
+        // already declines a symbolic link and says why; the inbound copy did not ask at
+        // all, and it is the direction that needs the wider question. [isLink]
+        // deliberately answers about an entry rather than about its parents, which is
+        // right where it is used and wrong here: `mkdirs` follows a link above the file,
+        // and so does the rename that moves a finished copy into place, so a single
+        // `docs -> ../../..` planted by a checkout or a terminal put every device
+        // document under `docs/` wherever that pointed: this app's own private storage,
+        // outside the folder the user granted and outside anything [reconcileDeletions]
+        // is allowed to touch.
+        //
+        // A mirror whose own path will not resolve leaves nothing here able to say
+        // where a destination lands, so phase 2 does not run at all. That is the same
+        // direction [reconcileDeletions] takes for the same question, and it is
+        // unreachable in practice: the directory was created by the caller moments ago.
+        val confine = try {
+            mirrorDir.canonicalPath + File.separator
+        } catch (e: Exception) {
+            Logger.e(tag, "Could not resolve the mirror's own path; copying nothing: ${e.message}")
+            return
+        }
+
+        // Phase 2: Create directories and copy files
+        for (doc in documents) {
+            val localPath = File(mirrorDir, doc.relativePath)
+
+            // The DIRECTORY the copy will work in, not the entry itself, and the
+            // difference is what keeps this from refusing a case that is already safe:
+            // a link at the leaf is replaced rather than written through, because
+            // [copyDocumentToLocal] stages its bytes and renames, and a
+            // rename replaces a link. What carries bytes out of the mirror is a link
+            // above the file, which is exactly what this resolves.
+            if (!resolvesInside(localPath.parentFile, confine)) {
+                Logger.w(
+                    tag,
+                    "Not copying ${doc.relativePath} in: the directory it would be " +
+                        "written in resolves outside the mirror",
+                )
+                if (!doc.isDirectory) {
+                    failedCopies++
+                    // The device holds a document this sync did not read, which is
+                    // exactly what the set means and what keeps a local file of that
+                    // name from opening it with "wt" and truncating it.
+                    unfetched.add(localPath.absolutePath)
+                    filesDone++
+                    onProgress(filesDone, totalFiles)
+                }
+                continue
+            }
+
+            if (doc.isDirectory) {
+                clearKindConflict(doc, localPath, mirrorDir) { previousRecord }
+                localPath.mkdirs()
+            } else {
+                clearKindConflict(doc, localPath, mirrorDir) { previousRecord }
+                // First, so it covers every arm below: each one either arms `unfetched`,
+                // which blocks writes on its own, leaves the device as enumerated, or
+                // writes it, and the write refreshes this entry.
+                deviceSeen[localPath.absolutePath] = DeviceState(doc.lastModified to doc.size)
+                // The one thing no timestamp comparison can see: this app was
+                // writing this path back when it stopped. A newer, shorter
+                // document here is CONSISTENT with this app's own truncated copy,
+                // which is not the same as being one, so the bytes are asked
+                // rather than assumed below. Where they answer yes the mirror is
+                // kept, it is the only complete version, and the upload is
+                // attempted again, which is also the repair. The record is
+                // consumed by the sync that acted on it; the re-upload re-marks
+                // it if it is cut short again.
+                //
+                // Repaired here rather than queued: the queue belongs to the
+                // watcher's lifecycle, and [startWatching] opens by calling
+                // [stopWatching], whose no-worker branch clears the queue, so a
+                // job offered between the sync and the thread that would run it
+                // is discarded before anything executes it. The sync already
+                // owns this moment; it is on the IO dispatcher and mid-copy.
+                if (localPath.exists() && localPath.absolutePath in unfinishedUploads) {
+                    val mutation = claimProviderMutation(doc.uri)
+                    if (mutation == null) {
+                        keptLocal++
+                        deferWriteBack(localPath, doc.uri)
+                        filesDone++
+                        onProgress(filesDone, totalFiles)
+                        continue
+                    }
+                    try {
+                        // The journal line is not the licence the comment above reads
+                        // it as. It says a write started here and did not finish; it
+                        // says nothing about what touched the document between then
+                        // and now, and the window is as long as the app was away. A
+                        // user who edits that file on the device before opening the
+                        // app again, or another app that rewrites it, leaves a
+                        // document this branch used to overwrite with `"wt"`, which
+                        // truncates at open. The bytes were gone and nothing had been
+                        // kept.
+                        //
+                        // [deviceIsTruncatedMirror] is what the comment above assumed
+                        // rather than checked: the interrupted write leaves a strict
+                        // prefix of the mirror, so anything else came from somewhere
+                        // else. In the expected case it costs one provider read and
+                        // no copy, which is why it is asked before the set-aside
+                        // rather than instead of it: routing every repair through
+                        // [setAsideDeviceCopy] would keep a `.device-` copy of this
+                        // app's own half-written bytes, and phase 2b would then put
+                        // that copy on the device.
+                        val ownPartialWrite =
+                            !anotherMirrorWritesDocument(doc.uri, mirrorDir) &&
+                                deviceIsTruncatedMirror(doc.uri, localPath, mirrorDir)
+                        val deviceCopy =
+                            if (ownPartialWrite) null else setAsideDeviceCopy(doc, localPath, mirrorDir)
+                        if (deviceCopy == DeviceCopyOutcome.IN_FLIGHT) {
+                            keptLocal++
+                            val wait = heldBefore[localPath.absolutePath]
+                                ?.let { minOf(it.wait * 2, HELD_BACK_RETRY_MAX_MS) }
+                                ?: HELD_BACK_RETRY_FIRST_MS
+                            heldBack[localPath.absolutePath] =
+                                HeldBackSave(doc.uri, SystemClock.elapsedRealtime() + wait, wait)
+                            Logger.w(
+                                tag,
+                                "Deferring ${doc.relativePath}: its device copy was involved " +
+                                    "in another write, so the mirror keeps its copy and " +
+                                    "retries when that write finishes",
+                            )
+                            announceLost(localPath)
+                            filesDone++
+                            onProgress(filesDone, totalFiles)
+                            continue
+                        }
+                        if (deviceCopy == DeviceCopyOutcome.UNAVAILABLE) {
+                            // Held back, not abandoned, and the record is deliberately
+                            // NOT consumed: the mirror keeps the only complete copy,
+                            // unvouched, and the next open tries the whole repair
+                            // again. Writing anyway would be the loss this guard
+                            // exists to prevent.
+                            keptLocal++
+                            // The device holds a document this sync did not read, which
+                            // is what the set means and what stops the next save opening
+                            // it with "wt" and truncating it. Recorded here for the same
+                            // reason the confine refusal, the size skip and a failed copy
+                            // all record it: this branch ends the same way, having
+                            // declined to read the device copy. Without it the refusal
+                            // protects the document for exactly as long as the sync runs,
+                            // and the first edit afterwards overwrites the bytes it would
+                            // not overwrite here. Self-clearing: `initialSync` scrubs the
+                            // mirror's prefix on every reopen, so a later sync that CAN
+                            // set the device copy aside leaves the path out again.
+                            unfetched.add(localPath.absolutePath)
+                            Logger.w(
+                                tag,
+                                "Not replacing ${doc.relativePath}: its device copy is not the " +
+                                    "unfinished upload this app left and could not be set " +
+                                    "aside, so the mirror keeps its copy and the next open " +
+                                    "tries again",
+                            )
+                            // Said on screen as well, for the reason every sibling
+                            // path here says it: the mirror now holds a copy no other
+                            // app can see, that an uninstall takes with it, and a log
+                            // line is not an answer to a user who thinks they saved.
+                            // Throttled twice over, per path here and per interval in
+                            // SafStorageManager, so a folder full of them is one
+                            // notice rather than a wall of them.
+                            announceLost(localPath)
+                            filesDone++
+                            onProgress(filesDone, totalFiles)
+                            continue
+                        }
+                        unfinishedUploads.remove(localPath.absolutePath)
+                        consumeStaleUploadRecord(localPath.absolutePath)
+                        keptLocal++
+                        if (deviceCopy == DeviceCopyOutcome.PRESERVED) setAside++
+                        Logger.i(
+                            tag,
+                            when (deviceCopy) {
+                                null ->
+                                    "Kept the mirror of ${doc.relativePath}: its device copy " +
+                                        "was an upload this app did not finish"
+                                // The line a maintainer reads to explain a `.device-` file in
+                                // a user's folder, so it is said only where one was really
+                                // left behind. It used to be said for the identical-bytes case
+                                // too, which is the case that deletes its own copy again.
+                                DeviceCopyOutcome.PRESERVED ->
+                                    "Kept the mirror of ${doc.relativePath}: its device copy " +
+                                        "did not come from an unfinished upload and was " +
+                                        "preserved first"
+                                else ->
+                                    "Kept the mirror of ${doc.relativePath}: its device copy " +
+                                        "did not come from an unfinished upload and holds the " +
+                                        "same bytes, so nothing was set aside"
+                            },
+                        )
+                        writeLocalToSaf(localPath, doc.uri, mirrorDir, mutation)
+                        filesDone++
+                        onProgress(filesDone, totalFiles)
+                        continue
+                    } finally {
+                        releaseProviderMutation(mutation)
+                    }
+                }
+                // Skip files larger than MAX_FILE_SIZE.
+                // Not recorded, because this sync did not fetch the file and so cannot
+                // say what is at that path. Usually there is nothing; but a file that was
+                // under the limit at an earlier sync and has since grown past it leaves a
+                // real, sync-written copy sitting there, and "nothing ever wrote this"
+                // would be the wrong reason for the right behaviour. Not vouching for it
+                // costs a stale copy that lingers, which is the direction to fail in.
+                if (doc.size > MAX_FILE_SIZE) {
+                    skippedLarge++
+                    unfetched.add(localPath.absolutePath)
+                    // At Logger.i, not d, for the reason the no-clock line below gives:
+                    // Logger.d is gated on a debuggable build, so on a release build
+                    // the only trace of this document was the count in the summary. The
+                    // file is intact on the device and the editor simply does not have
+                    // it, which is a folder that opens successfully and is quietly
+                    // incomplete, and a user asking why they cannot find it needs the
+                    // name rather than a number.
+                    Logger.i(tag, "Skipped large file: ${doc.relativePath} (${doc.size / 1_000_000} MB)")
+                    filesDone++
+                    onProgress(filesDone, totalFiles)
+                    continue
+                }
+                if (!shouldOverwriteMirror(
+                        localPath.exists(), localPath.lastModified(), localPath.length(),
+                        doc.lastModified, doc.size,
+                        mirrorIsOurCopy = {
+                            // A record this build cannot verify vouches for nothing,
+                            // which is what the unknown-time branch already does with
+                            // an answer of false: it keeps the mirror copy.
+                            identityLine(doc.relativePath, localPath) in
+                                previouslyRecorded.orEmpty()
+                        },
+                    )
+                ) {
+                    keptLocal++
+                    var deviceAgrees = false
+                    // Inside this branch the mirror is not older, so equal means the
+                    // mirror is already this document and can be vouched for, while
+                    // strictly newer means it holds an edit that has not been written
+                    // back and cannot.
+                    if (localPath.lastModified() == doc.lastModified) {
+                        recordIdentity(recorded, doc.relativePath, localPath, mirrorDir)
+                    } else if (doc.lastModified == 0L &&
+                        deviceMatchesUnchangedMirror(doc.uri, localPath, doc.size, mirrorDir) { _, attributes ->
+                            recordIdentity(recorded, doc.relativePath, attributes)
+                        }
+                    ) {
+                        // No clock, the mirror no longer matches the record, and yet the
+                        // device document holds exactly these bytes. That is the ordinary
+                        // end of a local edit: the watcher carried it to the device
+                        // already, so the two agree in content while the record still
+                        // describes what was there before.
+                        //
+                        // Only for a file nothing wrote while it was read. One that was
+                        // written is not what the read compared, and recorded it would be
+                        // the copy the record vouches for: the next open replaced it with
+                        // the device's older bytes, with nothing set aside, and the edit
+                        // was gone. It takes the branch for a copy that differs.
+                        //
+                        // Nothing here writes anything. It records what is already true
+                        // on both sides, which is what the record means and what
+                        // `holdsOnlyVouchedCopies` reads it to mean.
+                        //
+                        // This recovers two of the three costs of never being vouched:
+                        // device changes reach the file again, and the mirror becomes
+                        // reclaimable. It does not recover the third. An edit the watcher
+                        // never delivered is not on the device, so this cannot fire for
+                        // it, and with no clock there is nothing to say whether the
+                        // device copy is older or newer, so it is not pushed either.
+                        //
+                        // Deliberately not paired with a write in the other direction. If
+                        // the two do not agree there is no clock to say which is newer,
+                        // and pushing either way would destroy the other side's work.
+                        deviceAgrees = true
+                        Logger.i(
+                            tag,
+                            "Tracking ${doc.relativePath} again: the provider reports no " +
+                                "modification time, and the device copy already holds " +
+                                "what the mirror holds",
+                        )
+                    } else if (doc.lastModified > 0L &&
+                        localPath.lastModified() > doc.lastModified
+                    ) {
+                        val mutation = claimProviderMutation(doc.uri)
+                        if (mutation == null) {
+                            deferWriteBack(localPath, doc.uri)
+                        } else try {
+                            // Strictly newer with a time to compare against: an edit the
+                            // watcher never carried out. That happens whenever the watcher
+                            // was not running -- the app was killed, the directory sat past
+                            // the watch cap, or the write-back gave up -- and until now
+                            // nothing ever retried it. The prose around this feature calls
+                            // reopening the folder the way back; this is what makes that
+                            // true.
+                            //
+                            // Only when the provider reported a time. An unknown one arrives
+                            // as 0, and every real mirror timestamp is greater than 0, so
+                            // without this guard every file in such a folder would look
+                            // newer and be pushed over the device document on every reopen.
+                            //
+                            // Deliberately NOT capped at [MAX_FILE_SIZE], which the same loop
+                            // applies a few lines up, and the asymmetry is the right way
+                            // round. That cap keeps a large DEVICE document out of
+                            // `filesDir`, which is this app's own storage and the thing that
+                            // runs out; writing back spends the device folder's space
+                            // instead, so the reason for the cap does not apply in this
+                            // direction.
+                            //
+                            // The decisive argument is consistency, not data loss. Capping
+                            // costs nothing permanent -- an uncapped file simply stays in
+                            // the mirror, where [holdsOnlyVouchedCopies] keeps it because
+                            // the record cannot vouch for it -- but none of the other three
+                            // `writeLocalToSaf` sites cap, so a cap here alone would upload
+                            // a file when the watcher saves it and refuse the same file on
+                            // reopen. One engine, two answers to one question, is worse
+                            // than either answer.
+                            //
+                            // Note also how narrow the case is: reaching here needs the
+                            // DEVICE document under the cap, since a larger one is skipped
+                            // above, so only a file the user grew past 50 MB locally
+                            // qualifies.
+                            //
+                            // What it costs is honest: a large file makes the folder-open
+                            // dialog sit on this one entry. Progress is per file, so the bar
+                            // does not move until the copy finishes. This runs on
+                            // Dispatchers.IO, so it is a slow dialog and not an ANR.
+                            //
+                            // "Newer" says which side moved last, not that only one side
+                            // moved. The record carries the device time this file had at
+                            // the last sync, so a device document that no longer matches it
+                            // was written since by something other than this app's sync,
+                            // and the write below opens it with "wt". What wrote it is not
+                            // knowable from here: another app is the case that matters,
+                            // and this app's own delivered write-back is the common one,
+                            // since the record never learns the time that write left
+                            // behind. [setAsideDeviceCopy] tells the two apart by bytes
+                            // and keeps a copy only where they differ. The mirror-side
+                            // guard for the symmetric case already exists
+                            // ([setAsideDivergedMirror]); this is the same guard facing
+                            // the other way, and the one provider read it costs is paid
+                            // wherever the record cannot vouch for the path: where it
+                            // shows the device moved, and where it says nothing at all.
+                            // Silence is the arm below's own leavings, so a file written
+                            // back once pays that read on every open after it, and a
+                            // second mirror edit before the next open fetches this app's
+                            // own older bytes, which differ, and keeps them beside the
+                            // file. That is the known false positive [setAsideDivergedMirror]
+                            // already names for the two other producers of silence.
+                            //
+                            // A copy that fails leaves both sides as they are: the mirror
+                            // keeps its edit, unvouched, and the next open tries again. The
+                            // fetch failing is therefore a deferral, not a loss, but it is a
+                            // deferral of the user's own save and nothing but this log says
+                            // so, which for a persistent cause is indistinguishable from the
+                            // save never happening.
+                            val deviceCopy = when {
+                                anotherMirrorWritesDocument(doc.uri, mirrorDir) -> DeviceCopyOutcome.IN_FLIGHT
+                                previousRecord?.let { deviceChangedSinceRecord(it, doc) } != false ->
+                                    setAsideDeviceCopy(doc, localPath, mirrorDir)
+                                else -> null
+                            }
+                            if (deviceCopy == DeviceCopyOutcome.IN_FLIGHT) {
+                                val wait = heldBefore[localPath.absolutePath]
+                                    ?.let { minOf(it.wait * 2, HELD_BACK_RETRY_MAX_MS) }
+                                    ?: HELD_BACK_RETRY_FIRST_MS
+                                heldBack[localPath.absolutePath] =
+                                    HeldBackSave(doc.uri, SystemClock.elapsedRealtime() + wait, wait)
+                                Logger.w(
+                                    tag,
+                                    "Deferring ${doc.relativePath}: its device copy was " +
+                                        "involved in another write, so the mirror keeps " +
+                                        "the edit and retries when that write finishes",
+                                )
+                                announceLost(localPath)
+                            } else if (deviceCopy == DeviceCopyOutcome.UNAVAILABLE &&
+                                usableSpaceOf(mirrorDir) < OPEN_SPACE_FLOOR_BYTES &&
+                                deviceMatchesUnchangedMirror(doc.uri, localPath, doc.size, mirrorDir) { destination, _ ->
+                                    runCatching { destination.modified(doc.lastModified) }
+                                    recordIdentity(recorded, doc.relativePath, destination.attributes())
+                                }
+                            ) {
+                                // The floor held back the fetch the set-aside needed, and a
+                                // read says there was nothing to set aside or write back: the
+                                // device holds the mirror's bytes. The ordinary case is a save
+                                // the watcher delivered to a provider whose clock is coarser
+                                // than the mirror's, which rounds the write-back's time to
+                                // before the save. Settled like phase 2's own held-back fetch
+                                // below, stamped with the device's time and recorded, so it is
+                                // neither announced nor refused its saves for the session.
+                                //
+                                // Only for a file nothing wrote while it was read. One that
+                                // was written is not what the read compared, and stamping it
+                                // with the device's older time would record an edit the
+                                // device never received as delivered; it takes the deferral
+                                // below, as a read that found other bytes does.
+                            } else if (deviceCopy == DeviceCopyOutcome.UNAVAILABLE) {
+                                // Unread, exactly as in the repair branch above, and armed
+                                // for the same reason: this declines to touch the device
+                                // copy now, and nothing else would stop the next save
+                                // doing what this refused.
+                                unfetched.add(localPath.absolutePath)
+                                Logger.w(
+                                    tag,
+                                    "Not writing ${doc.relativePath} back: the record cannot " +
+                                        "vouch for its device copy and that copy could not be " +
+                                        "set aside, so the mirror keeps the edit and " +
+                                        "the next open tries again",
+                                )
+                                // The deferral this branch's comment describes, said
+                                // to the user rather than to logcat alone. Same seam,
+                                // same throttles and same sentence as every other
+                                // path that ends with the only copy inside the app.
+                                announceLost(localPath)
+                            } else {
+                                if (deviceCopy == DeviceCopyOutcome.PRESERVED) setAside++
+                                uploadsDone++
+                                Logger.i(tag, "Writing back a newer mirror copy: ${doc.relativePath}")
+                                writeLocalToSaf(localPath, doc.uri, mirrorDir, mutation)
+                            }
+                        } finally {
+                            releaseProviderMutation(mutation)
+                        }
+                    }
+                    // The flag the branch above set, not a fresh stat plus a scan of the
+                    // recorded list. Re-deriving it would also read "the two differ" out of
+                    // a recordIdentity that simply declined the path.
+                    if (doc.lastModified == 0L && !deviceAgrees) {
+                        // Not the listed stamp as what this engine saw, which let the next
+                        // save or delete go over the device copy unasked: it holds bytes the
+                        // open could not place, another app's edit as readily as the copy
+                        // the record vouched for before an edit the watcher never delivered,
+                        // or a save the session delivered before it lost a later one. So no
+                        // stamp, and the digest of the copy the record vouched for: the next
+                        // save or delete reads the device copy, goes ahead over that
+                        // version, and keeps anything else the way [keepsDeviceEdit] keeps
+                        // another app's edit, this app's own delivered save included; see
+                        // there for why the record cannot tell that one apart.
+                        val last = previousLineFor?.get(escapeRecordPath(doc.relativePath))
+                        deviceSeen[localPath.absolutePath] = DeviceState(
+                            null,
+                            last?.let { previousRecord?.get(it) },
+                            last?.substringAfterLast('\t')?.toLongOrNull() ?: 0,
+                        )
+                        // A save held back before this open is in the mirror and not on the
+                        // device, and nothing here sent it: dropped with the other holds, it
+                        // waited for the next save of the file, with no notice after the
+                        // open. Tried again as before, and the entry above makes the try
+                        // read the device copy, so another app's edit is kept beside it.
+                        // Through the document listed here rather than the one it was held
+                        // for, which another app may have replaced since.
+                        heldBefore[localPath.absolutePath]?.let {
+                            heldBack[localPath.absolutePath] =
+                                HeldBackSave(doc.uri, it.dueAt, it.wait)
+                        }
+                        // At Logger.i, not d: this file stops receiving device-side
+                        // changes from here on, and a user asking why their folder does
+                        // not update needs this line to exist in a bug report.
+                        Logger.i(
+                            tag,
+                            "Kept ${doc.relativePath}: the provider reports no " +
+                                "modification time, and the device copy differs from the " +
+                                "mirror, so nothing here can say which is newer. Both " +
+                                "sides are left as they are.",
+                        )
+                    }
+                    Logger.d(tag, "Kept local copy: ${doc.relativePath}")
+                    filesDone++
+                    onProgress(filesDone, totalFiles)
+                    continue
+                }
+                localPath.parentFile?.mkdirs()
+                // One sync at a time per mirror file, and the loser walks away rather
+                // than waiting, which is the shape [documentAccess] already
+                // uses on the outbound side and for the same measured reason: a
+                // provider stream has no timeout, so waiting turns a race into a stall
+                // behind a dialog the user cannot cancel. Two syncs over one mirror is
+                // not exotic: the mirror is named by a hash of the tree URI rather than
+                // by the session, the phase-2 loop has no suspension point so cancelling
+                // the coroutine does not stop it, and an activity recreated mid-open
+                // builds a second engine over the same directory. Both used to write the
+                // same scratch path, so one writer's rename pulled the inode out from under
+                // the other, whose remaining bytes then landed inside the finished
+                // mirror file that [recordIdentity] had already vouched for.
+                if (!mirrorCopiesInFlight.add(localPath.absolutePath)) {
+                    // Armed for the same reason every other refusal in this loop
+                    // arms it: THIS sync did not read the device document, which
+                    // is the whole of what the set means. Leaving it to the other
+                    // sync is right for the copy and says nothing about the guard,
+                    // and the two engines do not share one: the claim above is in
+                    // the companion object precisely because two engines meet
+                    // over one mirror, while [unfetched] is per engine.
+                    //
+                    // Which engine is left holding the folder makes it worse, not
+                    // academic. The routine way two syncs meet here is an activity
+                    // recreated mid-open: the claim belongs to the engine of the
+                    // activity being destroyed, so the winner is the one going
+                    // away and the LOSER is the engine whose watcher goes on
+                    // serving saves. A copy the winner never finished then leaves
+                    // the mirror holding a stub, and the first save writes it over
+                    // the device document with "wt", which truncates at open.
+                    //
+                    // It can only add refusals, never a write, and a refusal here
+                    // is a deferral the next open clears: [initialSync] scrubs the
+                    // mirror's prefix out of the set before phase 2. The cost when
+                    // the winner did finish is one save deferred to the next open
+                    // of that folder; the cost of not arming it is the document.
+                    unfetched.add(localPath.absolutePath)
+                    Logger.w(
+                        tag,
+                        "Another sync of this folder is already copying " +
+                            "${doc.relativePath}; leaving it to that one, and not " +
+                            "vouching for a device copy this sync never read",
+                    )
+                    filesDone++
+                    onProgress(filesDone, totalFiles)
+                    continue
+                }
+                val fetchedDigest = MessageDigest.getInstance("SHA-256")
+                var unchangedAfterFailure = true
+                val copied = try {
+                    copyDocumentToLocal(
+                        doc.uri, localPath, doc.lastModified, mirrorDir, fetchedDigest,
+                        expectedSize = doc.size,
+                        onCopyFailed = { unchangedAfterFailure = it },
+                    ) { fetched, changedDuringFetch, destination ->
+                        val moved = setAsideDivergedMirror(
+                            doc, localPath, fetched, changedDuringFetch, destination,
+                        ) { previousRecord }
+                        if (moved) setAside++
+                        moved
+                    }
+                } finally {
+                    mirrorCopiesInFlight.remove(localPath.absolutePath)
+                }
+                if (copied is LandedCopy) {
+                    // What the open fetched vouches for the device copy as a landed write's
+                    // bytes do in [keepsDeviceEdit]. Without it a provider that settles its
+                    // stamp after the open, a FAT card once the cached inode is evicted or
+                    // Nextcloud after its upload, had the first save of the session keep a
+                    // `.device-` copy of the very document the editor shows.
+                    //
+                    // Both from the copy as it landed rather than from the mirror file a
+                    // moment later, which is whatever an editor saved into it since: that
+                    // length beside this digest made the read at the next save stop short
+                    // of the fetched copy and keep a duplicate of it, and that identity in
+                    // the record vouched for an edit the device never received, which the
+                    // reclaim and phase 3 read as disposable.
+                    val fetched = fetchedDigest.digest()
+                    deviceSeen[localPath.absolutePath] =
+                        DeviceState(doc.lastModified to doc.size, fetched, copied.length)
+                    val line = identityLine(doc.relativePath, copied.lastModified, copied.length)
+                    recorded += line
+                    digests[line] = fetched
+                } else if (localPath.isFile &&
+                    usableSpaceOf(mirrorDir) < OPEN_SPACE_FLOOR_BYTES &&
+                    deviceMatchesUnchangedMirror(doc.uri, localPath, doc.size, mirrorDir) { destination, _ ->
+                        if (doc.lastModified > 0) runCatching { destination.modified(doc.lastModified) }
+                        recordIdentity(recorded, doc.relativePath, destination.attributes())
+                    }
+                ) {
+                    // Held back by the floor, and nothing was missed by it: the device
+                    // document holds the mirror's bytes, which a read settles without
+                    // spending disk. Two ordinary cases land here: on a provider with no
+                    // clock every file the record vouches for, which the unknown-time
+                    // branch fetches again on every open, and a file the editor saved and
+                    // the watcher delivered where the device stamped that write-back after
+                    // the save, newer on the device by time alone. A clock coarse enough
+                    // to stamp it before the save takes the strictly-newer arm above, which
+                    // settles it the same way. Taken as failed copies, each was announced
+                    // as not copied and refused every save of the session while the editor
+                    // showed it as the device holds it.
+                    //
+                    // Stamped with the device's time, as the copy would have been, so the
+                    // next open finds it current rather than fetching it again.
+                    //
+                    // Only for a file nothing wrote while it was read, as in the arm above;
+                    // one that was written falls to the failed copy below, which keeps it
+                    // as the editor wrote it.
+                    keptLocal++
+                } else {
+                    // Nothing says the mirror holds what the device holds now. Counted as
+                    // well as guarded: a failed copy had no counter at all, so the summary
+                    // reported a clean sync for a folder it did not read.
+                    failedCopies++
+                    unfetched.add(localPath.absolutePath)
+                    // What the previous record vouched for still stands while the mirror
+                    // copy is exactly the copy it vouched for: nothing landed on it since,
+                    // so the device held these bytes when that line was written, whether or
+                    // not it has moved on. Dropped, the next open read it as an edit nobody
+                    // synced, set it aside as a `.local-` file that phase 2b put into the
+                    // device folder, or with no clock kept it over every later device
+                    // change, and the reclaim and the storage screen called it work the
+                    // device folder lacks. Carried rather than made, so not through
+                    // [recordIdentity], whose precondition is that the device holds these
+                    // bytes now; the line goes on saying only what it said when it was
+                    // written.
+                    val line = identityLine(doc.relativePath, localPath)
+                    if (unchangedAfterFailure && localPath.isFile && line in previouslyRecorded.orEmpty()) {
+                        recorded += line
+                    }
+                }
+                filesDone++
+                onProgress(filesDone, totalFiles)
+            }
+        }
+        settledHeldWait.keys.removeAll { it.startsWith(mirrorDir.absolutePath + File.separator) }
+
+        digestKeptCopies(mirrorDir, documents, recorded, digests) { previousRecord?.get(it) }
+        recorded.forEach {
+            fetchedPaths.add(File(mirrorDir, unescapeRecordPath(it.substringBefore('\t'))).absolutePath)
+        }
+
+        // Read here, where phase 2 stopped fetching, rather than beside the notice: phase
+        // 2b writes into the device folder, which for internal storage is this same
+        // partition, and phase 3 frees mirror files, so either could change the answer.
+        val belowFloor = failedCopies > 0 && usableSpaceOf(mirrorDir) < OPEN_SPACE_FLOOR_BYTES
+
+        // Phase 2b: put onto the device what only the mirror has.
+        //
+        // Guarded by the same two facts [reconcileDeletions] needs, and for a mirrored
+        // reason. A partial enumeration does not know what the device holds, so a
+        // mirror file it cannot find would be created beside a document that is already
+        // there, or written into it; and an enumeration that succeeded and returned
+        // nothing is a folder the user emptied and a provider answering for a volume
+        // that is no longer mounted, told apart by nothing. This phase writes to the
+        // device, so both cases decline.
+        // The tick is added to the phase-2 figures rather than replacing them, so the
+        // dialog goes on counting up instead of restarting at one, and the total grows
+        // by exactly the work that is left.
+        val putBack = if (enumerationComplete && documents.isNotEmpty()) {
+            uploadMirrorOnlyDocuments(
+                safUri,
+                mirrorDir,
+                documents.mapTo(HashSet()) { it.relativePath },
+                { previouslyRecorded }
+            ) { done, total -> onProgress(filesDone + done, totalFiles + total) }
+        } else {
+            0
+        }
+
+        for ((path, receipt) in deliveredDuringSync) {
+            if (!path.startsWith(mirrorDir.absolutePath + File.separator)) continue
+            val (identity, digest) = splitRecordLine(receipt)
+            val relative = identity.substringBefore('\t')
+            recorded.removeAll { it.substringBefore('\t') == relative }
+            recorded += identity
+            if (digest != null) digests[identity] = digest
+            fetchedPaths.add(path)
+            deliveredDuringSync.remove(path, receipt)
+        }
+
+        // Phase 3: drop what the device no longer has. Each line goes out with the digest
+        // this open took of its copy, or else the one the previous record held for it:
+        // a line names the copy's time and length, so a digest taken of the copy it names
+        // still describes it, which is what carries a digest from open to open.
+        val removed = reconcileDeletions(
+            mirrorDir, documents, enumerationComplete,
+            recorded.map { recordLine(it, digests[it] ?: previousRecord?.get(it)) },
+        )
+        val clearedPartials = removeRedundantPartials(mirrorDir, documents)
+
+        val elapsed = System.currentTimeMillis() - startTime
+        Logger.i(
+            tag,
+            "Initial sync complete: $filesDone files ($skippedLarge too large, " +
+                "$failedCopies could not be copied, $keptLocal kept, " +
+                "$uploadsDone written back, $setAside set aside, $putBack put back, " +
+                "${recorded.size} vouched for, $removed removed, $clearedPartials partial copies cleared) in ${elapsed}ms"
+        )
+
+        // Only the copies that were attempted and failed. A document skipped for size is
+        // an expected, permanent condition that would toast on every open of the folder
+        // holding it, and the write-back guard already keeps a local file of that name
+        // from replacing it.
+        if (failedCopies > 0) {
+            if (belowFloor) {
+                Logger.w(
+                    tag,
+                    "${mirrorDir.name} stopped fetching under " +
+                        "${OPEN_SPACE_FLOOR_BYTES / 1_000_000} MB free; documents not " +
+                        "fetched stay on the device",
+                )
+            }
+            onDocumentsNotCopied(failedCopies, outOfRoom || belowFloor)
+        }
+        if ("" !in skippedDirs) unfetched.remove(mirrorDir.absolutePath)
+    }
+
+    /**
+     * Removes a `<name>.vscodroid-partial` entry beside a document when every byte it holds is
+     * the start of that document's copy in the mirror.
+     *
+     * Builds up to 1.5.0 streamed a device document into that name before renaming it into place,
+     * and a copy cut short left it behind for good. This build neither writes that name nor
+     * writes such an entry back, so it only sat in the Explorer. A name alone does not make an
+     * entry ours: a workspace file can end the same way. So the test is the content. An entry
+     * that is the start of the file beside it adds nothing to that file, so dropping it loses
+     * nothing whoever made it; anything else, including a link, a directory, an entry longer
+     * than its neighbour or one with no neighbour, is kept.
+     *
+     * It runs after the copies of this open are in place, so the entry of a document that was
+     * not yet in the mirror is compared with the copy fetched a moment ago. Almost no document
+     * has one, so the common cost is one stat per document.
+     */
+    private fun removeRedundantPartials(mirrorDir: File, documents: List<DocumentInfo>): Int {
+        var removed = 0
+        for (document in documents) {
+            if (document.isDirectory) continue
+            val relative = document.relativePath
+            if (!File(mirrorDir, relative + PARTIAL_SUFFIX).exists()) continue
+            try {
+                openOutboundPath(File(mirrorDir, relative), mirrorDir).use { path ->
+                    val partial = path.sibling(path.leaf.toString() + PARTIAL_SUFFIX)
+                    val before = path.attributes(partial)
+                    if (isStartOfSibling(path, partial, path.leaf, before)) {
+                        // A last look: what was compared must still be what is removed.
+                        if (!sameInboundAttributes(before, path.attributes(partial))) return@use
+                        path.parent.deleteFile(partial)
+                        removed++
+                    }
+                }
+            } catch (e: Exception) {
+                Logger.w(tag, "Kept a partial copy beside $relative: ${e.message}")
+            }
+        }
+        return removed
+    }
+
+    private fun isStartOfSibling(
+        dest: OutboundPath, partial: Path, whole: Path, partialAttributes: BasicFileAttributes,
+    ): Boolean {
+        val wholeAttributes = dest.attributes(whole)
+        if (!partialAttributes.isRegularFile || !wholeAttributes.isRegularFile ||
+            partialAttributes.size() > wholeAttributes.size()) return false
+        return dest.input(partial).use { start ->
+            dest.input(whole).use { all ->
+                val one = ByteArray(COPY_BUFFER_SIZE)
+                val two = ByteArray(COPY_BUFFER_SIZE)
+                var left = partialAttributes.size()
+                while (left > 0) {
+                    val want = minOf(left, one.size.toLong()).toInt()
+                    if (readFully(start, one, want) != want || readFully(all, two, want) != want) return false
+                    if (!java.util.Arrays.equals(one, 0, want, two, 0, want)) return false
+                    left -= want
+                }
+                true
+            }
+        }
+    }
+
+    /**
+     * Gives the copies this open kept rather than fetched the digest a fetch leaves, so
+     * that [keepsDeviceEdit] can tell a stamp their provider moves afterwards from another
+     * app's edit, and puts each digest it reads into [digests] for the copy's record line.
+     *
+     * Kept means recorded without being fetched: the mirror copy's time equalled the one
+     * the device reported, or a read found the device holding the mirror's bytes. With no
+     * digest, the first save after such a move kept a `.device-` copy of a document nobody
+     * had changed; a FAT card behind the FUSE cache is the ordinary case, reporting a
+     * rounded time once its cached inode is evicted. The mirror is what is read, locally,
+     * because it holds what the device holds as far as this open can tell, and where it
+     * does not, the device's bytes miss the digest and the save goes to the set-aside
+     * exactly as it did with none.
+     *
+     * A copy whose line in the previous record carries a digest, [recordedDigest], takes it
+     * from there unread. The line names the copy's time and length, the identity every
+     * other reader of the record acts on, so each copy is read for this at most once while
+     * its identity stands; reading every kept copy on every open read a typical source tree
+     * in full each time. The rest are read newest first, because a provider moves a stamp
+     * after a write and the recent copies are the ones it moves, and at most
+     * [KEPT_COPY_DIGEST_BYTES] of them per open. Those are the copies of a folder last opened
+     * by a build that recorded no digests, and copies recorded by a read that found the
+     * device holding them rather than by a fetch, so a folder with more of them than that is
+     * read over several opens. What that leaves is a late stamp over a kept copy no open has
+     * read yet, past this open's budget, which still keeps one spare copy of the unchanged
+     * document.
+     */
+    private fun digestKeptCopies(
+        mirrorDir: File,
+        documents: List<DocumentInfo>,
+        recorded: List<String>,
+        digests: MutableMap<String, ByteArray>,
+        recordedDigest: (String) -> ByteArray?,
+    ) {
+        val vouched = recorded.toHashSet()
+        var budget = keptCopyDigestBytes
+        for (doc in documents.sortedByDescending { it.lastModified }) {
+            if (doc.isDirectory) continue
+            val file = File(mirrorDir, doc.relativePath)
+            val seen = deviceSeen[file.absolutePath] ?: continue
+            // Not a name that is no regular file any more: opening a pipe waits for a writer,
+            // which held the folder's open for as long as none came. Nor a path this open could
+            // not read: the write and delete guards stop its saves and deletes before any digest
+            // is compared, unless the provider answers them inconsistently, and there a missing
+            // digest only keeps the device copy, as a set-aside or a declined delete.
+            if (seen.sha256 != null || file.absolutePath in unfetched) continue
+            try {
+                openOutboundSource(file, mirrorDir).use { selected ->
+                    val length = selected.attributes.size()
+                    val line = identityLine(doc.relativePath, selected.attributes.lastModifiedTime().toMillis(), length)
+                    // Taken whether or not this open vouched for the copy: the record's digest is of
+                    // the bytes the mirror holds under this time and length, so after a stamp moves
+                    // it lets a save or a delete go ahead only over those same bytes.
+                    val recordedOnce = recordedDigest(line)
+                    val hashed = if (recordedOnce != null) {
+                        recordedOnce to length
+                    } else if (length > budget) {
+                        null
+                    } else {
+                        try {
+                            selected.input.use { input ->
+                                // Vouched for, and asked with the file already open, because the
+                                // bytes read are the kept copy's only while the name still is: another
+                                // sync over this mirror, an activity recreated mid-open, renames a newer
+                                // device copy into place, during phase 2 or after the stat above, whose
+                                // digest would match that device copy and skip the set-aside meant to
+                                // keep it. A rename after this leaves the open stream on the copy that
+                                // was asked about.
+                                if (line !in vouched) return@use null
+                                budget -= length
+                                // Exactly the length the line names, or the digest is not of the copy
+                                // it is recorded beside: an editor writing the file meanwhile
+                                // lengthens or shortens what the stream reads.
+                                sha256(input, length)?.takeIf { it.second == length }
+                            }
+                        } catch (e: Exception) {
+                            null
+                        }
+                    }
+                    if (hashed == null) return@use
+                    // Only provider-matching bytes may authorize later deletion.
+                    val agrees = recordedOnce == null &&
+                        !anotherMirrorWritesDocument(doc.uri, mirrorDir) &&
+                        hashed.first.contentEquals(deviceSha256(doc.uri, hashed.second))
+                    if (!sameInboundAttributes(selected.attributes, selected.path.attributes()) ||
+                        !parentIsCurrent(selected.path, file, mirrorDir)
+                    ) return@use
+                    if (agrees) digests[line] = hashed.first
+                    // Only over the entry the open left, never one a write has replaced since.
+                    deviceSeen.replace(
+                        file.absolutePath, seen, DeviceState(seen.stamp, hashed.first, hashed.second),
+                    )
+                }
+            } catch (_: Exception) {
+                // An unreadable or redirected kept copy remains unvouched.
+            }
+        }
+    }
+
+    /**
+     * Moves the mirror copy of [doc] out of the way when the device's copy is about to
+     * replace it and nothing can say the mirror held this app's own copy, and answers
+     * whether it did.
+     *
+     * What it stands between: a save the write-back never delivered and a device edit
+     * made afterwards. [shouldOverwriteMirror] is last-writer-wins on modification time,
+     * so the device copy wins that comparison and [copyDocumentToLocal] replaces the
+     * mirror, after which [recordIdentity] vouches for the result. The edit is then gone
+     * with no copy of it anywhere: the mirror held the only one. Reaching that state
+     * needs nothing exotic, only a save the watcher did not carry (the app killed before
+     * the drain ran it, or the file sitting past [MAX_WATCHED_DIRECTORIES]) and then any
+     * other app touching the same file on the device.
+     *
+     * Two conditions keep this from firing on the ordinary case. A destination that
+     * changed during the provider read bypasses the record condition: neither missing
+     * history nor matching old metadata can vouch for bytes written in that interval.
+     *
+     * - **No record vouches for the mirror copy.** A file whose mirror
+     *   copy still matches the identity and digest the last sync wrote is this app's own
+     *   copy and the device is entitled to replace it, which is the same evidence
+     *   [holdsOnlyVouchedCopies] and [reconcileDeletions] act on. Missing, unreadable or
+     *   unsupported history cannot distinguish a stale copy from an undelivered edit,
+     *   so distinct bytes are retained in that case too.
+     *
+     * - **The fetched bytes differ from the mirror copy.** Without this the guard would
+     *   fire on every file the user edited in the last session: a save the watcher DID
+     *   deliver leaves the record naming the pre-edit copy and the device carrying the
+     *   write-back's own fresh timestamp, so the first condition holds for it too, and
+     *   the two sides hold the same bytes. [fetched] is the copy [copyDocumentToLocal]
+     *   has just finished staging, so this is a local comparison
+     *   and not a second read of the document.
+     *
+     * Two ordinary branches of phase 2 also leave a path out of the record, and each is
+     * a known false positive here: a document skipped for size, and a document whose
+     * destination directory resolved outside the mirror. If the device copy of such a
+     * file later changes, the stale sync-written mirror copy is set aside under a
+     * `.local-` name and [uploadMirrorOnlyDocuments] then puts that name onto the device
+     * folder. Nothing is lost, and both folders gain a file nothing removes. Narrowing
+     * the test would need the reason a path went unrecorded to survive to the next sync,
+     * which nothing on disk carries today: `unfetched` is this sync's own set, and every
+     * path in it took a branch that never reaches here. A copy that failed, or that the
+     * free-space floor held back, is not among them: phase 2 carries the previous
+     * record's line for a mirror copy still exactly as that record described it.
+     *
+     * The copy is renamed rather than duplicated, so the space cost is nothing and what
+     * the sync then finds at the original name is absent, which is where the fetched copy
+     * is about to land. A failed preservation aborts the incoming replacement.
+     *
+     * Deliberately not routed through [announceLost]. The set-aside copy is a candidate
+     * for [uploadMirrorOnlyDocuments] in this same sync, so it usually reaches the device
+     * folder a moment later, and the notice that seam owns says the opposite ("the only
+     * copy is inside VSCodroid"). What tells the user is stronger than a toast anyway:
+     * the file sits in the explorer beside the one it was set aside from. The
+     * announcement is left to the upload, which fires it only when the copy really did
+     * stay inside the app.
+     */
+    private fun setAsideDivergedMirror(
+        doc: DocumentInfo,
+        localPath: File,
+        fetched: InboundStage,
+        changedDuringFetch: Boolean,
+        destination: OutboundPath,
+        previouslyRecorded: () -> Map<String, ByteArray?>?,
+    ): Boolean {
+        val entry = inboundEntry(destination) ?: return false
+        if (!entry.attributes.isRegularFile) return false
+        if (!changedDuringFetch) {
+            val recorded = previouslyRecorded()
+            val identity = identityLine(doc.relativePath, entry.attributes.lastModifiedTime().toMillis(), entry.attributes.size())
+            if (recorded != null &&
+                matchesRecordedCopy(destination, doc.relativePath, recordLine(identity, recorded[identity]))
+            ) return false
+        }
+        if (sameRootedBytes(destination, destination.leaf, fetched)) return false
+
+        var time = entry.attributes.lastModifiedTime().toMillis()
+        var preserved = destination.sibling("${localPath.name}$LOCAL_COPY_SUFFIX$time")
+        while (inboundAttributes(destination, preserved) != null) {
+            time++
+            preserved = destination.sibling("${localPath.name}$LOCAL_COPY_SUFFIX$time")
+        }
+        destination.parent.move(destination.leaf, destination.parent, preserved)
+        Logger.i(
+            tag,
+            "Set the mirror copy of ${doc.relativePath} aside as $preserved: it " +
+                "differs from the device copy replacing it and no sync wrote it",
+        )
+        return true
+    }
+
+    /**
+     * Makes room for the device document [doc] where the mirror holds the other kind of
+     * entry at its path: a file where the device has a folder, or a folder where it has a
+     * file. Matching by name alone, an open otherwise tried to make a directory where a file
+     * stood (or copy a file onto a directory), failed on the document and on every child
+     * below it, and said so at every open for as long as the entry lived.
+     *
+     * The device keeps the name. The mirror's entry is set aside under a `.local-` name,
+     * exactly as [setAsideDivergedMirror] does for a file both sides changed, and
+     * [uploadMirrorOnlyDocuments] puts it across in this same sync, so both are kept and
+     * nothing waits for the user. Nothing else of the mirror is touched, and a link is left
+     * to the confinement rules that already refuse to write through one.
+     *
+     * One entry does not become a copy: a file the last sync can vouch for, unchanged since
+     * it was read, where the device now holds a folder. That is this app's own copy of
+     * what the device replaced, so it follows the device as it does when the device deletes
+     * it ([reconcileDeletions] acts on the same evidence); keeping it would put a stale
+     * file back on a device folder whose owner replaced it. A mirror folder is never judged
+     * this way, because what a folder holds is not one line of the record.
+     *
+     * Failing to do either leaves the old behaviour: the document cannot be made or
+     * copied, and the open reports it. The journal line of a failed save of the entry is
+     * retired with it (a folder's lines move with the folder): the path it names is a
+     * different kind of entry now, and the set-aside copy's own upload leaves a line of its
+     * own if it fails, so no stale line pins the mirror.
+     */
+    private fun clearKindConflict(
+        doc: DocumentInfo,
+        localPath: File,
+        mirrorRoot: File,
+        previouslyRecorded: () -> Map<String, ByteArray?>?,
+    ) {
+        try {
+            openOutboundPath(localPath, mirrorRoot).use { destination ->
+                val entry = inboundAttributes(destination) ?: return
+                val inTheWay = if (doc.isDirectory) entry.isRegularFile else entry.isDirectory
+                if (!inTheWay) return
+                if (doc.isDirectory) {
+                    val recorded = previouslyRecorded()
+                    val identity = identityLine(doc.relativePath, entry.lastModifiedTime().toMillis(), entry.size())
+                    if (recorded != null && matchesRecordedCopy(
+                            destination, doc.relativePath, recordLine(identity, recorded[identity]),
+                        )
+                    ) {
+                        requireCurrentParent(destination, localPath, mirrorRoot)
+                        destination.parent.deleteFile(destination.leaf)
+                        requireCurrentParent(destination, localPath, mirrorRoot)
+                        consumeStaleUploadRecord(localPath.absolutePath)
+                        Logger.i(
+                            tag,
+                            "Removed the mirror copy of ${doc.relativePath}: the device replaced " +
+                                "the file with a folder",
+                        )
+                        return
+                    }
+                }
+                var time = entry.lastModifiedTime().toMillis()
+                var preservedName = destination.sibling("${localPath.name}$LOCAL_COPY_SUFFIX$time")
+                while (inboundAttributes(destination, preservedName) != null) {
+                    time++
+                    preservedName = destination.sibling("${localPath.name}$LOCAL_COPY_SUFFIX$time")
+                }
+                requireCurrentParent(destination, localPath, mirrorRoot)
+                destination.parent.move(destination.leaf, destination.parent, preservedName)
+                requireCurrentParent(destination, localPath, mirrorRoot)
+                val preserved = File(localPath.parentFile, preservedName.toString())
+                if (doc.isDirectory) consumeStaleUploadRecord(localPath.absolutePath)
+                else renameUploadsUnder(localPath, preserved)
+                Logger.i(
+                    tag,
+                    "Set the mirror ${if (doc.isDirectory) "file" else "folder"} " +
+                        "${doc.relativePath} aside as ${preserved.name}: the device holds a " +
+                        "${if (doc.isDirectory) "folder" else "file"} under that name",
+                )
+            }
+        } catch (e: Exception) {
+            Logger.w(
+                tag,
+                "Could not make room for ${doc.relativePath}: ${e.javaClass.simpleName}",
+            )
+        }
+    }
+
+    /**
+     * Whether the device document [doc] has changed since the last sync recorded it.
+     *
+     * The record's line for a path carries the mirror copy's modification time, and
+     * [copyDocumentToLocal] stamps that copy with the provider's own time, so for a copy
+     * that landed the line holds the device time as of the last sync. A device document
+     * reporting any other time has been written since by something other than this
+     * app's own sync. The one false positive is a filesystem that cannot hold the stamp
+     * exactly, which `filesDir` never is; it would cost a spare `.device-` copy per
+     * reopen, not a byte.
+     *
+     * A record that parses but does not name the path answers **true**, and so does a
+     * line whose time field will not parse. Silence here is not evidence that the device
+     * document is ours: the record is silent about a path this app wrote back and never
+     * re-read, which is exactly what the caller's own write-back branch leaves behind,
+     * and about a document the device gained under a name the mirror also gained.
+     * Nothing on disk tells those apart, and one of them is a stranger's bytes. Answering
+     * false meant the write-back arm disarmed the guard for every later pass over the
+     * same path, so the second foreign edit was destroyed by a `"wt"` open with no copy
+     * kept anywhere.
+     *
+     * True is not free, and the three costs are worth stating because the arm below
+     * manufactures the silence that triggers them. One provider read per affected path
+     * per open, forever, since nothing here re-records the path. A `.device-` copy kept
+     * whenever the bytes differ, which includes the case where the device holds this
+     * app's own earlier push and the mirror has been edited again since: that copy is a
+     * stale duplicate of the user's own file, and it is the same known false positive
+     * [setAsideDivergedMirror] already names for the other two producers of silence.
+     * And a fetch that fails withholds the write-back, which defers the user's save
+     * rather than losing it. False costs the user someone else's edit outright, which is
+     * why true is still the right answer.
+     *
+     * No record gives no evidence for an overwrite either. The caller preserves the
+     * device copy first, while a completed upload can record the stable bytes it delivered.
+     */
+    private fun deviceChangedSinceRecord(recorded: Map<String, ByteArray?>, doc: DocumentInfo): Boolean {
+        val prefix = escapeRecordPath(doc.relativePath) + '\t'
+        val line = recorded.keys.firstOrNull { it.startsWith(prefix) } ?: return true
+        val parts = line.split('\t')
+        val recordedModified = parts.getOrNull(1)?.toLongOrNull() ?: return true
+        val recordedSize = parts.getOrNull(2)?.toLongOrNull() ?: return true
+        if (recordedModified != doc.lastModified || (doc.size > 0 && recordedSize != doc.size)) return true
+        val digest = recorded[line] ?: return true
+        return !digest.contentEquals(deviceSha256(doc.uri, recordedSize))
+    }
+
+    /**
+     * Fetches the device copy of [doc] to `<name>.device-<device time>` beside
+     * [localPath], and answers what became of it.
+     *
+     * The counterpart of [setAsideDivergedMirror] for the direction it does not cover:
+     * a save the watcher never delivered meeting a device edit made BEFORE it. The
+     * mirror copy is newer, so phase 2 writes it over the device document, and the
+     * device edit was gone with no copy anywhere; the mirror-side guard cannot fire,
+     * because it runs only where the device wins.
+     *
+     * Fetched rather than renamed, because the copy lives on the other side; that is
+     * the one provider read this guard costs, and [deviceChangedSinceRecord] keeps it
+     * off every file the record vouches for. The name starts with the device's own time,
+     * advanced past local entries and known provider names so earlier preserved bytes
+     * and a listed sibling cannot replace each other. The copy retains the source's
+     * timestamp so later opens compare times from the same clock.
+     *
+     * Like the `.local-` copy, this one is a candidate for [uploadMirrorOnlyDocuments]
+     * in the same sync, so it usually reaches the device folder a moment later and sits
+     * in the explorer beside the file it was set aside from. [keepsDeviceEdit] also calls
+     * this while the folder is open, and there the watcher, not phase 2b, puts the copy on
+     * the device. The same in-flight guard as phase 2's own copies, and for the same
+     * reason: overlapping fetches can choose the same preserved-copy name.
+     *
+     * The answer is four-valued because the callers ask three different questions of it.
+     * "May the mirror go over the device copy now" is yes for [DeviceCopyOutcome.PRESERVED]
+     * and for [DeviceCopyOutcome.IDENTICAL]; "is there a `.device-` file in the folder to
+     * account for" is yes only for the first; and when the answer is neither,
+     * [DeviceCopyOutcome.IN_FLIGHT] holds the save back for [retryHeldBack] without marking
+     * the document unread, while [DeviceCopyOutcome.UNAVAILABLE] marks it unread until the
+     * next open. A Boolean answered the first, and the counter and the log line that read it
+     * as the second described files this had just deleted for being duplicates.
+     */
+    private fun setAsideDeviceCopy(
+        doc: DocumentInfo,
+        localPath: File,
+        mirrorRoot: File,
+        access: OutboundAccess? = null,
+    ): DeviceCopyOutcome {
+        // The fetch below lands in `filesDir`, this app's own storage and the thing that
+        // runs out, so it obeys the ceiling phase 2's own copies obey. The repair branch
+        // that calls this sits ABOVE that gate and reaches a document of any size at all,
+        // including one the mirror could never have held; moving the gate up instead
+        // would skip the document, leaving the interrupted upload unrepaired and its
+        // journal line standing on every later open.
+        if (anotherMirrorWritesDocument(doc.uri, mirrorRoot)) {
+            return DeviceCopyOutcome.IN_FLIGHT
+        }
+        if (doc.size > MAX_FILE_SIZE) {
+            Logger.i(
+                tag,
+                "Not setting the device copy of ${doc.relativePath} aside: at " +
+                    "${doc.size / 1_000_000} MB it is larger than this app's own storage " +
+                    "will hold a copy of",
+            )
+            return DeviceCopyOutcome.UNAVAILABLE
+        }
+        val preserved = try {
+            openOutboundPath(localPath, mirrorRoot).use { destination ->
+                var time = doc.lastModified
+                var name = destination.sibling("${localPath.name}$DEVICE_COPY_SUFFIX$time")
+                while (inboundAttributes(destination, name) != null ||
+                    docIdCache.containsKey(File(localPath.parentFile, name.toString()).toRelativeString(mirrorRoot))
+                ) {
+                    time++
+                    name = destination.sibling("${localPath.name}$DEVICE_COPY_SUFFIX$time")
+                }
+                File(localPath.parentFile, name.toString())
+            }
+        } catch (_: Exception) {
+            return DeviceCopyOutcome.UNAVAILABLE
+        }
+        if (!mirrorCopiesInFlight.add(preserved.absolutePath)) {
+            return DeviceCopyOutcome.UNAVAILABLE
+        }
+        // Bounded by the same ceiling as it streams where nothing reported a size, at a stamp
+        // query [keepsDeviceEdit] got no answer to ([UNANSWERED_SIZE]): such a document passed
+        // the check above whatever it held, and one another app had grown far past the ceiling
+        // was fetched in full, the free-space floor asked only before the copy began. Not on a
+        // provider that reports no size, whose documents phase 2 fetches whole: stopped at the
+        // ceiling there, every set-aside of a file past it that phase 2 had copied in was
+        // refused, and the saves of the file with it.
+        val limit = if (doc.size == UNANSWERED_SIZE) MAX_FILE_SIZE else Long.MAX_VALUE
+        var outcome = DeviceCopyOutcome.PRESERVED
+        val fetched = try {
+            if (anotherMirrorWritesDocument(doc.uri, mirrorRoot)) {
+                return DeviceCopyOutcome.IN_FLIGHT
+            }
+            copyDocumentToLocal(
+                doc.uri, preserved, doc.lastModified, mirrorRoot, limit = limit, access = access,
+                expectedSize = doc.size,
+                onCopied = { destination, published ->
+                    if (sameRootedSiblings(destination, destination.sibling(localPath.name), destination.leaf)) {
+                        requireCurrentParent(destination, preserved, mirrorRoot)
+                        if (destination.attributes().fileKey() != published.fileKey()) {
+                            throw IOException("The preserved copy was replaced before cleanup")
+                        }
+                        destination.parent.deleteFile(destination.leaf)
+                        outcome = DeviceCopyOutcome.IDENTICAL
+                    }
+                },
+                onReplacing = { _, _, _ -> throw IOException("The preserved-copy name is no longer free") },
+            )
+        } finally {
+            mirrorCopiesInFlight.remove(preserved.absolutePath)
+        }
+        if (fetched == FailedCopy.IN_FLIGHT) return DeviceCopyOutcome.IN_FLIGHT
+        if (fetched !is LandedCopy) return DeviceCopyOutcome.UNAVAILABLE
+        // A changed time is not a changed file. This app's own delivered
+        // write-back moves the device time and the record never learns the new
+        // one, and a provider with coarse stamps (FAT32 at two seconds, cloud
+        // providers at whole seconds) reports the write-back's time below the
+        // mirror's, so on every reopen after an ordinary save the record differs
+        // and the mirror reads newer. The bytes are the same on both sides then,
+        // and a copy of them is not a set-aside but a duplicate that phase 2b
+        // would put into the user's folder. Compared after the fetch, which is
+        // the one provider read this costs either way.
+        if (outcome == DeviceCopyOutcome.PRESERVED) {
+            Logger.i(
+                tag,
+                "Set the device copy of ${doc.relativePath} aside as ${preserved.name}: " +
+                    "it differs from the newer mirror copy replacing it and was written " +
+                    "since the last sync",
+            )
+        }
+        return outcome
+    }
+
+    /**
+     * Preserves device bytes that do not match the last delivered or imported digest.
+     * Missing, equal, and changed metadata all require byte proof before replacement.
+     * An unavailable preservation copy holds the save for [retryHeldBack]; unknown
+     * documents are preserved when [preserveUnknown] is requested.
+     *
+     * Comparison reads at most the baseline length and one buffer. Preservation follows
+     * the ordinary copy policy: reported oversize documents are refused, unknown sizes
+     * are copied whole, and unanswered metadata uses [MAX_FILE_SIZE]. A document changed
+     * by another app after preservation but before the write remains a provider race.
+     */
+    private fun keepsDeviceEdit(
+        localFile: File,
+        docUri: Uri,
+        mirrorRoot: File,
+        access: OutboundAccess? = null,
+        preserveUnknown: Boolean = false,
+    ): Boolean {
+        if (withCurrentMemory(access) { true } != true) {
+            announceLost(localFile)
+            return true
+        }
+        // Settled again by whatever this answers: a save that goes ahead ends the hold, and
+        // one held back once more waits longer before it is tried again.
+        val held = withCurrentMemory(access) {
+            val removed = heldBack.remove(localFile.absolutePath)
+            if (removed != null) {
+                settledHeldWait[localFile.absolutePath] = removed.wait
+            } else {
+                settledHeldWait.remove(localFile.absolutePath)
+            }
+            removed
+        }
+        val kept = if (anotherMirrorWritesDocument(docUri, mirrorRoot)) {
+            DeviceCopyOutcome.IN_FLIGHT
+        } else {
+            val now = deviceMovedPast(localFile, docUri, access) ?: if (
+                preserveUnknown && !deviceSeen.containsKey(localFile.absolutePath)
+            ) {
+                deviceStamp(docUri) ?: (0L to UNANSWERED_SIZE)
+            } else return false
+            setAsideDeviceCopy(
+                DocumentInfo(docUri, "", localFile.name, false, now.second, now.first),
+                localFile,
+                mirrorRoot,
+                access,
+            )
+        }
+        if (kept == DeviceCopyOutcome.PRESERVED || kept == DeviceCopyOutcome.IDENTICAL) return false
+        Logger.w(
+            tag,
+            if (kept == DeviceCopyOutcome.IN_FLIGHT) {
+                "Not writing ${localFile.name} back: its device copy was involved in another write"
+            } else {
+                "Not writing ${localFile.name} back: its device copy changed since this app " +
+                    "last read or wrote it and could not be set aside"
+            },
+        )
+        val wait =
+            held?.let { minOf(it.wait * 2, HELD_BACK_RETRY_MAX_MS) } ?: HELD_BACK_RETRY_FIRST_MS
+        withCurrentMemory(access) {
+            settledHeldWait.remove(localFile.absolutePath)
+            announceLost(localFile)
+            heldBack[localFile.absolutePath] =
+                HeldBackSave(docUri, SystemClock.elapsedRealtime() + wait, wait)
+        }
+        return true
+    }
+
+    /** Returns metadata for a version not proved equal to the last known device bytes. */
+    private fun deviceMovedPast(localFile: File, docUri: Uri, access: OutboundAccess? = null): Pair<Long, Long>? {
+        val seen = deviceSeen[localFile.absolutePath] ?: return null
+        // A missing or unchanged timestamp cannot distinguish another application's bytes.
+        val now = deviceStamp(docUri) ?: (0L to UNANSWERED_SIZE)
+        // Read at any length a set-aside could still keep, a missing size column's 0 and an
+        // unanswered query's length included: a reported length can lag the bytes, as on a
+        // provider that reports a write's new time before its new length, and skipping the
+        // read there kept a copy of the previous save. Past [MAX_FILE_SIZE] only at the
+        // digested length, because a document another app grew that far was read in full at
+        // every save and each save was held back anyway.
+        if (seen.sha256 != null &&
+            (now.second == seen.length || now.second <= MAX_FILE_SIZE) &&
+            seen.sha256.contentEquals(deviceSha256(docUri, seen.length))
+        ) {
+            withCurrentMemory(access) {
+                deviceSeen.replace(localFile.absolutePath, seen, DeviceState(now, seen.sha256, seen.length))
+            }
+            return null
+        }
+        // The device now holds what this engine has not read, and the stamp it compared
+        // against no longer says anything: kept, it let a held-back save's try, the next
+        // save, a delete, or a file made again after a declined delete go over that version
+        // unread once a stamp query went unanswered, or once the provider reported the old
+        // stamp again. So no stamp, as for a copy an open could not place, and only the
+        // bytes answer from here. Only mark the snapshot read above: a reset or completed
+        // write may have replaced it during provider I/O, and owns that newer state.
+        withCurrentMemory(access) {
+            deviceSeen.replace(localFile.absolutePath, seen, DeviceState(null, seen.sha256, seen.length))
+        }
+        return now
+    }
+
+    /**
+     * Declines the delete [job] would send to [docUri], and says so, where the device holds
+     * there what this engine has not read: a document, or for a directory one under it, the
+     * folder's last open could not read, or a file another app changed since this engine
+     * last read or wrote it.
+     *
+     * [handleMirrorEvent] asks the first before it queues the delete, and a job can outlive
+     * that answer: a reopen while the closing folder's drain is still inside a slow provider
+     * call can find the document unreadable, and the delete queued before it then removed a
+     * document nothing had read. The second is [keepsDeviceEdit]'s question, which no delete
+     * asked, so an edit another app made while the folder was open went with the file. The
+     * bytes decide it as they do for a save, so this app's own write settling late does not
+     * hold a delete back, and a read that fails does. Declined rather than set aside as a
+     * save's device copy is: the user deleted the file, and a copy beside it would bring it
+     * back under another name. The device keeps the document, and the next open brings it
+     * back into the editor.
+     *
+     * A directory also checks its current descendants through [directoryDeleteIsSafe],
+     * because the provider's recursive delete includes children that raised no local
+     * event. A declined delete is not retried; the next open brings its device copy back.
+     */
+    private fun keepsDeviceDocument(job: SyncJob, docUri: Uri, access: OutboundAccess? = null): Boolean {
+        val unread = holdsUnread(job.localPath, job.isDirectory)
+        val held = (unread || job.isDirectory && holdsKept(job.localPath)) &&
+            job.safTreeUri?.let { providerHolds(it, job.relativePath) } != false
+        if (!held) {
+            val seen = deviceSeen[job.localPath]
+            val unchanged = if (job.isDirectory) directoryDeleteIsSafe(job, docUri) else
+                seen?.sha256 != null && seen.sha256.contentEquals(deviceSha256(docUri, seen.length))
+            if (unchanged) {
+                return false
+            }
+            withCurrentMemory(access) {
+                keptOnDevice.add(job.localPath)
+                if (!job.isDirectory && seen != null) {
+                    deviceSeen.replace(job.localPath, seen, DeviceState(null, seen.sha256, seen.length))
+                }
+            }
+        }
+        // Said as a change rather than as content the editor never had, for every file this
+        // declines: the delete passed [handleMirrorEvent]'s guard, so the editor had the file,
+        // and what the device keeps is a version that moved past what this engine read, or
+        // one an open after the delete could not read. A directory is kept for what is unread
+        // under it where there is any, and otherwise for such a file.
+        keepUnread(
+            File(job.localPath), job.relativePath, job.isDirectory,
+            changed = !job.isDirectory || !unread,
+        )
+        return true
+    }
+
+    /**
+     * A recursive provider delete may remove children the mirror never saw. Ask at the
+     * drain, without updating the cache that identifies the documents already known.
+     * Each file must still hold its recorded bytes, including where its stamp did not
+     * move. Provider changes after this check remain outside the SAF delete contract.
+     */
+    private fun directoryDeleteIsSafe(job: SyncJob, docUri: Uri): Boolean {
+        val treeUri = job.safTreeUri ?: return false
+        val knownIds = synchronized(docIdCache) {
+            if (cacheTree != treeUri) return false
+            docIdCache.toMap()
+        }
+        val root = File(job.localPath)
+        val states = deviceSeen.toMap()
+        try {
+            val directoryId = DocumentsContract.getDocumentId(docUri)
+            if (directoryId.isNullOrEmpty() || knownIds[job.relativePath] != directoryId) return false
+            if (documentIsDirectory(docUri) != true) return false
+            val pending = ArrayDeque<Pair<String, String>>()
+            pending.add(directoryId to job.relativePath)
+            val visited = mutableSetOf(directoryId)
+            val projection = arrayOf(
+                DocumentsContract.Document.COLUMN_DOCUMENT_ID,
+                DocumentsContract.Document.COLUMN_DISPLAY_NAME,
+                DocumentsContract.Document.COLUMN_MIME_TYPE,
+            )
+            while (pending.isNotEmpty()) {
+                val (parentId, parentPath) = pending.removeFirst()
+                val childrenUri = DocumentsContract.buildChildDocumentsUriUsingTree(treeUri, parentId)
+                context.contentResolver.query(childrenUri, projection, null, null, null)?.use { cursor ->
+                    cursor.extras?.let { extras ->
+                        if (extras.getBoolean(DocumentsContract.EXTRA_LOADING) ||
+                            extras.containsKey(DocumentsContract.EXTRA_ERROR)
+                        ) return false
+                    }
+                    val idIndex = cursor.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_DOCUMENT_ID)
+                    val nameIndex = cursor.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_DISPLAY_NAME)
+                    val mimeIndex = cursor.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_MIME_TYPE)
+                    while (cursor.moveToNext()) {
+                        val id = cursor.getString(idIndex)
+                        val name = cursor.getString(nameIndex)
+                        val mime = cursor.getString(mimeIndex)
+                        if (id.isNullOrEmpty() || !isSafeSegment(name) || mime.isNullOrEmpty()) return false
+                        val path = "$parentPath/$name"
+                        if (knownIds[path] != id || !visited.add(id)) return false
+                        if (mime == DocumentsContract.Document.MIME_TYPE_DIR) {
+                            pending.add(id to path)
+                        } else {
+                            val local = File(root, path.removePrefix("${job.relativePath}/"))
+                            val seen = states[local.absolutePath] ?: return false
+                            val digest = seen.sha256 ?: return false
+                            val uri = DocumentsContract.buildDocumentUriUsingTree(treeUri, id)
+                            if (!digest.contentEquals(deviceSha256(uri, seen.length))) return false
+                        }
+                    }
+                } ?: return false
+            }
+        } catch (e: Exception) {
+            Logger.w(tag, "Could not verify directory contents before deletion: ${e.javaClass.simpleName}")
+            return false
+        }
+        return true
+    }
+
+    /**
+     * Tries again, as the save it was, one save [keepsDeviceEdit], [writeLocalToSaf], or an
+     * open arm held back under [session]'s mirror whose wait is over, and answers whether it
+     * found one.
+     *
+     * The write-back loop asks whenever its queue is empty, so a held-back save lands once
+     * its device copy can be read, still by [keepsDeviceEdit]'s comparison of the bytes, and
+     * the waits bound what a provider that stays unreadable costs: per held-back file, a
+     * stamp query and the reads that fail, each as far as it gets, so a set-aside's fetch
+     * that breaks off partway streams that far again at every try, even past [MAX_FILE_SIZE]
+     * where the provider reports no size; or, while the provider does not answer that query
+     * over a device copy past [MAX_FILE_SIZE], a read of the digested length and a buffer and
+     * one of that limit, after [HELD_BACK_RETRY_FIRST_MS] and then at waits that double up to
+     * [HELD_BACK_RETRY_MAX_MS]. One per call, because the loop polls its queue before it asks
+     * again: tried all at once, a save made meanwhile waited behind every try that was due,
+     * which on a server that takes long to refuse a read is long for a save that has nothing
+     * to do with them. A file the mirror no longer holds is dropped rather than tried, which
+     * would spin the loop on a save with nothing left to send, and so would a mirror this
+     * session may no longer write to (a reset is running, or a newer open took it over): a
+     * try there is refused without ending the hold, so it answers false and the loop parks.
+     * A try runs as a save does, so one of a file the folder's last open could not read is
+     * refused like a save of it.
+     */
+    internal fun retryHeldBack(session: WatchSession): Boolean {
+        val root = session.root ?: return false
+        val access = outboundAccess(root, session.generation)
+        if (withCurrentMemory(access) { true } == null) return false
+        val prefix = root.absolutePath + File.separator
+        val now = SystemClock.elapsedRealtime()
+        for ((path, held) in heldBack) {
+            if (!path.startsWith(prefix) || held.dueAt > now) continue
+            if (!File(path).isFile) {
+                heldBack.remove(path, held)
+                continue
+            }
+            // Sent here rather than queued, and stamped older than any job an observer
+            // queues, so the debounce drops the try where a job of the file has arrived
+            // since the loop found its queue empty, which sends what the try would. Queued,
+            // the try went behind such a job with a later time: a create of the file was
+            // dropped for it, and where another app had deleted the document the hold
+            // names, the try failed there and the file reached no document at all.
+            processWriteBack(
+                session, SyncJob(
+                    SyncType.MODIFY, path, held.docUri, null, null, Long.MIN_VALUE,
+                    mirrorRoot = session.root,
+                    generation = access.generation,
+                ),
+            )
+            return true
+        }
+        return false
+    }
+
+    /**
+     * Creates on the device the mirror files the device has no document for, and answers
+     * with how many arrived.
+     *
+     * Until this existed nothing in a sync ever looked at the mirror: phase 2 iterates
+     * the DEVICE tree and its only outbound arm needs a device document to compare
+     * against, and phase 3 only deletes. So a file that reached the mirror and not the
+     * device stayed there for good. It is not hard to produce one: a create whose
+     * write-back job died with the process before the drain ran it, a file made in a
+     * directory past [MAX_WATCHED_DIRECTORIES] where no observer exists, or one made
+     * while [initialSync] itself is running and the watcher is deliberately stopped.
+     * The mirror keeps it ([holdsOnlyVouchedCopies] refuses to reclaim a mirror holding
+     * anything the record cannot vouch for), so it is not destroyed, but it lives only
+     * in this app's private storage: no other app can see it and it dies with an
+     * uninstall. Reopening the folder is what the design calls the way back, and this is
+     * what makes that true in the outbound direction.
+     *
+     * **What it must never do is undo a deletion.** A document the user deleted on the
+     * device is absent from the enumeration and still present in the mirror, which is
+     * indistinguishable from the case above by anything except the record: phase 3 is
+     * about to remove exactly those, and it proves them by the line the last sync wrote.
+     * So a path the previous record names is never a candidate here, whatever phase 3
+     * then decides to do with it. The two passes therefore cannot disagree: this one
+     * only ever touches paths the record has never carried.
+     *
+     * **A record that did not parse is not a record that names nothing**, and telling
+     * those apart is what keeps the rule above from inverting. An absent record, one
+     * this build cannot read, and one from the build before [RECORD_HEADER] existed all
+     * say nothing about any path, so every mirror file the enumeration did not return
+     * would be a candidate and every deletion the user made on the device since that
+     * install's last sync would be undone, permanently, on the next open.
+     * [reconcileDeletions] cannot offset it either: it declines on the same unusable
+     * record, so the file stays in the mirror and is offered again on every later open.
+     * This pass writes to the device, so it requires recognized history before adding
+     * a missing document.
+     *
+     * That rule is exact for the case it exists for and deliberately not wider. A path
+     * the record no longer names, because the last sync kept a local edit there rather
+     * than vouching for it, is a candidate again once the device drops its document, and
+     * that file IS put back. It is the same file phase 3 keeps in the mirror for the same
+     * reason, so the editor goes on showing it either way; the choice is only whether the
+     * device folder shows it too, and a copy the user is still editing belongs where they
+     * can reach it.
+     *
+     * [previouslyRecorded] is a function for the reason [shouldOverwriteMirror]'s
+     * argument is one. Reading the record costs a parse and a live set, and a healthy
+     * folder has no candidate at all, so the read happens only once one is found.
+     *
+     * [onCandidateDone] is told (done, total) once per candidate, which the caller
+     * folds into the progress it is already reporting. It is separate from that
+     * callback rather than the same one because the totals are different: the caller
+     * counts device documents and this counts mirror files, and only the caller can add
+     * the two.
+     *
+     * [writeLocalToSaf] records a delivered file only after verifying its local bytes.
+     * Failed or refused uploads remain unvouched and count toward the shortfall.
+     *
+     * Two ceilings, both stated rather than hidden. [uploadPlan] stops once it has
+     * [MAX_UPLOAD_ENTRIES] files the device does not have, so a mirror with more than
+     * that stranded is put across breadth-first and no deeper; and a directory the
+     * device does not have is created only when a file below it is going to be put
+     * there, so a directory the user deleted on the device does not reappear empty on
+     * every open.
+     *
+     * The cap counts the files this pass would put across, not the entries it walks
+     * past, and the difference is what the reopen promise rests on. It used to count
+     * every entry: the walk is local and costs the provider nothing, but the cap that
+     * bounds [createChildrenInSaf]'s provider round trips was applied to it unchanged,
+     * so in any mirror over 2000 entries, an ordinary repository, a file stranded past
+     * the first 2000 in breadth-first order was never reached, on that open or any
+     * later one, because the walk is deterministic. Counting candidates keeps the bound
+     * on provider work, which is one create and one write per candidate, and lets the
+     * walk cover the mirror. Once the cap does bite it is still permanent for that
+     * folder until the earlier candidates are put across, since the walk stays
+     * deterministic; the shortfall and the cap share one seam, [onUploadIncomplete],
+     * one notice for the whole pass, and the cap reaches it only with a stranded file
+     * in hand, which past the cap is always. [createChildrenInSaf] announces the cap
+     * either way, because there the copy is work the user just asked for.
+     */
+    private fun uploadMirrorOnlyDocuments(
+        safUri: Uri,
+        mirrorDir: File,
+        onDevice: Set<String>,
+        previouslyRecorded: () -> Set<String>?,
+        onCandidateDone: (Int, Int) -> Unit,
+    ): Int {
+        // Filtered inside the walk rather than after it, so that an entry the device
+        // already answers for spends none of the cap: phase 2 settled every one of those,
+        // and on a healthy folder that is every entry, so the record is never read.
+        val plan = uploadPlan(mirrorDir, MAX_UPLOAD_ENTRIES) {
+            it.isFile && it.toRelativeString(mirrorDir) !in onDevice
+        }
+        // Logged even where the returns below leave first, because the record can still
+        // refuse everything the walk found, and then the entries past the cap are exactly
+        // the ones nobody looked at. The log, and not the notice channel: a mirror with
+        // more than the cap stranded is rare and the pass is already about to say so
+        // through [onUploadIncomplete] for the files it does have in hand.
+        if (plan.truncated) {
+            Logger.w(
+                tag,
+                "Stopped at $MAX_UPLOAD_ENTRIES files only the mirror has; the rest stay " +
+                    "in the mirror until these are on the device",
+            )
+        }
+
+        val missing = plan.entries.map { it to it.toRelativeString(mirrorDir) }
+        if (missing.isEmpty()) return 0
+
+        // An unusable record cannot tell a save that never reached the device from a
+        // document the user deleted there, and this pass writes to the device, so it
+        // declines rather than guessing. Said at warn: the folder keeps files that only
+        // the mirror holds, which is the state this pass exists to end, and the next
+        // sync rewrites the record so it ends on the open after that.
+        val recorded = previouslyRecorded() ?: run {
+            Logger.w(
+                tag,
+                "Not putting files onto ${mirrorDir.name}: its record is missing or in a " +
+                    "format this build cannot read, so a stranded save and a deletion " +
+                    "made on the device look the same from here",
+            )
+            return 0
+        }
+        val recordedPaths = recorded.mapTo(HashSet()) { unescapeRecordPath(it.substringBefore('\t')) }
+        val candidates = missing.filterNot { (_, relativePath) -> relativePath in recordedPaths }
+        if (candidates.isEmpty()) return 0
+
+        // Seeded with the root, which [resolveDocumentUri] answers for without asking
+        // the provider anything. Every directory this pass resolves or creates is
+        // remembered here, so a directory holding twenty stranded files is looked up
+        // once rather than twenty times.
+        val directories = mutableMapOf<String, Uri?>("" to resolveDocumentUri(safUri, ""))
+        val movedDirectories = mutableMapOf<String, String>()
+        var made = 0
+        candidates.forEachIndexed { index, (original, relativePath) ->
+            val parent = deviceDirectoryFor(
+                safUri, mirrorDir, parentPathOf(relativePath), onDevice, directories, movedDirectories,
+            )
+            val file = movedMirrorFile(original, movedDirectories)
+            if (parent != null && createOneInSaf(file, parent, safUri, mirrorDir)?.delivered == true) made++
+            // Every candidate, including one that did not land: this is the folder
+            // dialog's only sign of life through a stretch that is one createDocument
+            // plus one provider write per file, behind a dialog the user cannot cancel.
+            // Phase 2's own count has already reached its total by here, so the tick
+            // carries its own denominator; without it the dialog reads "N of N" for as
+            // long as this pass runs, which on a mirror full of stranded saves is the
+            // longest part of opening the folder.
+            onCandidateDone(index + 1, candidates.size)
+        }
+        Logger.i(
+            tag,
+            "Put $made of ${candidates.size} file(s) only ${mirrorDir.name} had onto the " +
+                "device folder",
+        )
+        // One notice for the pass, not one per file, and spelled exactly as
+        // [createChildrenInSaf] spells it for the identical situation. That is the
+        // reason [onUploadIncomplete] exists at all: a provider that refuses one create
+        // refuses them all, and forty toasts of "the only copy is inside VSCodroid",
+        // each three and a half seconds long behind a dialog the user cannot cancel, is
+        // another way of telling them nothing. The cap rides along here rather than at
+        // the walk itself because this is the point where the pass has a stranded file
+        // in hand, which is what makes "there may be more below the cap" worth a
+        // sentence instead of noise on every open.
+        val lost = candidates.size - made
+        if (lost > 0 || plan.truncated) onUploadIncomplete(mirrorDir, lost, plan.truncated)
+        return made
+    }
+
+    /**
+     * The device document for the mirror directory at [relativePath], creating it and
+     * whatever is missing above it, or null when the provider would not.
+     *
+     * Memoised in [resolved] across one pass, negatives included: a parent the provider
+     * refused refuses every file under it too, and asking again is a binder walk per
+     * segment for an answer already known.
+     *
+     * A directory the enumeration returned is resolved rather than created, which is
+     * what [onDevice] is for: [docIdCache] already holds it, so that costs nothing,
+     * while asking the provider to create a name it already has is a round trip whose
+     * answer is the same document.
+     */
+    private fun deviceDirectoryFor(
+        safUri: Uri,
+        mirrorDir: File,
+        relativePath: String,
+        onDevice: Set<String>,
+        resolved: MutableMap<String, Uri?>,
+        movedDirectories: MutableMap<String, String>,
+    ): Uri? {
+        if (relativePath in resolved) return resolved[relativePath]
+        val uri = if (relativePath in onDevice) {
+            resolveDocumentUri(safUri, relativePath)
+        } else {
+            deviceDirectoryFor(
+                safUri, mirrorDir, parentPathOf(relativePath), onDevice, resolved, movedDirectories,
+            )?.let { parent ->
+                val original = File(mirrorDir, relativePath)
+                createOneInSaf(movedMirrorFile(original, movedDirectories), parent, safUri, mirrorDir)?.let {
+                    movedDirectories[original.absolutePath] = it.localFile.absolutePath
+                    it.uri
+                }
+            }
+        }
+        resolved[relativePath] = uri
+        return uri
+    }
+
+    /**
+     * Removes mirror files for documents that have since been deleted on the device.
+     *
+     * Reopening a folder used to only create and overwrite, so anything deleted on the
+     * device came straight back from the stale mirror, and because a MODIFY on a file
+     * the tree no longer knows falls through to a create, editing it pushed it back
+     * onto the device too.
+     *
+     * The two ways of being wrong here do not cost the same. A file left behind is
+     * untidy; deleting work that exists only in the mirror cannot be undone. So this
+     * removes only what a *complete* enumeration proves is gone, and only files it can
+     * show it put there itself:
+     *
+     * - A partial enumeration proves nothing. [walkTree] logs and carries on when a
+     *   provider query fails, so a folder that answered for two directories out of
+     *   twenty would otherwise read as "eighteen directories were deleted". One failure
+     *   anywhere disables deletion. Newly vouched identities are still recorded, with
+     *   previous lines retained for paths the partial open did not settle.
+     * - Neither does an enumeration that succeeded and returned nothing. A folder the
+     *   user emptied and a provider answering for a volume that is no longer mounted
+     *   look identical from here, and only one of them costs the whole mirror. The
+     *   price of declining is a folder emptied on the device keeping its mirror copies
+     *   until they are deleted in the editor, which propagates the other way.
+     * - **A candidate must still be the file that was recorded**, matched on modification
+     *   time, length and a digest read from a stable file, not merely on its path.
+     *   This is the rule the others used to
+     *   stand in for, and getting here took four separate defects to notice. Each was a
+     *   different way for a path to be recorded while the mirror held something else (a
+     *   local edit, a file too large to have ever been copied, a copy that failed), and
+     *   each was patched on its own. They were one gap: the record named *paths*, while
+     *   the argument for deleting needs *identity*. Matching identity is what makes a
+     *   fifth way, which nobody has found yet, stop mattering: a path recorded in error
+     *   will not have a file that matches what was recorded for it.
+     * - A line that cannot be parsed that way is never a candidate, and neither is any
+     *   line of a record that does not open with [RECORD_HEADER]. Records written by an
+     *   earlier build are one path per line and carry no identity at all, so they are
+     *   unverifiable by construction, and unverifiable has to mean "keep". The header is
+     *   what extends that to a format this build has never seen: field count is not a
+     *   version, and the operation on the other side of the guess is a delete.
+     * - A candidate that does not resolve inside the mirror is left alone. The record is
+     *   built from provider-supplied display names, and a delete is the wrong operation
+     *   to point at a path that walked out of the directory it belongs to.
+     * - Directories are left alone. Removing one means a recursive delete, the
+     *   operation with the worst outcome if any of the reasoning above is wrong. An
+     *   empty directory left behind is noise.
+     *
+     * **Where all of this stops being true.** Every line of it assumes the provider
+     * reports `COLUMN_LAST_MODIFIED`. When it does not, [shouldOverwriteMirror]'s
+     * unknown-time branch answers from the record instead, so a diverged file is kept
+     * rather than overwritten, and is tracked again once a sync finds the two sides
+     * holding the same bytes, before deletion is considered at
+     * all. Nothing recorded here can protect what the copy already replaced, and no
+     * identity check reaches a file that is gone. The account above of four defects
+     * turning out to be one gap holds for providers that report a time, and only those.
+     * MTP, some USB-OTG bridges and some network providers do not.
+     *
+     * @return how many files were removed.
+     */
+    private fun reconcileDeletions(
+        mirrorDir: File,
+        documents: List<DocumentInfo>,
+        enumerationComplete: Boolean,
+        recorded: List<String>
+    ): Int {
+        if (!enumerationComplete || documents.isEmpty()) {
+            Logger.w(
+                tag,
+                "Enumeration proved nothing: leaving the mirror of ${mirrorDir.name} as it is"
+            )
+            if (recorded.isNotEmpty()) {
+                val record = File(mirrorDir.path + SYNCED_RECORD_SUFFIX)
+                val previous = readSyncedRecord(record)
+                    .takeIf { it.firstOrNull() == RECORD_HEADER }?.drop(1).orEmpty()
+                val settled = recorded.mapTo(HashSet()) { it.substringBefore('\t') }
+                writeSyncedRecord(record, previous.filterNot { it.substringBefore('\t') in settled } + recorded)
+            }
+            return 0
+        }
+
+        val record = File(mirrorDir.path + SYNCED_RECORD_SUFFIX)
+        val present = documents.filterNot { it.isDirectory }.map { it.relativePath }.toSet()
+        var removed = 0
+
+        val lines = readSyncedRecord(record)
+        val entries = if (lines.firstOrNull() == RECORD_HEADER) {
+            lines.drop(1)
+        } else {
+            if (lines.isNotEmpty()) {
+                Logger.i(tag, "Record of ${mirrorDir.name} is not this format; removing nothing")
+            }
+            emptyList()
+        }
+
+        val carried = ArrayList<String>()
+        for (line in entries) {
+            val path = unescapeRecordPath(line.substringBefore('\t'))
+
+            if (path.isEmpty() || path in present) continue
+            if (removeRecordedCopy(mirrorDir, path, line)) removed++
+            else if (isUnprovenCopyOfRecord(mirrorDir, path, line)) carried += line
+        }
+
+        writeSyncedRecord(record, recorded + carried)
+        return removed
+    }
+
+    /**
+     * A row with no digest, written before digests existed or past the budget that reads them, cannot
+     * prove the mirror copy is the device's old bytes, so [removeRecordedCopy] keeps the copy. The row has
+     * to stay with it: without one the copy reads as new local work, and the next open sends a document the
+     * device deleted back to it. A copy that no longer matches its row is work of the user's and is let go.
+     */
+    private fun isUnprovenCopyOfRecord(mirrorDir: File, relativePath: String, line: String): Boolean {
+        val (whole, digest) = splitRecordLine(line)
+        if (digest != null) return false
+        // A fourth field this build cannot read leaves the identity in the first three.
+        val identity = line.split('\t').let { if (it.size == 4) it.take(3).joinToString("\t") else whole }
+        return try {
+            openOutboundPath(File(mirrorDir, relativePath), mirrorDir).use { selected ->
+                val attributes = selected.attributes()
+                attributes.isRegularFile && identity == identityLine(
+                    relativePath, attributes.lastModifiedTime().toMillis(), attributes.size(),
+                )
+            }
+        } catch (e: Exception) {
+            false
+        }
+    }
+
+    private fun removeRecordedCopy(mirrorDir: File, relativePath: String, line: String): Boolean {
+        val (identity, digest) = splitRecordLine(line)
+        if (digest == null) return false
+        val file = File(mirrorDir, relativePath)
+        return try {
+            openOutboundPath(file, mirrorDir).use { selected ->
+                if (!matchesRecordedCopy(selected, relativePath, line)) return@use false
+                val before = selected.attributes()
+                if (!before.isRegularFile || identity != identityLine(
+                        relativePath, before.lastModifiedTime().toMillis(), before.size(),
+                    )) return@use false
+                val preserved = selected.sibling("removed$LOCAL_COPY_SUFFIX${UUID.randomUUID()}")
+                requireCurrentParent(selected, file, mirrorDir)
+                // Capture the entry before proving its bytes, so a replacement at its old name survives.
+                selected.parent.move(selected.leaf, selected.parent, preserved)
+                var removed = false
+                try {
+                    val captured = inboundEntry(selected, preserved)
+                    if (captured != null && sameInboundAttributes(before, captured.attributes) &&
+                        captured.digest?.contentEquals(digest) == true
+                    ) {
+                        requireCurrentParent(selected, file, mirrorDir)
+                        selected.parent.deleteFile(preserved)
+                        removed = true
+                    }
+                } finally {
+                    if (!removed && inboundAttributes(selected, preserved) != null) {
+                        Logger.w(tag, "Kept a changed copy of $relativePath as $preserved")
+                    }
+                }
+                removed
+            }
+        } catch (e: Exception) {
+            Logger.d(tag, "Kept $relativePath during deletion: ${e.javaClass.simpleName}")
+            false
+        }
+    }
+
+    /**
+     * Replaces the synced record in one step, or leaves the previous one exactly where
+     * it was.
+     *
+     * Written beside the record and renamed, for the reason [rewriteJournal] gives about
+     * the file next to it: a truncate-and-write loses the whole record to a process
+     * death in the middle, and the process being killed while a large folder finishes
+     * opening is an ordinary event here rather than a rare one. Every consumer of a
+     * damaged record does fail safe ([holdsOnlyVouchedCopies] keeps the mirror,
+     * [reconcileDeletions] removes nothing, [shouldOverwriteMirror]'s unknown-time
+     * branch keeps the mirror copy), so what this costs is a mirror that cannot be
+     * reclaimed and, on a provider that omits COLUMN_LAST_MODIFIED, a folder that stops
+     * receiving device-side changes until [deviceMatchesMirror] heals it a file at a
+     * time. The next sync of the same folder rewrites the record in full, so the damage
+     * lasts one sync, which is exactly as long as the folder goes unopened.
+     *
+     * The temporary name is deterministic rather than unique, and that is what keeps an
+     * interrupted write from leaving one small file per interruption beside the mirror:
+     * the next write reuses the same name. That holds only while the folder is opened
+     * again, though, and a name `MIRROR_ENTRY` does not match is a name nothing else in
+     * `saf-mirrors` ever looks at, so a record whose mirror is then reclaimed used to
+     * leave this behind for good, in a directory exported into every terminal as
+     * `SAF_MIRRORS_DIR`. `SafStorageManager.reclaimRevokedMirrorsSync` deletes it with
+     * the pair it belonged to.
+     */
+    private fun writeSyncedRecord(record: File, recorded: List<String>) {
+        val body = (listOf(RECORD_HEADER) + recorded).joinToString("\n")
+        val tmp = File(record.parentFile, record.name + PARTIAL_SUFFIX)
+        try {
+            tmp.writeText(body)
+            if (!tmp.renameTo(record)) {
+                throw IOException("Could not replace the synced record")
+            }
+        } catch (e: Exception) {
+            tmp.delete()
+            Logger.w(tag, "Could not record the synced set: ${e.message}")
+        }
+    }
+
+    /** Records only the stable mirror bytes a completed upload delivered. */
+    private fun recordDeliveredCopy(localFile: File, mirrorRoot: File, lastModified: Long, length: Long, sha256: ByteArray) {
+        val root = mirrorRoot.absolutePath
+        if (!mirrorGenerations.containsKey(root) || !localFile.absolutePath.startsWith(root + File.separator)) return
+        fetchedPaths.add(localFile.absolutePath)
+        unfetched.remove(localFile.absolutePath)
+        val relative = localFile.toRelativeString(File(root))
+        val identity = identityLine(relative, lastModified, length)
+        val receipt = recordLine(identity, sha256)
+        if (mirrorAccess[root]?.syncing == true) {
+            deliveredDuringSync[localFile.absolutePath] = receipt
+            return
+        }
+        val record = File(root + SYNCED_RECORD_SUFFIX)
+        val lines = readSyncedRecord(record)
+        if (lines.firstOrNull() != RECORD_HEADER) return
+        val path = escapeRecordPath(relative)
+        writeSyncedRecord(
+            record,
+            lines.drop(1).filterNot { it.substringBefore('\t') == path } + receipt,
+        )
+    }
+
+    /**
+     * Appends [path]'s identity as it stands on disk, or nothing when there is no file
+     * there.
+     *
+     * Read back rather than predicted, so that a timestamp the filesystem truncated or a
+     * length the provider misreported cannot put the record out of step with the disk.
+     *
+     * ⚠️ Reading back is only sound because the caller has established the file is this
+     * sync's. It cannot tell on its own: [copyDocumentToLocal] stages the bytes and
+     * renames, deliberately leaving the destination untouched when it
+     * fails, so after a failed copy this reads whatever was already there, which can be
+     * an edit of the user's that no sync ever wrote. Recording that identity is what
+     * would make the user's only copy match, and match is what licenses the delete.
+     *
+     * So the precondition is about the DEVICE, not about who authored the bytes: call
+     * this only where the device is known to hold what is on disk here. A comparison that
+     * read both sides and found them equal establishes that, which is how a file the
+     * editor wrote and the watcher delivered gets recorded without any copy having
+     * happened. A landed copy does too, but only for the bytes it landed with, so phase 2
+     * records the identity [copyDocumentToLocal] reports rather than reading the file
+     * again, which an editor can have written in between.
+     */
+    private fun recordIdentity(into: MutableList<String>, path: String, attributes: BasicFileAttributes) {
+        if (!attributes.isRegularFile) return
+        into.add(identityLine(path, attributes.lastModifiedTime().toMillis(), attributes.size()))
+    }
+
+    private fun recordIdentity(into: MutableList<String>, path: String, file: File, mirrorRoot: File) {
+        try {
+            openOutboundPath(file, mirrorRoot).use { selected ->
+                val attributes = selected.attributes()
+                requireCurrentParent(selected, file, mirrorRoot)
+                recordIdentity(into, path, attributes)
+            }
+        } catch (_: Exception) { }
+    }
+
+    /**
+     * One file's line in the synced record: relative path, mtime, size, tab separated. That
+     * is the whole line unless [recordLine] puts the copy's digest after it, and every
+     * reader takes the digest off with [splitRecordLine] before it compares.
+     *
+     * Shared rather than spelled out at each site, because two of them have to agree
+     * byte for byte or the disagreement shows up as behaviour: [recordIdentity] writes
+     * the line and [holdsOnlyVouchedCopies] looks the same line up. A fixture that
+     * composes it by hand is a third reader of the same bytes, which is why the tests
+     * call this too.
+     *
+     * The path is spelled through [escapeRecordPath], so a name holding a tab or a line
+     * break is one line of three fields like any other. Such a name used to be left out
+     * of the record instead, and a path the record never names is what
+     * [uploadMirrorOnlyDocuments] reads as "never on the device": a document the user
+     * deleted on the device came back on the next open, [reconcileDeletions] could not
+     * remove its mirror copy, and [setAsideDivergedMirror] set that copy aside on every
+     * device-side change. Readers that want the path back go through
+     * [unescapeRecordPath]; the ones comparing whole lines need nothing, since both
+     * sides come through here.
+     */
+    internal fun identityLine(path: String, file: File): String =
+        identityLine(path, file.lastModified(), file.length())
+
+    /** The same line for a copy whose time and length are already known. */
+    private fun identityLine(path: String, lastModified: Long, length: Long): String =
+        "${escapeRecordPath(path)}\t$lastModified\t$length"
+
+    /**
+     * Whether every file under [mirrorDir] is one this app can prove it copied from the
+     * device folder, unchanged since.
+     *
+     * The question the reclaim pass has to answer before deleting a mirror, and it is
+     * narrower than the one it used to ask. That pass reads [uploadsInFlight], which
+     * records write-backs that were ATTEMPTED and failed. A file that was never queued
+     * for write-back at all has no journal entry, and there are several ways to be in
+     * that state: anything under [SKIP_DIRECTORIES], so a `.git` from a terminal clone;
+     * a file below a directory past [MAX_WATCHED_DIRECTORIES]; anything written while no
+     * watcher was running; a mirror copy [initialSync] kept for being newer than the
+     * device document, which it never uploads; entries past the upload cap; and jobs the
+     * queue dropped on [stopWatching]. Each of those is the user's only copy, and the
+     * journal cannot see any of them.
+     *
+     * So the test is inverted: rather than look for evidence a file is precious, require
+     * evidence that it is disposable. The record beside the mirror is that evidence and
+     * already exists. [recordIdentity] writes one line per file the device is known to
+     * hold, and this compares against it in the same format, so a file absent from the
+     * record, or present but no longer the bytes recorded for it, means the mirror holds
+     * something the device does not.
+     *
+     * "The device holds it" rather than "this app copied it", and the difference is not
+     * pedantry. A file the editor wrote and the watcher delivered is recorded too, once a
+     * sync has read both sides and found them equal. It was never copied here, and it is
+     * still disposable, because deleting the mirror does not destroy it. So is a file
+     * whose line a held-back or failed fetch carried forward: the mirror holds the copy an
+     * earlier record vouched for, which nobody edited since, of a document the device still
+     * holds, in that version or a newer one.
+     *
+     * Fails closed, in three directions, all deliberate. A missing record, a record whose
+     * first line is not [RECORD_HEADER], and an unreadable directory each return false
+     * and keep the mirror. That is the same direction [reconcileDeletions] takes when it
+     * cannot vouch for a path, and the cost of being wrong here is disk rather than the
+     * user's only copy.
+     *
+     * Symlinks are not followed: `walkTopDown` reports the link itself, and [isLink]
+     * sends it down the not-a-plain-file branch, so a link out of the mirror can neither
+     * be vouched for nor be walked through.
+     *
+     * A temporary-looking workspace name does not establish provenance: a user can
+     * create it too, so every regular file must satisfy the same record check. Current
+     * inbound staging lives outside the workspace and has its own cleanup.
+     */
+    internal fun holdsOnlyVouchedCopies(mirrorDir: File): Boolean {
+        val lines = readSyncedRecord(File(mirrorDir.path + SYNCED_RECORD_SUFFIX))
+        if (lines.firstOrNull() != RECORD_HEADER) return false
+        val vouched = lines.drop(1).associateBy { it.substringBefore('\t') }
+        // A directory the walk could not read leaves the mirror only partly examined,
+        // which is indistinguishable from an empty one to `all`. Recorded rather than
+        // returned from the handler: `onFail` is not inline, so it cannot return here.
+        var unreadable = false
+        return try {
+            mirrorDir.walkTopDown().onFail { _, _ -> unreadable = true }.all { file ->
+                if (isLink(file)) false
+                else if (!file.isFile) true
+                else {
+                    val relative = file.toRelativeString(mirrorDir)
+                    val line = vouched[escapeRecordPath(relative)]
+                    line != null && matchesRecordedCopy(file, relative, line)
+                }
+            } && !unreadable
+        } catch (e: Exception) {
+            Logger.w(tag, "Could not walk ${mirrorDir.name}; treating it as unvouched: ${e.message}")
+            false
+        }
+    }
+
+    private fun matchesRecordedCopy(file: File, relativePath: String, line: String): Boolean {
+        val (identity, digest) = splitRecordLine(line)
+        if (digest == null) return false
+        val entry = try {
+            inboundEntry(file)
+        } catch (_: Exception) {
+            null
+        } ?: return false
+        return entry.attributes.isRegularFile &&
+            identity == identityLine(relativePath, entry.attributes.lastModifiedTime().toMillis(), entry.attributes.size()) &&
+            entry.digest?.contentEquals(digest) == true
+    }
+
+    private fun matchesRecordedCopy(file: OutboundPath, relativePath: String, line: String): Boolean {
+        val (identity, digest) = splitRecordLine(line)
+        if (digest == null) return false
+        val entry = inboundEntry(file) ?: return false
+        return entry.attributes.isRegularFile &&
+            identity == identityLine(relativePath, entry.attributes.lastModifiedTime().toMillis(), entry.attributes.size()) &&
+            entry.digest?.contentEquals(digest) == true
+    }
+
+    /**
+     * The last vouched identities, or none when there is no file to
+     * read or the read failed.
+     *
+     * The first line is [RECORD_HEADER]; every line after it is `path`, `modification
+     * time` and `length` separated by tabs, the path spelled as [escapeRecordPath]
+     * spells it, and a fourth field where an open recorded the copy's digest; see
+     * [splitRecordLine]. The header check and the parsing are both the caller's, because a
+     * record in a format this build does not know has to be discarded whole and a line
+     * it cannot read has to be dropped rather than repaired.
+     */
+    private fun readSyncedRecord(record: File): List<String> =
+        if (!record.isFile) {
+            emptyList()
+        } else {
+            try {
+                record.readLines()
+            } catch (e: Exception) {
+                Logger.w(tag, "Could not read the synced record: ${e.message}")
+                emptyList()
+            }
+        }
+
+    // -- File Watching (Write-back) --
+
+    /**
+     * Starts watching the mirror directory for changes and syncing them back to SAF.
+     * Must be called after [initialSync] completes.
+     *
+     * A no-op once [shutdown] has run; see [shutDown] for why that is a refusal rather
+     * than a start that happens to be late.
+     */
+    fun startWatching(mirrorDir: File, safUri: Uri) {
+        synchronized(lifecycleLock) {
+            if (shutDown) {
+                Logger.i(
+                    tag,
+                    "Not watching ${mirrorDir.name}: this engine's owner is gone and " +
+                        "nothing could stop the watcher again",
+                )
+                return
+            }
+            stopWatching()
+
+            // Published before any observer exists so each captures its owning session.
+            val opening = WatchSession(mirrorDir, mirrorGenerations[mirrorDir.absolutePath])
+            session = opening
+            isWatching = true
+            watchTree(mirrorDir, mirrorDir, safUri, opening)
+
+            // Background thread to process this session's write-back queue. Handed over
+            // before it starts, so a stop arriving at once cannot find a null worker for a
+            // thread that is already running.
+            val worker = thread(start = false, name = "saf-writeback", isDaemon = true) {
+                runWriteBackLoop(opening) { opening.running }
+            }
+            opening.worker = worker
+            worker.start()
+
+            val watched = synchronized(watchersLock) { watchers.size }
+            Logger.i(tag, "File watcher started for ${mirrorDir.absolutePath} ($watched directories)")
+        }
+    }
+
+    /**
+     * Processes queued write-backs until [isRunning] goes false or the thread is
+     * interrupted, then sends out whatever is still queued. Whenever the queue runs empty
+     * it tries a held-back save whose wait is over; see [retryHeldBack].
+     *
+     * Drives whichever session is current, which is what a test without a live watcher
+     * needs: no JVM test can call [startWatching], because registering a watch builds a
+     * [FileObserver] and its static initializer reaches native code.
+     */
+    internal fun runWriteBackLoop(isRunning: () -> Boolean) = runWriteBackLoop(session, isRunning)
+
+    /**
+     * The same loop bound to one folder's [session], which is the form the watcher's own
+     * thread runs: a drain that outlives [stopWatching] goes on polling the queue it was
+     * started with, and the folder opened next has a different one.
+     */
+    internal fun runWriteBackLoop(session: WatchSession, isRunning: () -> Boolean) {
+        var interrupted = false
+        try {
+            while (isRunning()) {
+                if (Thread.interrupted()) {
+                    interrupted = true
+                    break
+                }
+                val job = session.queue.poll()
+                if (job != null) {
+                    processWriteBack(session, job)
+                } else if (!retryHeldBack(session)) {
+                    // Parked, not slept: a stop wakes it with unpark. An interrupt lands in whatever the
+                    // thread is doing, and in the middle of a save the next read of the local file fails
+                    // on it, leaving the device document cut short.
+                    LockSupport.parkNanos(WRITEBACK_POLL_MS * 1_000_000L)
+                }
+            }
+        } catch (_: InterruptedException) {
+            // An interrupt from outside, which wakes a sleeping thread and ends the loop
+            // the way a stop does, is not a fault. Letting it escape reaches the thread's
+            // uncaught handler, and Android's default handler ends the process: closing a
+            // folder, which happens on every folder switch and on destroy, would close the app.
+            interrupted = true
+        }
+        // Whichever way the loop ended, the queue can still hold writes the user is
+        // expecting on the device, and they have to go out with the interrupt status
+        // clear: the stream copies below throw InterruptedIOException on a thread still
+        // carrying the flag, losing exactly what this drain exists to save.
+        if (Thread.interrupted()) interrupted = true
+
+        var remaining = session.queue.poll()
+        while (remaining != null) {
+            processWriteBack(session, remaining)
+            remaining = session.queue.poll()
+        }
+        // Said after the last poll rather than before it, so the flag is never set while
+        // this thread could still deliver: an event that reads it answers "nothing will
+        // take this now" only when that is already true.
+        session.abandoned = true
+        if (interrupted) Thread.currentThread().interrupt()
+    }
+
+    /**
+     * Stops the file watcher and drains the write-back queue.
+     */
+    fun stopWatching() {
+        synchronized(lifecycleLock) {
+            isWatching = false
+            synchronized(watchersLock) {
+                watchers.values.forEach { it.stopWatching() }
+                watchers.clear()
+            }
+            // The folder being closed keeps the queue its jobs are in, and the folder opened
+            // next gets an empty one, whether or not the drain below finishes in time.
+            //
+            // Abandoned from birth: only [startWatching] starts a worker and it always
+            // installs a session of its own first.
+            val closing = session
+            session = WatchSession().apply { abandoned = true }
+            closing.running = false
+
+            // Wake the thread out of its wait, then wait for it to drain remaining writes.
+            // An idle queue drains in microseconds, so this costs only what there is to lose.
+            // Not interrupted: a save in flight would fail its next read of the local file.
+            val worker = closing.worker
+            closing.worker = null
+            worker?.let { LockSupport.unpark(it) }
+            try { worker?.join(DRAIN_GRACE_MS) } catch (_: InterruptedException) {}
+
+            if (worker != null && worker.isAlive) {
+                // Still draining. Emptying the queue from here would throw away exactly the
+                // writes the drain exists to save, and would do it in the case where there
+                // are the most of them: a burst of saves, or one slow provider. The thread
+                // owns this session's queue until it finishes, and nothing else can reach
+                // it: the queue went with the session, so the folder opened next offers its
+                // jobs somewhere this drain never polls. Addressing was never the question.
+                // Two threads polling one queue was: each write opens its document with
+                // "wt", which truncates at open, so the two interleave inside one document.
+                Logger.w(tag, "Write-back still draining after ${DRAIN_GRACE_MS}ms; leaving it to finish")
+            } else {
+                // Anything still here arrived after the drain took its last look, which is
+                // the one window an event observed while the folder was open can still fall
+                // into. Counted rather than dropped in silence: the mirror keeps the file and
+                // the record cannot vouch for it, so nothing is destroyed, but the save is
+                // not on the device and only reopening the folder puts it there. A user
+                // asking why needs this line to exist in a bug report.
+                val dropped = closing.queue.size
+                closing.queue.clear()
+                closing.abandoned = true
+                if (dropped > 0) {
+                    Logger.w(tag, "$dropped write-back(s) arrived after the drain ended")
+                }
+            }
+            // docIdCache is deliberately not cleared here. A drain that outlived the wait
+            // still needs the mappings of the folder it is finishing, and [initialSync]
+            // clears the cache itself before anything reads it for the next one.
+            //
+            // The half-renames are cleared, and the difference is that nothing consumes them
+            // after this point: a MOVED_TO of the next folder must not be able to claim a
+            // directory that left the previous one, which would rename a document in a folder
+            // the user has closed.
+            //
+            // Which is the same instant their upload records stop being able to move: a claim
+            // is the only thing that carries a line to the directory's new path. Retired here
+            // rather than left standing, because after this nothing can; see
+            // [consumeStaleUploadsUnder].
+            dropVanished { true }
+            Logger.i(tag, "File watcher stopped")
+        }
+    }
+
+    /**
+     * Stops the watcher for good: the same teardown as [stopWatching], plus the promise
+     * that no later [startWatching] will undo it.
+     *
+     * For the owner that is going away rather than switching folders. The two differ
+     * only in what may follow: a folder switch stops one watcher and starts the next on
+     * the same engine, while a teardown has no next. A start still on its way when this
+     * runs -- the one in a coroutine of the Activity being destroyed, which is not
+     * cancellable once it is inside the engine -- would otherwise finish afterwards and
+     * leave observers and a drain running on an engine no one holds any more.
+     */
+    fun shutdown() {
+        synchronized(lifecycleLock) {
+            shutDown = true
+            stopWatching()
+        }
+    }
+
+    // -- Internal: Watch Registration --
+
+    /**
+     * Puts an observer on each of [watchableDirectories] for [dir], one per directory,
+     * because a watch descriptor covers a directory and not a tree.
+     */
+    private fun watchTree(dir: File, rootDir: File, safTreeUri: Uri, owner: WatchSession) {
+        // The walk calls listFiles() once per directory, so it stays outside the lock:
+        // holding a monitor across a tree's worth of filesystem calls would block the
+        // observer thread's own registrations behind them. Its result is a bound on how
+        // much work follows, not a reservation; the cap is enforced again below, where
+        // it can be exact.
+        val room = synchronized(watchersLock) { MAX_WATCHED_DIRECTORIES - watchers.size }
+        val targets = watchableDirectories(dir, room)
+        val started = mutableListOf<DirectoryObserver>()
+        var atLimit = false
+
+        synchronized(lifecycleLock) {
+            if (shutDown || !isWatching || owner !== session) return
+            synchronized(watchersLock) {
+                for (target in targets) {
+                    if (watchers.size >= MAX_WATCHED_DIRECTORIES) {
+                        atLimit = true
+                        break
+                    }
+                    if (watchers.containsKey(target)) continue
+                    val observer = DirectoryObserver(target, rootDir, safTreeUri, owner)
+                    watchers[target] = observer
+                    started += observer
+                }
+            }
+            // Teardown must see every observer that reaches the kernel.
+            started.forEach { it.startWatching() }
+        }
+
+        if (atLimit || targets.size >= room) {
+            Logger.w(
+                tag,
+                "Watch limit of $MAX_WATCHED_DIRECTORIES reached; directories below " +
+                    "${dir.name} are unwatched"
+            )
+        }
+    }
+
+    /** Releases the observer for [dir] and for anything below it. A no-op if unwatched. */
+    private fun unwatchTree(dir: File, owner: WatchSession) {
+        synchronized(lifecycleLock) {
+            if (owner !== session) return
+            synchronized(watchersLock) {
+                // Every deleted file reaches here, and only a deleted directory can be
+                // holding watches. Without this the scan below would run once per entry of
+                // a `git clean`, across the whole map, on the observer thread.
+                if (!watchers.containsKey(dir)) return
+
+                val prefix = dir.path + File.separator
+                watchers.keys
+                    .filter { it == dir || it.path.startsWith(prefix) }
+                    .forEach { watchers.remove(it)?.stopWatching() }
+            }
+        }
+    }
+
+    // -- Internal: Tree Walking --
+
+    /**
+     * Recursively walks a SAF document tree, collecting [DocumentInfo] entries.
+     *
+     * @return whether every directory under [parentDocId] could be enumerated. A false
+     *   here is what stops [reconcileDeletions] from reading a provider that stopped
+     *   answering as a device folder that was emptied.
+     */
+    private fun walkTree(
+        treeUri: Uri,
+        parentDocId: String,
+        parentRelPath: String,
+        result: MutableList<DocumentInfo>,
+        skipped: MutableList<String>,
+        ancestors: Set<String> = emptySet(),
+    ): Boolean {
+        if (parentDocId in ancestors || ancestors.size >= MAX_ENUMERATION_DEPTH) {
+            skipped.add(parentRelPath)
+            Logger.w(tag, "Not following a repeated or overly deep device directory: $parentRelPath")
+            return false
+        }
+        val branch = ancestors + parentDocId
+        val childrenUri = DocumentsContract.buildChildDocumentsUriUsingTree(treeUri, parentDocId)
+        var complete = true
+
+        val projection = arrayOf(
+            DocumentsContract.Document.COLUMN_DOCUMENT_ID,
+            DocumentsContract.Document.COLUMN_DISPLAY_NAME,
+            DocumentsContract.Document.COLUMN_MIME_TYPE,
+            DocumentsContract.Document.COLUMN_SIZE,
+            DocumentsContract.Document.COLUMN_LAST_MODIFIED
+        )
+
+        try {
+            context.contentResolver.query(childrenUri, projection, null, null, null)?.use { cursor ->
+                val idIndex = cursor.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_DOCUMENT_ID)
+                val nameIndex = cursor.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_DISPLAY_NAME)
+                val mimeIndex = cursor.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_MIME_TYPE)
+                val sizeIndex = cursor.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_SIZE)
+                // Not every provider fills this one, so a missing column is not fatal.
+                val modifiedIndex = cursor.getColumnIndex(DocumentsContract.Document.COLUMN_LAST_MODIFIED)
+
+                // A provider backed by a network answers with the rows it has and says more
+                // are coming, or says it failed. The rows are real, and they are not all of
+                // them: read as the whole folder, what they leave out looked deleted on the
+                // device and its mirror copy was removed, or looked missing and was created
+                // again. Treated as the listing that failed is treated, which is the
+                // machinery for exactly this: the folder is recorded as unread, so what is
+                // under it stays guarded, and nothing is deleted or put across on its word.
+                if (cursor.extras?.let {
+                        it.getBoolean(DocumentsContract.EXTRA_LOADING) ||
+                            it.containsKey(DocumentsContract.EXTRA_ERROR)
+                    } == true
+                ) {
+                    complete = false
+                    skipped.add(parentRelPath)
+                }
+
+                // Names this directory lists more than once: a drive that allows two documents
+                // of one name in a folder. A path names one file in the mirror and cannot
+                // name two, so an open copied the later row over the earlier, and a mirror
+                // newer than the older document uploaded one document's bytes over the
+                // other's with no copy kept.
+                val seenNames = HashSet<String>()
+                val repeatedNames = LinkedHashSet<String>()
+
+                while (cursor.moveToNext()) {
+                    val docId = cursor.getString(idIndex)
+                    val name = cursor.getString(nameIndex)
+                    val mimeType = cursor.getString(mimeIndex)
+                    // A null reads back as 0, and a negative size, the -1 some providers give
+                    // for one they do not know, is read as 0 as well. Taken as a length, it had
+                    // [deviceMatchesMirror] answer every file unlike the mirror unread, and had a
+                    // set-aside take it for [UNANSWERED_SIZE] and stop at [MAX_FILE_SIZE] where
+                    // phase 2 fetches the document whole. [deviceStamp] reads the column alike.
+                    val size = cursor.getLong(sizeIndex).coerceAtLeast(0)
+                    val lastModified =
+                        if (modifiedIndex >= 0 && !cursor.isNull(modifiedIndex)) cursor.getLong(modifiedIndex) else 0L
+                    val isDir = mimeType == DocumentsContract.Document.MIME_TYPE_DIR
+
+                    // Before the name is composed into a path, not after: see
+                    // [isSafeSegment].
+                    if (!isSafeSegment(name)) {
+                        Logger.w(tag, "Skipped a document whose display name is not a path segment")
+                        continue
+                    }
+
+                    val relativePath = if (parentRelPath.isEmpty()) name else "$parentRelPath/$name"
+                    val docUri = DocumentsContract.buildDocumentUriUsingTree(treeUri, docId)
+
+                    // Directories only, and only the auto-generated names in
+                    // [SKIP_DIRECTORIES]: a file is never skipped here, whatever it is
+                    // called. Filtering hidden names is the tempting addition and is the
+                    // rule [shouldWriteBack] had to shed, because it kept `.vscode/`,
+                    // `.gitignore` and `.editorconfig` off the device silently. Note the
+                    // set holds `.env` as a DIRECTORY name, so a `.env` file is mirrored
+                    // and a `.env` directory is not.
+                    if (shouldSkip(name, isDir)) {
+                        // Collected, not merely dropped. Nothing under a skipped
+                        // directory becomes a DocumentInfo, so it never reaches phase
+                        // 2 and never reaches an `unfetched.add`; the DELETE guard
+                        // then proves "the device holds the only copy" from a set
+                        // that cannot contain it, answers false, and lets
+                        // deleteDocument take the whole directory on the device --
+                        // including the `.git` or `node_modules` that being skipped
+                        // is the reason the mirror never held. The MOVED_FROM hold
+                        // already refuses to lose this exact content; this is what
+                        // lets the outright delete refuse it too.
+                        skipped.add(relativePath)
+                        continue
+                    }
+
+                    if (!seenNames.add(name)) {
+                        repeatedNames.add(name)
+                        continue
+                    }
+
+                    // Cache the docId so write-back resolves this path without
+                    // walking the tree again
+                    cacheDocId(treeUri, relativePath, docId)
+
+                    result.add(DocumentInfo(docUri, docId, relativePath, isDir, size, lastModified))
+
+                    if (isDir && !walkTree(treeUri, docId, relativePath, result, skipped, branch)) {
+                        complete = false
+                        // Recorded for the same reason a skipped directory is, and it
+                        // is the same loss: the children could not be enumerated, so
+                        // none of them becomes a DocumentInfo, none reaches phase 2,
+                        // and none reaches an `unfetched.add`. Without this the DELETE
+                        // guard proves "the device holds the only copy" from a set that
+                        // cannot contain them and lets deleteDocument take the whole
+                        // directory on the device, including documents the mirror never
+                        // held. Unlike a skipped name, nothing filters this one out
+                        // earlier: [shouldWriteBack] drops SKIP_DIRECTORIES by name,
+                        // and a directory whose enumeration merely failed has an
+                        // ordinary one.
+                        skipped.add(relativePath)
+                    }
+                }
+
+                // Taken back out, the first row and whatever was listed under it included, and
+                // recorded the way an unlistable directory is: nothing at that path is fetched,
+                // written, created or deleted on the word of one of two documents, and the open
+                // reports it as not copied. The listing as a whole is incomplete, so the deletion
+                // pass leaves the mirror alone.
+                for (name in repeatedNames) {
+                    val path = if (parentRelPath.isEmpty()) name else "$parentRelPath/$name"
+                    result.removeAll { it.relativePath == path || it.relativePath.startsWith("$path/") }
+                    skipped.add(path)
+                    complete = false
+                }
+                if (repeatedNames.isNotEmpty()) {
+                    Logger.w(
+                        tag,
+                        "Left ${repeatedNames.size} names alone in " +
+                            (if (parentRelPath.isEmpty()) "the folder root" else parentRelPath) +
+                            ": the provider lists two documents under each",
+                    )
+                }
+            } ?: run {
+                skipped.add(parentRelPath)
+                return false
+            }
+        } catch (e: Exception) {
+            skipped.add(parentRelPath)
+            // The path inside the folder, not the document id, which the platform
+            // provider spells as the user's own directory; and the exception's class,
+            // because a provider quotes the document URI in its message.
+            Logger.w(
+                tag,
+                "Failed to enumerate " +
+                    (if (parentRelPath.isEmpty()) "the folder root" else parentRelPath) +
+                    ": ${e.javaClass.simpleName}",
+            )
+            return false
+        }
+        return complete
+    }
+
+    /**
+     * Skip patterns: large auto-generated directories that would slow sync unnecessarily.
+     */
+    private fun shouldSkip(name: String, isDir: Boolean): Boolean =
+        Companion.shouldSkip(name, isDir)
+
+    // -- Internal: File Operations --
+
+    private fun reclaimInboundScratch(): File? = synchronized(inboundScratchPaths) {
+        val directory = File(context.filesDir, "saf-inbound")
+        try {
+            try { Files.createDirectory(directory.toPath()) } catch (_: FileAlreadyExistsException) { }
+            secureDirectory(directory).use { parent ->
+                val identity = parent.getFileAttributeView(BasicFileAttributeView::class.java)
+                    ?.readAttributes()?.fileKey() ?: throw IOException("Staging has no identity")
+                for (entry in parent) {
+                    val name = entry.fileName
+                    if (InboundScratchKey(identity, name.toString()) !in inboundScratchPaths) {
+                        runCatching { parent.deleteFile(name) }
+                    }
+                }
+            }
+            directory
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    private fun secureDirectory(directory: File): SecureDirectoryStream<Path> {
+        val owner = directory.parentFile ?: throw IOException("The directory has no parent")
+        val opened = Files.newDirectoryStream(owner.toPath())
+        val anchor = opened as? SecureDirectoryStream<Path>
+        if (anchor == null) {
+            opened.close()
+            throw IOException("Filesystem cannot confine staging")
+        }
+        val handles = mutableListOf(anchor)
+        try {
+            val child = anchor.newDirectoryStream(directory.toPath().fileName, LinkOption.NOFOLLOW_LINKS)
+            handles.add(child)
+            anchor.close()
+            handles.removeAt(0)
+            return child
+        } catch (failure: Exception) {
+            try { closeOutboundResources(null, handles) } catch (closing: Exception) { failure.addSuppressed(closing) }
+            throw failure
+        }
+    }
+
+    private inner class InboundStage(
+        val parent: SecureDirectoryStream<Path>,
+        val name: Path,
+        private val key: InboundScratchKey,
+        val output: OutputStream,
+    ) : Closeable {
+        var moved = false
+
+        fun attributes(): BasicFileAttributes = parent.getFileAttributeView(
+            name, BasicFileAttributeView::class.java, LinkOption.NOFOLLOW_LINKS,
+        )?.readAttributes() ?: throw IOException("Staging attributes are unavailable")
+
+        fun input(): InputStream = Channels.newInputStream(parent.newByteChannel(
+            name, setOf<OpenOption>(StandardOpenOption.READ, LinkOption.NOFOLLOW_LINKS),
+        ))
+
+        fun modified(time: Long) {
+            parent.getFileAttributeView(name, BasicFileAttributeView::class.java, LinkOption.NOFOLLOW_LINKS)
+                ?.setTimes(FileTime.fromMillis(time), null, null)
+        }
+
+        override fun close() {
+            runCatching { output.close() }
+            synchronized(inboundScratchPaths) {
+                try {
+                    if (!moved) runCatching { parent.deleteFile(name) }
+                } finally {
+                    inboundScratchPaths.remove(key)
+                    runCatching { parent.close() }
+                }
+            }
+        }
+    }
+
+    private fun createInboundStage(): InboundStage = synchronized(inboundScratchPaths) {
+        val directory = reclaimInboundScratch() ?: throw IOException("Inbound staging is unavailable")
+        val parent = secureDirectory(directory)
+        try {
+            val identity = parent.getFileAttributeView(BasicFileAttributeView::class.java)
+                ?.readAttributes()?.fileKey() ?: throw IOException("Staging has no identity")
+            repeat(16) {
+                val name = directory.toPath().fileSystem.getPath("copy-${UUID.randomUUID()}$PARTIAL_SUFFIX")
+                try {
+                    val channel = parent.newByteChannel(name, setOf<OpenOption>(
+                        StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE, LinkOption.NOFOLLOW_LINKS,
+                    ))
+                    val key = InboundScratchKey(identity, name.toString())
+                    inboundScratchPaths.add(key)
+                    return@synchronized InboundStage(parent, name, key, Channels.newOutputStream(channel))
+                } catch (_: FileAlreadyExistsException) { }
+            }
+            throw IOException("No staging name is available")
+        } catch (failure: Exception) {
+            try { parent.close() } catch (closing: Exception) { failure.addSuppressed(closing) }
+            throw failure
+        }
+    }
+
+    private data class InboundParent(val fileKey: Any)
+
+    private inner class InboundEntry(val attributes: BasicFileAttributes, val digest: ByteArray?) {
+        fun matches(other: InboundEntry): Boolean =
+            sameInboundAttributes(attributes, other.attributes) &&
+                if (digest == null) other.digest == null else
+                    other.digest != null && digest.contentEquals(other.digest)
+    }
+
+    private fun inboundParent(dest: OutboundPath): InboundParent = InboundParent(dest.parentKey())
+
+    internal fun parentIsCurrent(dest: OutboundPath, file: File, mirrorRoot: File): Boolean = try {
+        openOutboundPath(file, mirrorRoot).use { current ->
+            current.rootKey == dest.rootKey && inboundParent(current) == inboundParent(dest)
+        }
+    } catch (_: Exception) {
+        false
+    }
+
+    private fun requireCurrentParent(dest: OutboundPath, file: File, mirrorRoot: File) {
+        if (!parentIsCurrent(dest, file, mirrorRoot)) throw IOException("The mirror directory changed")
+    }
+
+    private fun inboundAttributes(dest: OutboundPath, name: Path = dest.leaf): BasicFileAttributes? = try {
+        dest.attributes(name)
+    } catch (_: NoSuchFileException) {
+        null
+    }
+
+    private fun sameInboundAttributes(a: BasicFileAttributes, b: BasicFileAttributes): Boolean =
+        a.fileKey() == b.fileKey() && a.lastModifiedTime() == b.lastModifiedTime() &&
+            a.size() == b.size() && a.isRegularFile == b.isRegularFile &&
+            a.isDirectory == b.isDirectory && a.isSymbolicLink == b.isSymbolicLink &&
+            a.isOther == b.isOther
+
+    private fun inboundEntry(dest: File): InboundEntry? {
+        val attributes = try {
+            Files.readAttributes(dest.toPath(), BasicFileAttributes::class.java, LinkOption.NOFOLLOW_LINKS)
+        } catch (_: NoSuchFileException) {
+            return null
+        }
+        if (attributes.fileKey() == null) throw IOException("The destination has no identity")
+        val digest = if (attributes.isRegularFile) {
+            Files.newInputStream(dest.toPath(), LinkOption.NOFOLLOW_LINKS).use {
+                sha256(it, attributes.size())?.takeIf { result -> result.second == attributes.size() }?.first
+                    ?: throw IOException("The destination changed while reading it")
+            }
+        } else null
+        val after = Files.readAttributes(
+            dest.toPath(), BasicFileAttributes::class.java, LinkOption.NOFOLLOW_LINKS,
+        )
+        if (!sameInboundAttributes(attributes, after)) {
+            throw IOException("The destination changed while reading it")
+        }
+        return InboundEntry(attributes, digest)
+    }
+
+    private fun inboundEntry(dest: OutboundPath, name: Path = dest.leaf): InboundEntry? {
+        val attributes = inboundAttributes(dest, name) ?: return null
+        if (attributes.fileKey() == null) throw IOException("The destination has no identity")
+        val digest = if (attributes.isRegularFile) {
+            dest.input(name).use {
+                sha256(it, attributes.size())?.takeIf { result -> result.second == attributes.size() }?.first
+                    ?: throw IOException("The destination changed while reading it")
+            }
+        } else null
+        if (!sameInboundAttributes(attributes, dest.attributes(name))) {
+            throw IOException("The destination changed while reading it")
+        }
+        return InboundEntry(attributes, digest)
+    }
+
+    private fun sameStreamBytes(left: InputStream, right: InputStream): Boolean {
+        val one = ByteArray(COPY_BUFFER_SIZE)
+        val two = ByteArray(COPY_BUFFER_SIZE)
+        while (true) {
+            val count = readFully(left, one, one.size)
+            if (count != readFully(right, two, two.size)) return false
+            if (count == 0) return true
+            if (!java.util.Arrays.equals(one, 0, count, two, 0, count)) return false
+        }
+    }
+
+    private fun sameRootedBytes(dest: OutboundPath, name: Path, fetched: InboundStage): Boolean = try {
+        val attributes = inboundAttributes(dest, name)
+        attributes?.isRegularFile == true && attributes.size() == fetched.attributes().size() &&
+            dest.input(name).use { left -> fetched.input().use { right -> sameStreamBytes(left, right) } }
+    } catch (_: Exception) {
+        false
+    }
+
+    private fun sameRootedSiblings(dest: OutboundPath, first: Path, second: Path): Boolean = try {
+        val left = inboundAttributes(dest, first)
+        val right = inboundAttributes(dest, second)
+        left?.isRegularFile == true && right?.isRegularFile == true && left.size() == right.size() &&
+            dest.input(first).use { a -> dest.input(second).use { b -> sameStreamBytes(a, b) } }
+    } catch (_: Exception) {
+        false
+    }
+
+    /**
+     * Copies a single SAF document to a local file.
+     *
+     * @return the installed [LandedCopy], or why no copy was installed. A writer observed
+     *   during the read remains [FailedCopy.IN_FLIGHT] even if it finishes before the
+     *   caller handles the result. Other failures answer [FailedCopy.UNAVAILABLE]. The
+     *   destination can still hold a local edit, or its preserved copy can be beside it
+     *   if installation failed after preservation. The landed identity is taken before
+     *   the rename, not from [dest] afterwards, which an editor can have written by then.
+     * @param digest updated with every byte fetched, so a caller learns what the copy
+     *   holds without reading it again. Meaningful only after a [LandedCopy] answer.
+     * @param limit the most bytes the copy may hold. A document holding more is not
+     *   copied, after no more than that has been staged, and answers [FailedCopy.UNAVAILABLE].
+     * @param expectedSize a positive provider size the completed stream must reach.
+     * @param onCopyFailed told whether the failed copy left the original destination
+     *   unchanged, so old record metadata cannot vouch for an intervening edit.
+     * @param onReplacing preserves conflicting destination bytes before installation.
+     *   The default refuses intervening edits to a device-copy destination.
+     */
+    private fun copyDocumentToLocal(
+        docUri: Uri,
+        dest: File,
+        sourceModified: Long,
+        mirrorRoot: File,
+        digest: MessageDigest? = null,
+        limit: Long = Long.MAX_VALUE,
+        access: OutboundAccess? = null,
+        expectedSize: Long = 0,
+        onCopyFailed: (destinationUnchanged: Boolean) -> Unit = {},
+        onCopied: (destination: OutboundPath, installed: BasicFileAttributes) -> Unit = { _, _ -> },
+        onReplacing: (fetched: InboundStage, changedDuringFetch: Boolean, destination: OutboundPath) -> Boolean = { _, changed, _ ->
+            if (changed) throw IOException("The preserved-copy destination changed during copy")
+            false
+        },
+    ): DocumentCopyResult {
+        // The only floor, and here because both fetches into filesDir pass through this
+        // function: phase 2's copy and [setAsideDeviceCopy]. Both turn an unavailable
+        // copy into [unfetched] or UNAVAILABLE, so a
+        // document held back is guarded exactly like one that failed, unless phase 2 can
+        // read that the mirror already holds it. Measured before every fetch rather than
+        // latched, so copies resume if space comes back mid-open.
+        // Staged outside the workspace and moved into place only once the stream
+        // finished. Abandoned copies are reclaimed on the next open. Writing straight
+        // to dest would truncate it first, so a copy cut
+        // short (by an exception, or by the process being killed mid-stream) would
+        // leave a short file carrying a fresh timestamp. That is indistinguishable
+        // from an unsaved local edit, and the sync decision has to tell them apart.
+        var partial: InboundStage? = null
+        var destination: OutboundPath? = null
+        var destinationParent: InboundParent? = null
+        var destinationEntry: InboundEntry? = null
+        var observedDestination = false
+        var installed = false
+        try {
+            val target = openOutboundPath(dest, mirrorRoot)
+            destination = target
+            destinationParent = inboundParent(target)
+            destinationEntry = inboundEntry(target)
+            observedDestination = true
+            requireCurrentParent(target, dest, mirrorRoot)
+            if (usableSpaceOf(dest.parentFile ?: dest) < OPEN_SPACE_FLOOR_BYTES) {
+                Logger.d(tag, "Not copying into ${dest.name}: free space is below the floor")
+                return FailedCopy.UNAVAILABLE
+            }
+            if (anotherMirrorWritesDocument(docUri, mirrorRoot)) {
+                Logger.w(
+                    tag,
+                    "Not copying into ${dest.name}: another folder grant is still writing its device copy",
+                )
+                return FailedCopy.IN_FLIGHT
+            }
+            val copied = withStableDocumentRead(docUri) {
+                val source = context.contentResolver.openInputStream(docUri)
+                if (source == null) {
+                    // By the mirror file's own name, never the document id: a provider
+                    // composes that from the user's own path, and this level ships. See
+                    // SafStorageManager.persistPermission for the whole of that reasoning.
+                    Logger.w(tag, "No stream for ${dest.name}")
+                    return@withStableDocumentRead null
+                }
+                (if (digest != null) DigestInputStream(source, digest) else source).use { input ->
+                    // Workspace entries must never choose or redirect the scratch file.
+                    val scratch = createInboundStage().also { partial = it }
+                    scratch.output.use { output -> copyAtMost(input, output, limit) }
+                }
+            }
+            val fetched = partial ?: return FailedCopy.UNAVAILABLE
+            if (copied == null) {
+                Logger.i(
+                    tag,
+                    "Not copying ${dest.name}: the document holds more than this app's own " +
+                        "storage will hold a copy of",
+                )
+                return FailedCopy.UNAVAILABLE
+            }
+            if (expectedSize > 0 && copied < expectedSize) {
+                throw IOException("The device stream ended before its reported size")
+            }
+            // Stamp with the source's own time so later syncs compare two timestamps
+            // from the same clock rather than a provider's against the filesystem's.
+            if (sourceModified > 0) runCatching { fetched.modified(sourceModified) }
+            // Read back from the scratch file, which nothing else writes, so the time is
+            // the one the filesystem kept.
+            val staged = fetched.attributes()
+            if (!staged.isRegularFile || staged.fileKey() == null) throw IOException("Staging is not a regular file")
+            val landed = LandedCopy(staged.lastModifiedTime().toMillis(), copied)
+            // The one moment anything can act on the copy this is about to replace, and
+            // the only one where replacing it is already certain: the stream finished, so
+            // the caller is not being asked to judge a copy that may yet fail and leave
+            // the destination exactly as it was. The fetched bytes are on disk here, so
+            // the comparison the caller needs costs no second read of the document.
+            return withCurrent(access) {
+                // A terminal can replace a workspace parent while the provider read is blocked.
+                requireCurrentParent(target, dest, mirrorRoot)
+                val currentEntry = inboundEntry(target)
+                val changed = if (destinationEntry == null) currentEntry != null else
+                    currentEntry == null || !destinationEntry.matches(currentEntry)
+                if (changed && currentEntry?.attributes?.isRegularFile != true) {
+                    throw IOException("The destination type changed during copy")
+                }
+                val moved = currentEntry != null && onReplacing(fetched, changed, target)
+                // The callback can compare whole files before preserving a local edit.
+                requireCurrentParent(target, dest, mirrorRoot)
+                val afterCallback = inboundEntry(target)
+                if (moved) {
+                    if (afterCallback != null) throw IOException("The preserved destination was recreated")
+                } else if (currentEntry == null) {
+                    if (afterCallback != null) throw IOException("The destination appeared before installation")
+                } else if (afterCallback == null || !currentEntry.matches(afterCallback)) {
+                    throw IOException("The destination changed before installation")
+                }
+                // Observation and rename are not atomic against external filesystem writers.
+                fetched.parent.move(fetched.name, target.parent, target.leaf)
+                fetched.moved = true
+                installed = true
+                onCopied(target, staged)
+                landed
+            } ?: FailedCopy.UNAVAILABLE
+        } catch (_: DocumentWriteDuringReadException) {
+            Logger.w(
+                tag,
+                "Discarding copy into ${dest.name}: a write overlapped its device read",
+            )
+            return FailedCopy.IN_FLIGHT
+        } catch (e: Exception) {
+            // The class rather than the message, and it takes both halves to be
+            // redaction at all: the document id names the user's directory, and a
+            // provider stream's own exception quotes the URI in its message, so
+            // dropping the interpolation alone would put the same string in logcat by
+            // the other route.
+            Logger.w(tag, "Failed to copy into ${dest.name}: ${e.javaClass.simpleName}")
+            return FailedCopy.UNAVAILABLE
+        } finally {
+            if (!installed) {
+                val unchanged = try {
+                    val target = destination
+                    val currentEntry = target?.let { inboundEntry(it) }
+                    target != null && observedDestination && parentIsCurrent(target, dest, mirrorRoot) &&
+                        inboundParent(target) == destinationParent &&
+                        if (destinationEntry == null) currentEntry == null else
+                            currentEntry != null && destinationEntry.matches(currentEntry)
+                } catch (_: Exception) {
+                    false
+                }
+                onCopyFailed(unchanged)
+            }
+            partial?.close()
+            destination?.let { runCatching { it.close() } }
+        }
+    }
+
+    /**
+     * Whether the device document is exactly what this app's own interrupted
+     * write-back leaves behind: a STRICT PREFIX of the mirror.
+     *
+     * The upload journal records that a write started and did not finish. It does
+     * not record that nothing touched the document afterwards, and the two are
+     * only the same thing if the app was the last writer. `"wt"` truncates at
+     * open and the copy runs forward from zero, so a write cut short leaves the
+     * document holding the mirror's leading bytes and nothing else. Any other
+     * content, longer, shorter with different bytes, or the same length, was
+     * written by something that is not that interrupted write, and the caller
+     * must preserve it rather than overwrite it.
+     *
+     * Strict, because equal length is [deviceMatchesMirror]'s question and means
+     * the write finished after all. Every case is decided from the two streams:
+     *
+     * | Device document | Answer |
+     * |---|---|
+     * | unreadable | false; the caller preserves it before replacing |
+     * | empty, mirror is not | true, the empty prefix |
+     * | empty, mirror is empty too | false, not strict |
+     * | shorter, bytes agree | true |
+     * | shorter, bytes differ | false |
+     * | same length, or longer | false |
+     *
+     * ⚠️ `doc.size` is deliberately not a parameter here, and a length
+     * pre-check must not come back. `COLUMN_SIZE` is optional, a NULL reads back
+     * as 0 through the cursor, and `walkTree` does not test for it, so a provider
+     * that omits it claims 0 for every document it returns. The pre-check this
+     * replaced, `deviceSize <= 0L || deviceSize >= localFile.length()`, therefore
+     * answered false for every file of such a provider, and for every genuinely
+     * empty document as well: which is exactly what a `"wt"` open followed by an
+     * immediate death leaves, the most likely shape of the write this exists to
+     * recognise. A false here sends the EXPECTED case into [setAsideDeviceCopy],
+     * which keeps a `.device-` copy of this app's own half-written bytes, and
+     * phase 2b then puts that copy in the user's folder, where nothing removes
+     * it. The relation is a property of two byte streams and both of them are
+     * open here; a third party's claim about one of them can only add ways to be
+     * wrong.
+     *
+     * The cost is one provider read of at most `min(document, mirror) + 1` bytes,
+     * paid a second time by [setAsideDeviceCopy] wherever this answers false.
+     * Affordable only because a journal line gates the branch, so it never runs
+     * on a healthy folder. [deviceMatchesMirror] decides the other way and says
+     * why: on a folder with no clock it runs at every open for each file the
+     * record does not vouch for, and wherever the free-space floor holds a fetch
+     * back.
+     *
+     * A read that fails answers false, the safe direction: the caller then
+     * preserves the document before replacing it.
+     */
+    private fun deviceIsTruncatedMirror(safDocUri: Uri, localFile: File, mirrorRoot: File): Boolean {
+        return try {
+            openOutboundSource(localFile, mirrorRoot).use { selected ->
+                val matched = withStableDocumentRead(safDocUri) {
+                    context.contentResolver.openInputStream(safDocUri)?.use { device ->
+                        selected.input.use { mirror ->
+                            val a = ByteArray(COPY_BUFFER_SIZE)
+                            val b = ByteArray(COPY_BUFFER_SIZE)
+                            while (true) {
+                                val read = readFully(device, a, a.size)
+                                // The document ended while the two still agreed, so it is
+                                // a prefix. Strict needs one more byte in the mirror, and
+                                // it is asked of the stream rather than of
+                                // `localFile.length()`: the mirror is a file an editor may
+                                // be writing while this runs, and a second measurement of
+                                // it can disagree with the bytes just read.
+                                if (read == 0) return@use mirror.read() != -1
+                                // The mirror ran out first, so the document holds more
+                                // than any prefix of it: something else put it there.
+                                if (readFully(mirror, b, read) != read) return@use false
+                                if (!java.util.Arrays.equals(a, 0, read, b, 0, read)) return@use false
+                            }
+                            @Suppress("UNREACHABLE_CODE") false
+                        }
+                    } ?: false
+                }
+                matched && sameInboundAttributes(selected.attributes, selected.path.attributes()) &&
+                    parentIsCurrent(selected.path, localFile, mirrorRoot)
+            }
+        } catch (e: Exception) {
+            Logger.w(
+                tag,
+                "Could not compare ${localFile.name} with its device copy: " +
+                    e.javaClass.simpleName,
+            )
+            false
+        }
+    }
+
+    /**
+     * Whether the device document and the mirror hold the same bytes.
+     *
+     * The one question that can be answered without a clock, and the only one this
+     * path needs. When the watcher has already carried an edit to the device, the two
+     * agree in content while the record still describes what was there before, and
+     * that mismatch is what froze the file: nothing else ever brings the bookkeeping
+     * back into step. Phase 2 also asks it of a fetch the free-space floor held back,
+     * where a read spends no disk and the fetch would have.
+     *
+     * Reads the device document, so lengths are compared first: unequal lengths cannot
+     * hold equal bytes, and skipping the read there is what keeps this off the common
+     * path.
+     *
+     * ⚠️ That length is the provider's claim, not a measurement, and `COLUMN_SIZE` is
+     * optional in the same way `COLUMN_LAST_MODIFIED` is. A provider omitting it reports
+     * every length as 0, which is why 0 rules nothing out and the bytes decide: answered
+     * false for every non-empty file, a provider omitting both never had a file tracked
+     * again, and a save delivered there would read as a device copy unlike the mirror's,
+     * of which the next save keeps a spare copy. The read stops a buffer past the mirror's
+     * length. With no clock phase 2 asks only about the files the record does not vouch
+     * for, while each file it does vouch for is fetched in full on every open, and below
+     * the free-space floor the read stands in for such a fetch. A reported length still
+     * rules the read out. [deviceIsTruncatedMirror] takes the opposite decision, and says
+     * why.
+     *
+     * A read that fails answers false. That is the safe direction: false leaves the
+     * mirror kept and vouches for nothing new, while a true this could not justify would
+     * vouch for bytes nobody compared. After a fetch the floor held back, a false still
+     * lets phase 2 carry the line the previous record held for a copy nobody has touched
+     * since, which says no more than it said before.
+     */
+    private fun deviceMatchesMirror(safDocUri: Uri, localFile: File, deviceSize: Long, selected: OutboundSource): Boolean {
+        if (deviceSize != 0L && deviceSize != selected.attributes.size()) return false
+        return try {
+            withStableDocumentRead(safDocUri) {
+                context.contentResolver.openInputStream(safDocUri)?.use { device ->
+                    selected.input.use { mirror ->
+                        val a = ByteArray(COPY_BUFFER_SIZE)
+                        val b = ByteArray(COPY_BUFFER_SIZE)
+                        while (true) {
+                            val read = readFully(device, a, a.size)
+                            val same = readFully(mirror, b, b.size)
+                            if (read != same) return@use false
+                            if (read == 0) return@use true
+                            // Only the bytes this chunk filled. Comparing the whole buffer
+                            // would drag in the previous, longer chunk's tail.
+                            if (!java.util.Arrays.equals(a, 0, read, b, 0, read)) return@use false
+                        }
+                        @Suppress("UNREACHABLE_CODE") false
+                    }
+                } ?: false
+            }
+        } catch (e: Exception) {
+            Logger.w(
+                tag,
+                "Could not compare ${localFile.name} with its device copy: " +
+                    e.javaClass.simpleName,
+            )
+            false
+        }
+    }
+
+    /**
+     * [deviceMatchesMirror], answered true only for a mirror file nothing wrote while the
+     * two were being read.
+     *
+     * Both streams are read to their ends, which on a large file or a slow provider takes
+     * a while, and the watcher is stopped for the whole open: an editor's autosave, a
+     * terminal or a build can write the file meanwhile, behind the point the read has
+     * reached. The comparison then answers for bytes that are gone, and a caller that
+     * settles on it records the file as held by the device and, where the device reports
+     * a time, stamps it with that older time. The next open reads that as a save already
+     * delivered, and the edit is never sent.
+     *
+     * The file's time and length are taken before the comparison, ahead of its own length
+     * check, and again after it. A file that moved is not the one the comparison answered
+     * for, and false is what every caller already makes of "the device copy is not known
+     * to hold these bytes": the file stays as the editor wrote it and takes the deferral
+     * or the failed copy it would have taken had the bytes differed.
+     *
+     * Ceilings, both inherent in checking a file's identity rather than holding it: a
+     * rewrite of the same length inside one tick of the file system's clock shows no
+     * change, and a write between the second reading and the caller's stamp is not seen.
+     */
+    private fun deviceMatchesUnchangedMirror(
+        safDocUri: Uri,
+        localFile: File,
+        deviceSize: Long,
+        mirrorRoot: File,
+        onMatched: (OutboundPath, BasicFileAttributes) -> Unit = { _, _ -> },
+    ): Boolean {
+        if (anotherMirrorWritesDocument(safDocUri, mirrorRoot)) return false
+        return try {
+            openOutboundSource(localFile, mirrorRoot).use { selected ->
+                if (!deviceMatchesMirror(safDocUri, localFile, deviceSize, selected)) return@use false
+                val after = selected.path.attributes()
+                if (!sameInboundAttributes(selected.attributes, after) ||
+                    !parentIsCurrent(selected.path, localFile, mirrorRoot)
+                ) return@use false
+                onMatched(selected.path, after)
+                true
+            }
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    /**
+     * Writes a local file's contents back to its corresponding SAF document.
+     *
+     * Declines outright when another write already holds the document, so two streams
+     * never interleave into one file: see [documentAccess]. Declines a symbolic
+     * link outright too, for the reason spelled out at that test.
+     *
+     * The copy itself runs in [writeLocalToSafHoldingDocument], bracketed by the
+     * in-flight journal, and the bracket is the whole point of that method's shape:
+     * `"wt"` truncates the document at open, and the provider stamps a fresh
+     * modification time on the shorter bytes, so a copy
+     * that dies partway leaves the device holding a *newer* copy of a file whose
+     * only complete version is the mirror's. That is indistinguishable, at the
+     * next sync, from an edit made on the device, and the sync would copy the
+     * truncation over the edit. The journal line is written before the stream
+     * opens and removed only by a copy that ran to its end, so the next sync can
+     * tell the two apart by the one fact it can know: whether this app was
+     * mid-upload when the copy stopped.
+     *
+     * One retry, because a first attempt that fails has already paid the
+     * truncation, and a second full write is cheaper than a session of a stale
+     * device copy. Permission loss is not retried: nothing about a revoked grant
+     * gets better within a second.
+     */
+    private fun writeLocalToSaf(
+        localFile: File, safDocUri: Uri, mirrorRoot: File, mutation: ProviderMutation,
+    ): Boolean {
+        if (!ownsProviderMutation(safDocUri, mutation)) {
+            deferWriteBack(localFile, safDocUri)
+            return false
+        }
+        // A symbolic link is never written out, which is the same refusal [uploadPlan]
+        // and [watchableDirectories] make, in the same words and for the same reason: a
+        // mirror is routinely a checked-out repository, so a link inside one is
+        // attacker-supplied in the ordinary case. Every stream below reads *through* the
+        // link, so without this a link named `notes.txt` puts its target's bytes into the
+        // device document of that name, and the target can be anywhere this app can read,
+        // its own private storage included.
+        //
+        // Here rather than at the four call sites, because this is the one point all four
+        // pass through and two of them had no link test anywhere: a CREATE or MODIFY the
+        // observer reports for a single entry never goes near [uploadPlan], which is the
+        // only place the tree stated this policy. A DELETE does not come through here,
+        // which is what it needs: by then the entry is gone, the link question has no
+        // answer, and the device document still has to be removed.
+        if (isLink(localFile)) {
+            Logger.w(
+                tag,
+                "Not writing ${localFile.name} back: it is a symbolic link, and writing " +
+                    "it would copy its target's bytes into the device folder",
+            )
+            return false
+        }
+        val document = documentWriteKey(safDocUri)
+        val claimed = synchronized(documentAccess) {
+            val state = documentAccess.getOrPut(document) { DocumentAccess() }
+            if (state.writer != null) false else {
+                state.writer = mirrorRoot.absolutePath
+                state.generation++
+                true
+            }
+        }
+        if (!claimed) {
+            // Someone is streaming into this document now. Declining is what keeps the
+            // two from interleaving, and holding the save lets the write-back loop try
+            // again once that stream finishes.
+            Logger.d(tag, "Another write holds ${localFile.name}; leaving it to that one")
+            deferWriteBack(localFile, safDocUri)
+            return false
+        }
+        settledHeldWait.remove(localFile.absolutePath)
+        try {
+            return writeLocalToSafHoldingDocument(localFile, safDocUri, mirrorRoot)
+        } finally {
+            synchronized(documentAccess) {
+                val state = documentAccess.getValue(document)
+                state.writer = null
+                if (state.readers == 0) documentAccess.remove(document)
+            }
+        }
+    }
+
+    private fun deferWriteBack(localFile: File, docUri: Uri) {
+        val settledWait = settledHeldWait.remove(localFile.absolutePath)
+        val wait = (heldBack[localFile.absolutePath]?.wait ?: settledWait)
+            ?.let { minOf(it * 2, HELD_BACK_RETRY_MAX_MS) }
+            ?: HELD_BACK_RETRY_FIRST_MS
+        announceLost(localFile)
+        heldBack[localFile.absolutePath] = HeldBackSave(
+            docUri, SystemClock.elapsedRealtime() + wait, wait,
+        )
+    }
+
+    /** The copy itself, with the document already claimed by the caller. */
+    private fun writeLocalToSafHoldingDocument(localFile: File, safDocUri: Uri, mirrorRoot: File): Boolean {
+        val claim = markUploadInFlight(localFile.absolutePath) ?: run {
+            onWriteBackFailed(localFile)
+            return false
+        }
+        // What a hold was waiting to send goes out now, as the file stands, so the hold ends
+        // here whatever this write comes to: one that fails is reported and kept in the
+        // journal like any other. Nearly every write comes after [keepsDeviceEdit], which
+        // has settled the hold already, but a create writes a document it has just made
+        // without asking it. A hold left standing there named the document before, which
+        // another app may have deleted: its next try reported this save as lost, kept a
+        // journal line that refuses the mirror's reclaim, and dropped what the new document
+        // was read as, so the save after it went over another app's edit of that document
+        // unguarded.
+        heldBack.remove(localFile.absolutePath)
+        // Released in a finally rather than at each exit, and this is not style.
+        // The claim taken above was originally dropped at the one exit its author
+        // had in mind, and the failure exits added later each returned without it,
+        // so the count never came back to zero for the life of the process. From
+        // then on [clearUploadInFlight] saw a writer that no longer existed and
+        // kept the journal line after a write-back that had landed, and
+        // [consumeStaleUploadRecord] refused to consume it, so every later
+        // initialSync force-pushed the mirror over whatever the device held. A
+        // device edit made in between was destroyed, silently, on every reopen.
+        //
+        // The distinction the two paths draw is what the journal means, and it is
+        // the reason there are two calls rather than one. The line records an edit
+        // that has not reached the device, so a landed write retires it and a
+        // failed one leaves it standing for the next sync to retry. The one thing
+        // that leaves nothing to retry is the mirror file going away while this
+        // write ran, and the failing path retires the line for that alone; see
+        // [releaseUploadClaim].
+        var landed = false
+        // Digested on the way out, so it is exactly what the provider was handed whatever
+        // the mirror file holds by the time [keepsDeviceEdit] asks.
+        var written: ByteArray? = null
+        var writtenLength = 0L
+        var providerAttempted = false
+        try {
+            var attempts = 0
+            while (true) {
+                try {
+                    val digest = MessageDigest.getInstance("SHA-256")
+                    val (copied, observed) = openOutboundSource(localFile, mirrorRoot).use { source ->
+                        // A refused or unreadable source must not truncate the document.
+                        providerAttempted = true
+                        val count = context.contentResolver.openOutputStream(safDocUri, "wt")
+                            ?.use { output ->
+                                DigestInputStream(source.input, digest).copyTo(output, COPY_BUFFER_SIZE)
+                            }
+                        count to source.attributes
+                    }
+                    if (copied != null) {
+                        landed = true
+                        written = digest.digest()
+                        writtenLength = copied
+                        try {
+                            val delivered = File(synchronized(uploadJournalLock) { claim.path })
+                            openOutboundPath(delivered, mirrorRoot).use { destination ->
+                                val after = inboundEntry(destination)
+                                if (after != null && sameInboundAttributes(observed, after.attributes) &&
+                                    copied == after.attributes.size() && written.contentEquals(after.digest)
+                                ) {
+                                    requireCurrentParent(destination, delivered, mirrorRoot)
+                                    recordDeliveredCopy(
+                                        delivered, mirrorRoot, after.attributes.lastModifiedTime().toMillis(), copied, written,
+                                    )
+                                }
+                            }
+                        } catch (_: Exception) {
+                            // A changed or unreadable mirror copy remains unvouched.
+                        }
+                        return true
+                    }
+                    attempts++
+                } catch (e: SecurityException) {
+                    Logger.e(tag, "Permission revoked while writing back: ${localFile.name}")
+                    onWriteBackFailed(localFile)
+                    return false
+                } catch (e: Exception) {
+                    attempts++
+                }
+                if (attempts >= 2) {
+                    Logger.e(
+                        tag,
+                        "Write-back of ${localFile.name} did not finish; its device copy " +
+                            "is recorded as not to be trusted"
+                    )
+                    onWriteBackFailed(localFile)
+                    return false
+                }
+            }
+        } finally {
+            // By the claim rather than by the path this opened with: a rename of the
+            // directory above it moves both records while the stream runs.
+            if (landed) clearUploadInFlight(claim)
+            else releaseUploadClaim(claim)
+            // The version a declined delete kept there is replaced once these bytes land.
+            if (landed) keptOnDevice.remove(localFile.absolutePath)
+            // An attempted output open may leave this app's bytes, whole or truncated.
+            // A refused source leaves the previous device baseline in place instead.
+            // A write cut short has no digest because its prefix is unknown.
+            if (providerAttempted) {
+                val stamp = deviceStamp(safDocUri)
+                deviceSeen[localFile.absolutePath] = DeviceState(stamp, written, writtenLength)
+            }
+        }
+    }
+
+    /** Opens a descendant's parent relative to the captured mirror without following links. */
+    internal fun openOutboundPath(localFile: File, mirrorRoot: File): OutboundPath {
+        val root = mirrorRoot.toPath().toAbsolutePath().normalize()
+        val file = localFile.toPath().toAbsolutePath().normalize()
+        if (file == root || !file.startsWith(root)) throw IOException("Source is outside its mirror")
+        val parent = root.parent ?: throw IOException("Mirror has no parent")
+        val relative = root.relativize(file)
+        val directories = mutableListOf<SecureDirectoryStream<Path>>()
+        try {
+            // The app-owned mirror parent may itself be reached through Android's
+            // filesDir alias. Every component below that anchor is opened without links.
+            val opened = Files.newDirectoryStream(parent)
+            val anchor = opened as? SecureDirectoryStream<Path>
+            if (anchor == null) {
+                opened.close()
+                throw IOException("Filesystem cannot confine a mirror source")
+            }
+            directories.add(anchor)
+            var directory = anchor.newDirectoryStream(root.fileName, LinkOption.NOFOLLOW_LINKS)
+            directories.add(directory)
+            val rootKey = directory.getFileAttributeView(BasicFileAttributeView::class.java)
+                ?.readAttributes()?.fileKey() ?: throw IOException("The mirror has no identity")
+            anchor.close()
+            directories.removeAt(0)
+            for (index in 0 until relative.nameCount - 1) {
+                val previous = directory
+                directory = previous.newDirectoryStream(relative.getName(index), LinkOption.NOFOLLOW_LINKS)
+                directories.add(directory)
+                previous.close()
+                directories.removeAt(0)
+            }
+            return OutboundPath(directory, relative.fileName, directories, rootKey)
+        } catch (failure: Exception) {
+            try {
+                closeOutboundResources(null, directories)
+            } catch (closing: Exception) {
+                failure.addSuppressed(closing)
+            }
+            throw failure
+        }
+    }
+
+    /** Opens and tests a regular source before a provider can truncate its destination. */
+    private fun openOutboundSource(localFile: File, mirrorRoot: File): OutboundSource {
+        val path = openOutboundPath(localFile, mirrorRoot)
+        var input: InputStream? = null
+        try {
+            val attributes = path.attributes()
+            if (!attributes.isRegularFile) throw IOException("Source is not a regular file")
+            val channel = path.parent.newByteChannel(
+                path.leaf, setOf<OpenOption>(StandardOpenOption.READ, LinkOption.NOFOLLOW_LINKS),
+            )
+            val readable = PushbackInputStream(Channels.newInputStream(channel), 1)
+            input = readable
+            // A channel can open for an entry that cannot be read. Test that before wt.
+            val first = readable.read()
+            if (first >= 0) readable.unread(first)
+            return OutboundSource(readable, attributes, path)
+        } catch (failure: Exception) {
+            try {
+                closeOutboundResources(input, path.directories)
+            } catch (closing: Exception) {
+                failure.addSuppressed(closing)
+            }
+            throw failure
+        }
+    }
+
+    private fun validateOutboundDirectory(localFile: File, mirrorRoot: File) {
+        openOutboundPath(localFile, mirrorRoot).use { path ->
+            if (!path.attributes().isDirectory) throw IOException("Source is not a directory")
+        }
+    }
+
+    /**
+     * Told when a write-back has given up on [File]. Does nothing until something wires
+     * it up, and [MainActivity] is what does.
+     *
+     * The default is a no-op rather than a Toast, and that is not squeamishness about
+     * layers. A default that touched `Looper.getMainLooper()` threw "not mocked" in every
+     * existing JVM test that drives a failing write-back, which is a fair warning: this
+     * class has no screen and should not reach for one. The layer that owns a screen
+     * decides how to say it.
+     *
+     * A failed upload leaves its journal entry in place, which
+     * `SafStorageManager.mayReclaim` reads. A refusal before the write begins, either
+     * [refuseUnreadDocument] or an unavailable upload journal, has no new entry. What
+     * covers it is [holdsOnlyVouchedCopies], which refuses to reclaim a mirror holding
+     * any file the `.synced` record cannot vouch for, and a file that was never written
+     * back never is.
+     *
+     * What was missing is the user knowing, and that is a different fact from the data
+     * being safe. A save that never reached the device folder looks exactly like one
+     * that did, and the difference only shows when the app is uninstalled and the work
+     * is gone.
+     */
+    internal var onWriteBackFailed: (File) -> Unit = {}
+
+    /**
+     * Told, once per [initialSync], when documents the device holds did not reach the
+     * mirror: how many, and whether the sizes reported for them did not fit in the room
+     * that was left or free space fell below [OPEN_SPACE_FLOOR_BYTES] and held them back.
+     *
+     * Its own seam rather than a reuse of [onWriteBackFailed], because the two say
+     * opposite things. That one means the app holds the only copy; this one means the
+     * DEVICE does and the editor simply does not have the file, so a notice worded "the
+     * only copy is inside VSCodroid" would send the user looking after a file that is
+     * safe where it is. A no-op by default for the reason that one is: no screen here.
+     */
+    internal var onDocumentsNotCopied: (Int, Boolean) -> Unit = { _, _ -> }
+
+    /**
+     * Told when a directory being copied out to the device arrived incomplete: which
+     * directory, how many entries did not make it, and whether the enumeration cap was
+     * the reason rather than a provider refusal.
+     *
+     * The outbound twin of [onDocumentsNotCopied], and a separate seam from
+     * [onWriteBackFailed] for a reason of accuracy rather than symmetry. That one says
+     * the app holds the only copy, which is true of a single file that never arrived
+     * and false of a directory where most entries did: announcing forty failures with
+     * it would overstate forty times, and announcing them one by one is another way of
+     * not telling the user anything.
+     */
+    internal var onUploadIncomplete: (File, Int, Boolean) -> Unit = { _, _, _ -> }
+
+    /**
+     * Told when something deleted in the editor was left standing on the device,
+     * because it holds content this sync never copied in: a directory holding such a
+     * document, or the document itself. With [changed], because what the device holds
+     * is a version of a file the editor had that this engine has not read: one that
+     * moved past what it last read or wrote, as another app's edit does, or a directory
+     * holding such a file; see [keepsDeviceDocument].
+     *
+     * Its own seam for the reason [onDocumentsNotCopied] has one: [onWriteBackFailed]
+     * says the app holds the only copy, and here the opposite is true. The mirror copy
+     * is gone, the device holds the only one, and a notice worded the other way would
+     * send the user looking inside the app for files that are safe where they are.
+     *
+     * The flags are what the sentence turns on and they cannot be recovered downstream:
+     * the entry is already unlinked when the event arrives, so nothing left on disk
+     * can be asked whether it was a directory. "It holds files that never reached the
+     * editor" is the right sentence for one case and false for the other, and "the
+     * editor never had a copy of it" is false of a file the user had open and deleted.
+     */
+    internal var onKeptOnDevice: (file: File, isDirectory: Boolean, changed: Boolean) -> Unit =
+        { _, _, _ -> }
+
+    /**
+     * Told when something the editor deleted is still on the device folder because the
+     * delete did not happen there: the provider refused it, or the engine could not name the
+     * document to ask it about, as when a folder was renamed and removed again inside one
+     * poll and the device had no document of the new name yet.
+     *
+     * Its own seam rather than [onKeptOnDevice], which reads as a decision this
+     * app made and explains it with a reason that is false here: the editor did
+     * have a copy, and it deleted it. The outcome is the same either way, so the
+     * sentence has to be about the device folder rather than about the editor.
+     *
+     * Worth a notice at all because the outcome is not merely a stale document.
+     * The mirror entry is unlinked whatever the provider says, so the next time
+     * the folder is opened the document is copied back in and the file the user
+     * deleted returns, with nothing in between having said why.
+     */
+    internal var onDeleteRefused: (File) -> Unit = {}
+
+    /**
+     * How much room is left where the mirror lives.
+     *
+     * A seam because no JVM test can make a real filesystem answer that it is full, and
+     * the pre-flight and the floor that read this are exactly the code that has to be
+     * right when it is.
+     *
+     * `usableSpace` rather than `StorageManager.getAllocatableBytes`, which lint asks for
+     * and which reports more, because it counts cache Android is willing to evict. This
+     * also decides whether a fetch is attempted at all, through the floor in
+     * [copyDocumentToLocal], and the larger figure is wrong for that too, although this
+     * comment once called it the right one for deciding a write: the evictable cache
+     * belongs to other apps, it is not space this app can count on, and free space is
+     * what the floor exists to leave behind.
+     */
+    internal var usableSpaceOf: (File) -> Long = defaultUsableSpaceOf
+
+    /**
+     * Declines to write [localFile] out, because the device holds a document under that
+     * name this sync never read, and says so once per file.
+     *
+     * Every file-level refusal site comes through here, and the message living in one
+     * place is what keeps them saying the same thing: [handleMirrorEvent] asks before it
+     * queues a job, [processWriteBack] asks again before it writes a save, a held-back
+     * save's try included, and [createOneInSaf] asks the same question while walking into
+     * a directory, which no JVM test can reach, because delivering a directory event builds
+     * a `FileObserver` and its static initializer needs native code. One helper is the only
+     * thing holding that site to the others.
+     *
+     * The notice is [onWriteBackFailed]'s and it fits: the file did not reach the device
+     * folder, and the copy inside the app is the only one of it that exists. What the
+     * device holds under that name is a different document, which is why this refuses.
+     * A refused delete does not come through here, because for it the opposite is
+     * true; see [keepUnread].
+     */
+    private fun refuseUnreadDocument(localFile: File, describedAs: String) {
+        Logger.w(
+            tag,
+            "Not writing $describedAs back: the device holds a document there " +
+                "that this sync never read, and writing would replace it",
+        )
+        announceLost(localFile)
+    }
+
+    /**
+     * Says once that [localFile] exists only inside the app.
+     *
+     * The throttle is per path and lives here rather than at each site, so a file the
+     * watcher retries on every save is announced once instead of on every keystroke.
+     * [initialSync] clears the set for a folder when it is reopened, which is the one
+     * moment the user could act on the notice again. Named precisely because it was
+     * named wrongly here for a while: [startWatching] never touches the set, and a
+     * reader deciding when a refusal can be said again went to the wrong function.
+     */
+    private fun announceLost(localFile: File) {
+        if (refusalsAnnounced.add(localFile.absolutePath)) onWriteBackFailed(localFile)
+    }
+
+    /**
+     * Declines to delete what the device holds at [relativePath], because it is, or it
+     * holds, a document this sync never read, or with [changed] a version of a file the
+     * editor had that this engine has not read, and says so.
+     *
+     * Not through [refuseUnreadDocument]: that one announces on [onWriteBackFailed],
+     * whose wording says the app holds the only copy, and here the app holds none.
+     * Not through [refusalsAnnounced] either, and that is the second half of the same
+     * point: something is deleted once per deletion, and a user who recreates it and
+     * deletes it again is owed the notice again. Spending that budget here also costs
+     * the notice its owner needs, since the next save of a recreated name is refused
+     * as a write and is the one occasion on which "the only copy is inside VSCodroid"
+     * is both true and urgent.
+     */
+    private fun keepUnread(
+        localFile: File,
+        relativePath: String,
+        isDirectory: Boolean,
+        changed: Boolean,
+    ) {
+        Logger.w(
+            tag,
+            "Not deleting $relativePath from the device: " +
+                if (changed) {
+                    "what it holds there may have changed since this app last read or wrote it"
+                } else {
+                    "it holds content this sync never read"
+                },
+        )
+        onKeptOnDevice(localFile, isDirectory, changed)
+    }
+
+    /**
+     * Says that a deletion did not reach the device folder.
+     *
+     * Not routed through [keepUnread], whose sentence is about content this sync
+     * never read and which is this app declining on purpose. Here the app asked
+     * and was told no.
+     */
+    private fun announceDeleteRefused(localFile: File) {
+        Logger.w(
+            tag,
+            "The device folder would not delete ${localFile.name}; the next open will " +
+                "copy it back into the editor",
+        )
+        onDeleteRefused(localFile)
+    }
+
+    private fun uploadJournal(): File = File(context.filesDir, UPLOADS_IN_FLIGHT_FILE)
+
+    /**
+     * Records recovery intent before claiming [absolutePath], or returns null on failure.
+     *
+     * The claim is handed back rather than looked up again at the end, because the path
+     * it names can move while the stream runs; see [UploadClaim].
+     */
+    private fun markUploadInFlight(absolutePath: String): UploadClaim? =
+        synchronized(uploadJournalLock) {
+            if (!recordUploadIntent(absolutePath)) return@synchronized null
+            UploadClaim(absolutePath).also { uploadClaims.add(it) }
+        }
+
+    private fun recordUploadIntent(absolutePath: String): Boolean =
+        synchronized(uploadJournalLock) {
+            try {
+                val journal = uploadJournal()
+                val lines = if (journal.isFile) readUploadJournal(journal) else emptyList()
+                if (absolutePath !in lines) {
+                    rewriteJournal(lines + absolutePath)
+                }
+            } catch (e: Exception) {
+                Logger.w(tag, "Could not record the upload in flight: ${e.message}")
+                return@synchronized false
+            }
+            true
+        }
+
+    /**
+     * Drops this writer's claim, and with it the line only when the mirror file it names
+     * went away while the write ran.
+     *
+     * The counterpart to [clearUploadInFlight], and deliberately not the same
+     * function. Both say "this writer is finished"; only one of them says "and the
+     * device copy is current now". A failed write-back has to say the first without
+     * the second, or the mirror edit it could not deliver is forgotten and the next
+     * sync has no reason to retry it.
+     *
+     * The one line it does take is the one with nothing left to retry. Two retirements
+     * defer to a live claim rather than take it, [consumeStaleUploadRecord] for a delete
+     * or rename of the file itself and [consumeStaleUploadsUnder] for a directory that
+     * left the mirror, and each of them was the last pass that could reach that line
+     * while the file was gone. Deferring to a writer that then fails here left it
+     * standing, and a standing line is not inert: `SafStorageManager.mayReclaim` reads it
+     * as the mirror holding a write the device never received, so the launch pass keeps
+     * that mirror and the device-folder screen reports it as holding work the device
+     * folder does not have. So the test here is the one [consumeStaleUploadsUnder]
+     * applies, the file being there, asked at the moment this writer is the only party
+     * that knows the line is now unowned.
+     *
+     * How long that used to last is worth stating exactly, because the two deferrals
+     * differ and only one of them ever healed. A directory departure nobody claimed is
+     * never propagated to the device ([handleMirrorEvent] holds it back), so the device
+     * still holds the document: the next open of the folder copies it back into the
+     * mirror, and the open after that reaches [initialSync]'s repair and consumes the
+     * line. That is two whole reopens with the mirror mislabelled in between, and no
+     * repair at all where the copy cannot come back, which is a folder never opened
+     * again, a document past [MAX_FILE_SIZE], one outside the enumeration cap, or one
+     * whose stale old-named copy the user removed on the device first. A delete or rename
+     * of the file itself has no such second chance: that one IS propagated, so the device
+     * document goes with it and nothing can ever copy it back down.
+     *
+     * The other two branches are unchanged and both matter: a line whose file is still in
+     * the mirror stands, because that is the edit the next sync retries, and a line
+     * another writer holds a claim on is left to that writer's own release, for the
+     * reason [clearUploadInFlight] gives.
+     */
+    private fun releaseUploadClaim(claim: UploadClaim) = synchronized(uploadJournalLock) {
+        uploadClaims.remove(claim)
+        if (!File(claim.path).exists() && uploadClaims.none { it.path == claim.path }) {
+            removeJournalLine(claim.path)
+        }
+    }
+
+    /**
+     * Releases [claim] and removes the journal line only when no other writer holds the
+     * path it names now.
+     *
+     * Paired with [markUploadInFlight] and called by writers alone. A second writer of
+     * the same path is reachable whenever a folder is reopened while a drain of the
+     * previous session is still streaming: the mirror is named by a hash of the folder,
+     * so both writers address one file, and before the claims the first to finish removed
+     * the line the other was still inside.
+     *
+     * The line is named by the claim rather than by the path the writer opened, which is
+     * what makes a write that lands during a rename of the directory above it retire its
+     * own line: [renameUploadsUnder] moved both records while this one streamed.
+     */
+    private fun clearUploadInFlight(claim: UploadClaim) = synchronized(uploadJournalLock) {
+        uploadClaims.remove(claim)
+        if (uploadClaims.none { it.path == claim.path }) removeJournalLine(claim.path)
+    }
+
+    /**
+     * Drops a journal line whose reason to exist has gone, without touching any claim.
+     *
+     * Two callers, and neither of them is a writer. [initialSync] consumes a record left
+     * by a process that died, for a path it is about to write itself. [processWriteBack]
+     * consumes one when the mirror file the line names has been deleted, which is where
+     * a file rename arrives too: the line records an edit that never reached the device,
+     * and once the file holding that edit is gone there is no edit left to protect.
+     *
+     * Not the same operation as [clearUploadInFlight] and deliberately not spelled as
+     * one. Treating either of those as releasing a claim would
+     * drop a live writer's claim and remove the line while that writer was still
+     * streaming, which is the defect the claims exist to prevent, arriving through a
+     * different door. A path somebody is writing right now is left alone, and that
+     * writer's own release retires the line: [clearUploadInFlight] when the write lands,
+     * and [releaseUploadClaim] when it fails onto a path the file has left, which is the
+     * state the [processWriteBack] caller defers in. The [initialSync] caller defers in
+     * the other one, where the file is there and about to be written out again, so the
+     * line it leaves is retired by that write landing.
+     */
+    private fun consumeStaleUploadRecord(absolutePath: String) = synchronized(uploadJournalLock) {
+        if (uploadClaims.any { it.path == absolutePath }) return@synchronized
+        removeJournalLine(absolutePath)
+    }
+
+    /** Caller must hold [uploadJournalLock]. */
+    private fun removeJournalLine(absolutePath: String) {
+        try {
+            val journal = uploadJournal()
+            if (journal.isFile) {
+                val all = readUploadJournal(journal)
+                val kept = all.filter { it != absolutePath }
+                if (kept.size != all.size) rewriteJournal(kept)
+            }
+        } catch (e: Exception) {
+            Logger.w(tag, "Could not clear the upload record: ${e.message}")
+        }
+    }
+
+    /**
+     * Moves the upload records of [from] to [to], so they follow a directory that has
+     * moved.
+     *
+     * Two callers, and the same one fact makes both necessary: the records are keyed by
+     * absolute mirror path, so a path that moves takes its meaning with it. A removal
+     * renames a whole mirror out of the way; a rename in the editor moves one directory
+     * inside it, which nothing else in the write-back carries across, because a claimed
+     * rename deliberately re-uploads nothing.
+     *
+     * The journal is keyed by absolute path, and a mirror's directory name is a hash
+     * of the tree URI rather than of the session, so the path a removal frees is the
+     * path the same folder gets again when the user re-grants it. Without this, the
+     * records of the departing mirror and of its replacement are the same strings, and
+     * whichever side is cleared takes the other's with it: retiring them loses the live
+     * mirror's distrust, and keeping them applies a dead mirror's distrust to a live
+     * one. Both end the same way, with a stale copy written over the user's file.
+     *
+     * Renaming them at the moment the directory moves is what keeps the two apart,
+     * because that is the last moment anything can still tell them apart. It survives a
+     * process death for the same reason the rename does: both are on disk before
+     * anything else happens.
+     *
+     * The live writers' claims move with the lines, in the same critical section, because
+     * they are two records of one write and this runs on a thread of its own: a directory
+     * can be renamed in the editor while a write below it is still streaming. Moving only
+     * the line would leave that write releasing a name nothing is filed under, so a write
+     * that landed would be recorded for ever as one that never reached the device.
+     *
+     * Which is why the claims move *after* the lines, and not at all when moving the
+     * lines threw. The journal half is best effort by design, and it fails in exactly the
+     * state that fills the journal in the first place: [rewriteJournal] writes a temporary
+     * file in `filesDir`, so internal storage that has run out refuses it. A claim that
+     * moved on its own is the same defect from the other side, and permanent rather than
+     * retried: the writer would retire a line nobody ever wrote and leave the real one
+     * standing under a path that has gone, which nothing can consume afterwards
+     * ([consumeStaleUploadsUnder] never sees a claimed departure, and [initialSync]'s
+     * repair needs the file the line names to be there), so `SafStorageManager.mayReclaim`
+     * would refuse that mirror for a save that did reach the device. Both records staying
+     * at the old name is the recoverable half of the pair: the writer's release still
+     * names the line it is filed under.
+     */
+    internal fun renameUploadsUnder(from: File, to: File) {
+        synchronized(uploadJournalLock) {
+            val old = from.absolutePath + File.separator
+            val new = to.absolutePath + File.separator
+            try {
+                val journal = uploadJournal()
+                // A journal that is not there, and a rewrite with nothing to move, are
+                // both moves that succeeded: there is no line to disagree with the claim.
+                if (journal.isFile) {
+                    val all = readUploadJournal(journal)
+                    val moved =
+                        all.map { if (it.startsWith(old)) new + it.removePrefix(old) else it }
+                    if (moved != all) rewriteJournal(moved)
+                }
+            } catch (e: Exception) {
+                Logger.w(tag, "Could not move the upload records of ${from.name}: ${e.message}")
+                return
+            }
+            uploadClaims.forEach {
+                if (it.path.startsWith(old)) it.path = new + it.path.removePrefix(old)
+            }
+        }
+    }
+
+    /**
+     * Moves the provider's unread markers, fetched exceptions, retained deletes and
+     * version baselines only after its directory relocation lands. Older queued deletes
+     * still need the old paths until then. Failed and superseded renames keep them there.
+     * Held saves end because their captured document URIs may no longer be valid.
+     */
+    private fun renameDeviceMemoryUnder(from: File, to: File) {
+        val old = from.absolutePath
+        val new = to.absolutePath
+        if (old == new) return
+        fun movedTo(path: String): String? = when {
+            path == old -> new
+            path.startsWith(old + File.separator) -> new + path.removePrefix(old)
+            else -> null
+        }
+        for (memory in listOf(unfetched, fetchedPaths, keptOnDevice)) {
+            for (path in memory.filter { movedTo(it) != null }) {
+                val moved = movedTo(path) ?: continue
+                memory.add(moved)
+                memory.remove(path)
+            }
+        }
+        for (path in deviceSeen.keys.filter { movedTo(it) != null }) {
+            val moved = movedTo(path) ?: continue
+            val seen = deviceSeen[path] ?: continue
+            deviceSeen[moved] = seen
+            deviceSeen.remove(path, seen)
+        }
+        heldBack.keys.removeAll { movedTo(it) != null }
+        settledHeldWait.keys.removeAll { movedTo(it) != null }
+    }
+
+    /**
+     * Retires the journal lines under [directory] whose mirror file is no longer there.
+     *
+     * The directory-shaped counterpart to [consumeStaleUploadRecord], and it exists
+     * because the delete that retires a line never arrives for the files under a
+     * directory that leaves the mirror. [handleMirrorEvent] holds that departure back for
+     * a rename to claim rather than queueing anything, inotify raises no event at all for
+     * the entries beneath a directory that moved, and [consumeStaleUploadRecord] matches
+     * one exact path, so it would not reach them even if it ran. Nothing else could:
+     * [initialSync]'s call is guarded by the file still existing, and [clearUploadsUnder]
+     * runs only once the whole mirror is going away. One write-back that gave up followed
+     * by a directory move no rename claimed therefore left a line standing for the life of
+     * the install, and a stranded line is not inert: `SafStorageManager.mayReclaim` reads
+     * any line under a mirror as that mirror holding a write the device never received, so
+     * the launch pass kept it and the device-folder screen described it as holding work
+     * the device folder does not have.
+     *
+     * A line whose file is still there is left alone, and that is the whole distinction:
+     * something is at that path again, a directory recreated under the same name or a
+     * checkout that restored it, and the line still records that the mirror holds an edit
+     * the device never received. So is a line some writer holds a claim on, for the reason
+     * [consumeStaleUploadRecord] gives, and taking it here is the defect [UploadClaim]
+     * exists to prevent. That deferral is not a hand-off into nothing: the writer applies
+     * this same test when it releases, so a write that fails onto the path this pass
+     * skipped retires the line itself ([releaseUploadClaim]), and one that lands retires
+     * it through [clearUploadInFlight].
+     */
+    private fun consumeStaleUploadsUnder(directory: File) {
+        synchronized(uploadJournalLock) {
+            try {
+                val journal = uploadJournal()
+                if (!journal.isFile) return
+                val prefix = directory.absolutePath + File.separator
+                val all = readUploadJournal(journal)
+                val kept = all.filter { line ->
+                    !line.startsWith(prefix) || File(line).exists() ||
+                        uploadClaims.any { it.path == line }
+                }
+                if (kept.size != all.size) rewriteJournal(kept)
+            } catch (e: Exception) {
+                Logger.w(
+                    tag,
+                    "Could not retire the upload records under ${directory.name}: ${e.message}"
+                )
+            }
+        }
+    }
+
+    /**
+     * Drops every vanished directory [predicate] answers for, and retires the upload
+     * records the files beneath them left behind.
+     *
+     * One function for all three removals of an *unclaimed* departure, so that the
+     * retirement cannot be forgotten at one of them. The fourth removal is deliberately
+     * not here: [claimVanishedDirectory] takes an entry precisely because a rename is
+     * about to move its records to the new path, which [renameUploadsUnder] does.
+     *
+     * The journal is touched outside [vanishedLock], because it has a lock of its own
+     * and this is the only path that would otherwise hold both.
+     */
+    private fun dropVanished(predicate: (VanishedDirectory) -> Boolean) {
+        val gone = synchronized(vanishedLock) {
+            val taken = vanishedDirectories.filter(predicate)
+            vanishedDirectories.removeAll(predicate)
+            taken
+        }
+        gone.forEach { consumeStaleUploadsUnder(File(it.localPath)) }
+    }
+
+    /**
+     * Drops every journal entry under [mirrorRoot], for when the mirror itself is
+     * going away.
+     *
+     * An entry outlives its mirror otherwise, and the damage is delayed rather
+     * than avoided: the folder's permission lapses, the mirror is reclaimed with
+     * the entry still recorded, and a re-grant weeks later hashes back to the same
+     * path. The first sync after it copies the device down with the mirror absent,
+     * so the entry is not consumed; an edit made on the device after that is then
+     * read back as this app's own interrupted upload and thrown away in favour of
+     * the stale copy. Reclaiming the mirror has to reclaim its distrust with it.
+     */
+    internal fun clearUploadsUnder(mirrorRoot: File) {
+        synchronized(uploadJournalLock) {
+            try {
+                val journal = uploadJournal()
+                if (!journal.isFile) return
+                val prefix = mirrorRoot.absolutePath + File.separator
+                val all = readUploadJournal(journal)
+                val kept = all.filterNot { it.startsWith(prefix) }
+                if (kept.size != all.size) rewriteJournal(kept)
+            } catch (e: Exception) {
+                Logger.w(tag, "Could not clear the upload records under ${mirrorRoot.name}: ${e.message}")
+            }
+        }
+    }
+
+    internal fun uploadsInFlight(): Set<String> = synchronized(uploadJournalLock) {
+        try {
+            val journal = uploadJournal()
+            if (journal.isFile) readUploadJournal(journal).filter { it.isNotBlank() }.toSet()
+            else emptySet()
+        } catch (e: Exception) {
+            // Said rather than swallowed: an unreadable journal silently disables
+            // the whole bracket, and that is worth a log line when it happens.
+            Logger.w(tag, "Could not read the upload journal: ${e.message}")
+            emptySet()
+        }
+    }
+
+    /** Reads escaped journals while preserving literal backslashes in older journals. */
+    private fun readUploadJournal(journal: File): List<String> {
+        val lines = journal.readLines()
+        return if (lines.firstOrNull() == UPLOAD_JOURNAL_HEADER) {
+            lines.drop(1).map(::unescapeRecordPath)
+        } else lines
+    }
+
+    /**
+     * Replaces the journal in one step, or leaves the previous content exactly
+     * where it was.
+     *
+     * Caller must hold [uploadJournalLock]. The rename is the atomic half; a
+     * truncate-and-write here would lose every bracket at once to a process death
+     * in the middle, which is the one failure this file exists to remember across.
+     * This protects process interruption, without promising persistence after power loss.
+     */
+    private fun rewriteJournal(lines: List<String>) {
+        val journal = uploadJournal()
+        if (lines.isEmpty()) {
+            journal.delete()
+            return
+        }
+        val tmp = File(journal.parentFile, journal.name + PARTIAL_SUFFIX)
+        val escaped = lines.any { escapeRecordPath(it) != it }
+        val body = if (escaped) {
+            listOf(UPLOAD_JOURNAL_HEADER) + lines.map(::escapeRecordPath)
+        } else lines
+        tmp.writeText(body.joinToString("\n"))
+        if (!tmp.renameTo(journal)) {
+            tmp.delete()
+            throw IOException("Could not replace the upload journal")
+        }
+    }
+
+    /**
+     * Puts a locally created file into the SAF tree, writing into the document that
+     * already carries that name rather than adding a second one.
+     *
+     * [DocumentsContract.createDocument] does not merge: handed a name the folder
+     * already has, a provider invents "notes (1).txt" and the user's file quietly
+     * forks. Two ordinary things arrive here as a create: the rename
+     * [copyDocumentToLocal] performs to move a finished copy into place, and any local
+     * rename over an existing name, which is what `mv` and a git checkout do. Resolving
+     * first is also what makes the MODIFY-on-unknown fallback in [processWriteBack]
+     * safe to keep.
+     */
+    private fun createInSaf(
+        localFile: File, parentSafUri: Uri, treeUri: Uri, mirrorRoot: File,
+        access: OutboundAccess? = null, mutation: ProviderMutation? = null,
+    ) {
+        if (isLink(localFile)) return
+        val created = createOneInSaf(localFile, parentSafUri, treeUri, mirrorRoot, access, mutation)
+        if (created == null) {
+            // The provider refused, and the file exists only inside the app. Exactly
+            // what onWriteBackFailed already means, so it says it rather than a second
+            // wording of the same fact. Until this line the caller returned on the null
+            // and the user was never told: a file they created in the editor simply was
+            // not on the device, and the difference only shows after an uninstall.
+            announceLost(localFile)
+            return
+        }
+        if (created.localFile.isDirectory) {
+            // A directory that just appeared brings whatever is inside it; without
+            // this it landed on the device empty and its files stayed in the mirror.
+            // What it cannot do is stand in for a copy that already exists on the
+            // device: it stops at [MAX_UPLOAD_ENTRIES] and excludes whatever
+            // [SKIP_DIRECTORIES] kept out of the mirror. That is why a rename does not
+            // come through here at all when [handleMirrorEvent] can pair its two halves
+            // it renames the device's document instead, and why the old name is
+            // never deleted when it cannot.
+            createChildrenInSaf(created.localFile, created.uri, treeUri, mirrorRoot, access, mutation = mutation)
+        }
+    }
+
+    /**
+     * Creates or opens the document for [localFile] under [parentSafUri], writing its
+     * bytes if it is a file, and returns the document's URI.
+     *
+     * Does not descend. [createInSaf] owns that, so that the recursion lives in one
+     * place and this stays the single-entry operation both it and
+     * [createChildrenInSaf] need.
+     *
+     * The returned mirror path follows any name the provider rewrote. Callers that walk
+     * descendants use that path rather than the requested name.
+     */
+    private fun createOneInSaf(
+        localFile: File, parentSafUri: Uri, treeUri: Uri, mirrorRoot: File,
+        access: OutboundAccess? = null, mutation: ProviderMutation? = null,
+    ): CreatedDocument? {
+        if (access != null) {
+            return withCurrent(access) { createOneInSaf(localFile, parentSafUri, treeUri, mirrorRoot, mutation = mutation) }
+        }
+        if (mutation == null) {
+            val owned = claimProviderMutationWithin(parentSafUri, providerClaimWaitMs) ?: return null
+            try {
+                return createOneInSaf(localFile, parentSafUri, treeUri, mirrorRoot, mutation = owned)
+            } finally {
+                releaseProviderMutation(owned)
+            }
+        }
+        if (!ownsProviderMutation(parentSafUri, mutation)) return null
+        var file = localFile
+        return try {
+            if (isLink(localFile) || (!localFile.isDirectory && !localFile.isFile)) return null
+            val parentDocId = DocumentsContract.getDocumentId(parentSafUri)
+            val existing = findChildDocument(treeUri, parentDocId, localFile.name)
+            val existingDocId = existing?.docId
+            if (existing?.isDirectory != null && existing.isDirectory != localFile.isDirectory) {
+                // The device holds the other kind under this name. Writing a file into a
+                // folder, or making entries inside a file, is refused by the provider and
+                // was tried anyway, twice, on every save; the entry stays inside the app
+                // and the next open sets it aside next to the device's, see
+                // [clearKindConflict]. The caller says so.
+                Logger.w(
+                    tag,
+                    "Not writing ${localFile.name} back: the device holds a " +
+                        "${if (existing.isDirectory) "folder" else "file"} under that name",
+                )
+                return null
+            }
+            val docUri = if (existingDocId != null) {
+                DocumentsContract.buildDocumentUriUsingTree(treeUri, existingDocId)
+            } else {
+                // A new empty document must already have recoverable local bytes.
+                if (localFile.isFile) openOutboundSource(localFile, mirrorRoot).use { }
+                else validateOutboundDirectory(localFile, mirrorRoot)
+                if (localFile.isFile && !recordUploadIntent(localFile.absolutePath)) {
+                    announceLost(localFile)
+                    return null
+                }
+                val mimeType = if (localFile.isDirectory) {
+                    DocumentsContract.Document.MIME_TYPE_DIR
+                } else {
+                    CREATED_FILE_MIME_TYPE
+                }
+                DocumentsContract.createDocument(
+                    context.contentResolver, parentSafUri, mimeType, localFile.name
+                )
+            } ?: return null
+
+            // The device folder decides what the file is called and the mirror follows;
+            // [mirrorNamedAsStored] holds the whole argument, including why the three
+            // obvious repairs are each worse. Only for a document this call created: one
+            // that was already there was found BY the mirror's name, so the two agree.
+            file =
+                if (existingDocId == null) mirrorNamedAsStored(docUri, localFile) else localFile
+
+            var delivered = false
+            if (file.isFile) {
+                // The same question [handleMirrorEvent] asks before queueing a job, asked
+                // again here because this path does not come through it. A directory
+                // create, or a move whose other half never arrived, walks the tree
+                // through [createChildrenInSaf] and reaches every child directly.
+                //
+                // `existingDocId != null` IS the provider answer for this child, already
+                // paid for above, so unlike the event path this costs no extra binder
+                // call. A file this sync could not read, whose document still exists on
+                // the device, would otherwise be written back as whatever placeholder the
+                // mirror holds -- truncating a document nothing here has ever seen.
+                if (writeWouldReplaceUnreadDocument(
+                        file.absolutePath, existingDocId != null,
+                    )
+                ) {
+                    refuseUnreadDocument(file, file.name)
+                } else if (existingDocId == null || !keepsDeviceEdit(file, docUri, mirrorRoot, access, preserveUnknown = true)) {
+                    // A document this call just created is empty, and a stale entry left
+                    // by a deleted namesake would otherwise set that emptiness aside.
+                    val written = withCurrent(access) { writeLocalToSaf(file, docUri, mirrorRoot, mutation) }
+                    delivered = written == true
+                    if (written == null) {
+                        announceLost(file)
+                    }
+                }
+            }
+            // Cache the document ID for future write-back lookups, but only while the
+            // cache speaks for this job's tree and knows the parent. A miss is not "the
+            // parent is the root" -- initialSync puts the root in under the empty key,
+            // so the root is found. The label test is what a drain outliving its own
+            // lifecycle needs: the cache then belongs to the next folder, and writing
+            // the entry anyway would file a document from the old folder under a
+            // plausible name in the new one, so the next write-back for that name would
+            // land in the wrong folder entirely. Where two granted folders nest, a
+            // document id can be the same in both trees, which is why the label is
+            // tested rather than the reverse lookup trusted to miss.
+            val parentRelPath = synchronized(docIdCache) {
+                if (cacheTree == treeUri) {
+                    docIdCache.entries.firstOrNull { it.value == parentDocId }?.key
+                } else {
+                    null
+                }
+            }
+            if (parentRelPath != null) {
+                // [file] and not [localFile]. Where the provider stored the document under
+                // another name the mirror was renamed to match above, and this entry has to
+                // name the document as both sides now spell it. Filed under the requested
+                // name instead, the MOVED_FROM that rename raises resolves straight to this
+                // document and the write-back deletes it.
+                val relPath = if (parentRelPath.isEmpty()) file.name
+                    else "$parentRelPath/${file.name}"
+                withCurrentMemory(access) {
+                    cacheDocId(treeUri, relPath, DocumentsContract.getDocumentId(docUri))
+                }
+            }
+            CreatedDocument(docUri, file, delivered)
+        } catch (e: Exception) {
+            // The class rather than the message, for the reason [copyDocumentToLocal]
+            // spells out: a provider quotes the document URI in its own exception, and
+            // the platform provider builds that URI out of the user's own directory path.
+            Logger.w(tag, "Failed to create ${localFile.name} in SAF: ${e.javaClass.simpleName}")
+            null
+        } finally {
+            withCurrentMemory(access) {
+                for (candidate in setOf(localFile, file)) {
+                    if (!candidate.exists()) consumeStaleUploadRecord(candidate.absolutePath)
+                }
+            }
+        }
+    }
+
+    private fun storedDocumentName(docUri: Uri): String? = try {
+            context.contentResolver.query(
+                docUri,
+                arrayOf(DocumentsContract.Document.COLUMN_DISPLAY_NAME),
+                null, null, null,
+            )?.use { cursor ->
+                val nameIndex = cursor.getColumnIndex(
+                    DocumentsContract.Document.COLUMN_DISPLAY_NAME
+                )
+                if (nameIndex >= 0 && cursor.moveToFirst()) cursor.getString(nameIndex) else null
+            }
+        } catch (e: Exception) {
+            Logger.d(
+                tag,
+                "Could not read back a document name: ${e.javaClass.simpleName}",
+            )
+            null
+        }
+
+    /**
+     * Renames the mirror copy to the name the device folder really gave the document, and
+     * answers with the file under that name.
+     *
+     * The name is the only thing tying a mirror file to its device document: every lookup
+     * here is [findChildDocId] by display name, and the cache below is keyed by the
+     * mirror's own path. A provider that renames on create therefore leaves the two sides
+     * disagreeing about what the file is called, and nothing afterwards converges. This
+     * was written as a warning and left unrepaired on the reading that it costs one
+     * duplicate; it does not stop there. The next [initialSync] fetches the stored name
+     * into the mirror beside the original, so the editor shows two files, and then
+     * [uploadMirrorOnlyDocuments] reads the original as a file only the mirror has and
+     * creates it again. Its record cannot say otherwise, because a locally created file
+     * was never recorded, and for the same reason [reconcileDeletions] will not tidy any
+     * of it. So the device folder gains one more document on every open, without bound.
+     * That is what a user reports as the editor making files they did not ask for.
+     *
+     * The mirror follows the device rather than the other way round, because the three
+     * other repairs are each worse. Renaming the document back hands the same name to the
+     * same normaliser that just rejected it. Deleting the document it did make takes the
+     * user's bytes off the device to tidy up a name. Refusing the create leaves the file
+     * inside the app only. What is left is the mirror, which is this app's own copy:
+     * [setAsideDivergedMirror] already renames one out from under an open editor, and what
+     * tells the user here is what tells them there, the name in the explorer.
+     *
+     * What used to cause this was the type this app asked for, which [CREATED_FILE_MIME_TYPE]
+     * settles for every extension. What is left is a provider normalising the name itself,
+     * as the platform one does for characters FAT cannot hold, and a name the folder turns
+     * out to hold already, which providers answer by inventing "notes (1).txt".
+     *
+     * Directory callers follow the returned path and remap their remaining children, so
+     * normalising a directory cannot strand its descendants under the previous name.
+     *
+     * **The rename is observed, and that is what decides where the caller caches.** On the
+     * write-back path the mirror is watched, so this raises MOVED_FROM on the old name and
+     * MOVED_TO on the new one. The MOVED_FROM arrives as a DELETE whose document is
+     * resolved from the old path, and it resolves to nothing only because the caller files
+     * this document under the name returned here. Filed under the requested name instead,
+     * that DELETE calls `deleteDocument` on the document this call just made. The MOVED_TO
+     * arrives as a CREATE, finds the document by its stored name and writes the same bytes
+     * into it once more, which costs one provider write and changes nothing.
+     *
+     * **What it does not close is the old name being written again.** Nothing here
+     * remembers that the folder refused a name, and the mirror no longer carries it, so a
+     * producer still holding the old spelling starts the whole thing from the top: the
+     * lookup misses, because the device has never held that name, `createDocument` makes a
+     * second document, which the provider names past the first as "notes (1).txt", and the
+     * mirror follows that one instead. A checked-out repository is where it bites, since
+     * the tracked spelling is the one the folder will not store: the working tree reads
+     * dirty against a path the mirror gave up, and every `git checkout` of it leaves one
+     * more document. Shipped this way because the bound is how often something writes the
+     * old name, against one more document on every open of the folder while the mirror
+     * kept the refused name. Closing it needs a per-folder memory of the names a provider
+     * would not store, scrubbed where [initialSync] scrubs [unfetched]; the count is
+     * pinned in `SafCreatedDocumentNameTest` so the ceiling is measured rather than
+     * asserted.
+     *
+     * Three refusals, each leaving the caller exactly where it was:
+     * - a provider that will not answer for the document it just made proves nothing
+     *   either way, and the create itself succeeded;
+     * - a stored name that is not one path segment would move the file out of the mirror,
+     *   which is the reason [isSafeSegment] exists on the way in;
+     * - a mirror that already holds the stored name, because `rename(2)` replaces its
+     *   destination silently and that copy is the device's own, fetched by an earlier sync.
+     */
+    private fun mirrorNamedAsStored(
+        docUri: Uri,
+        localFile: File,
+        stored: String? = storedDocumentName(docUri),
+    ): File {
+        if (!localFile.isFile && !localFile.isDirectory) return localFile
+        if (stored == null || stored == localFile.name) return localFile
+
+        val renamed = if (isSafeSegment(stored)) File(localFile.parentFile, stored) else null
+        val owner = session
+        var followed = false
+        if (renamed != null && !renamed.exists() &&
+            (localFile.isDirectory || recordUploadIntent(renamed.absolutePath))
+        ) {
+            val identity = if (localFile.isDirectory) runCatching {
+                Files.readAttributes(localFile.toPath(), BasicFileAttributes::class.java,
+                    LinkOption.NOFOLLOW_LINKS).fileKey()
+            }.getOrNull() else null
+            val expected = identity?.let { localFile.absolutePath to it }
+            if (expected != null && owner.normalizedDirectories.size < MAX_WATCHED_DIRECTORIES) {
+                owner.normalizedDirectories[renamed.absolutePath] = expected
+            }
+            followed = localFile.renameTo(renamed)
+            if (!followed && expected != null) owner.normalizedDirectories.remove(renamed.absolutePath, expected)
+        }
+        if (!followed) {
+            if (renamed != null && !renamed.exists()) consumeStaleUploadRecord(renamed.absolutePath)
+            Logger.w(
+                tag,
+                "The device folder stored ${localFile.name} as $stored and the mirror could " +
+                    "not follow; the editor will show both the next time the folder is opened",
+            )
+            return localFile
+        }
+        if (renamed!!.isDirectory) {
+            renameUploadsUnder(localFile, renamed)
+            renameDeviceMemoryUnder(localFile, renamed)
+        } else consumeStaleUploadRecord(localFile.absolutePath)
+        Logger.i(
+            tag,
+            "The device folder stored ${localFile.name} as $stored; the mirror copy now " +
+                "carries that name too",
+        )
+        return renamed
+    }
+
+    /**
+     * What the device reports for [docUri] now, as (COLUMN_LAST_MODIFIED, COLUMN_SIZE), or
+     * null when the provider does not answer. A missing column, and a negative size, read as
+     * 0, the rules [walkTree] applies, so both sides of a [deviceSeen] comparison are read
+     * alike and no answer carries [UNANSWERED_SIZE].
+     */
+    private fun deviceStamp(docUri: Uri): Pair<Long, Long>? = try {
+        context.contentResolver.query(
+            docUri,
+            arrayOf(
+                DocumentsContract.Document.COLUMN_LAST_MODIFIED,
+                DocumentsContract.Document.COLUMN_SIZE,
+            ),
+            null, null, null,
+        )?.use { cursor ->
+            if (!cursor.moveToFirst()) return@use null
+            val modifiedIndex =
+                cursor.getColumnIndex(DocumentsContract.Document.COLUMN_LAST_MODIFIED)
+            val sizeIndex = cursor.getColumnIndex(DocumentsContract.Document.COLUMN_SIZE)
+            val modified = if (modifiedIndex >= 0 && !cursor.isNull(modifiedIndex)) {
+                cursor.getLong(modifiedIndex)
+            } else {
+                0L
+            }
+            val size = if (sizeIndex >= 0) cursor.getLong(sizeIndex).coerceAtLeast(0) else 0L
+            modified to size
+        }
+    } catch (e: Exception) {
+        null
+    }
+
+    /** The current kind of this identity, which a provider may reuse after deletion. */
+    private fun documentIsDirectory(docUri: Uri): Boolean? = try {
+        context.contentResolver.query(
+            docUri, arrayOf(DocumentsContract.Document.COLUMN_MIME_TYPE), null, null, null,
+        )?.use { cursor ->
+            val index = cursor.getColumnIndex(DocumentsContract.Document.COLUMN_MIME_TYPE)
+            if (index < 0 || !cursor.moveToFirst()) return@use null
+            val mime = cursor.getString(index)
+            if (mime.isNullOrEmpty()) null else mime == DocumentsContract.Document.MIME_TYPE_DIR
+        }
+    } catch (_: Exception) {
+        null
+    }
+
+    /**
+     * The SHA-256 of what the device holds for [docUri], read without keeping a copy, or
+     * null when the provider will not give it or holds more than [limit] bytes, where the
+     * read stops: more bytes than a digest covers cannot hash to it.
+     */
+    private fun deviceSha256(docUri: Uri, limit: Long): ByteArray? = try {
+        withStableDocumentRead(docUri) {
+            context.contentResolver.openInputStream(docUri)?.use { sha256(it, limit)?.first }
+        }
+    } catch (e: Exception) {
+        null
+    }
+
+    /**
+     * Creates everything under [localDir] on the device, beneath [dirSafUri].
+     *
+     * Iterative rather than recursive through [createInSaf], and that is deliberate:
+     * [uploadPlan] already returns parents before children, so each entry's
+     * parent document exists by the time it is reached, and the URI of every
+     * directory created along the way is remembered here. Recursing instead would
+     * re-query the provider for a parent it had just made.
+     *
+     * A child whose parent is missing from [created] is skipped rather than guessed
+     * at. That happens when the parent's own creation failed, and inventing a place
+     * to put the child would file it somewhere the user did not put it.
+     */
+    private fun createChildrenInSaf(
+        localDir: File, dirSafUri: Uri, treeUri: Uri, mirrorRoot: File, access: OutboundAccess? = null,
+        delivered: MutableSet<String>? = null,
+        mutation: ProviderMutation? = null,
+    ) {
+        val plan = uploadPlan(localDir, MAX_UPLOAD_ENTRIES)
+        val entries = plan.entries
+        if (entries.isEmpty()) return
+
+        val created = mutableMapOf(localDir.absolutePath to dirSafUri)
+        val movedDirectories = mutableMapOf<String, String>()
+        var made = 0
+        for (original in entries) {
+            if (delivered?.contains(original.absolutePath) == true) {
+                made++
+                continue
+            }
+            val entry = movedMirrorFile(original, movedDirectories)
+            // Split rather than chained: `parentFile` is a platform type, so the
+            // chained form indexed the map with a String? and the compiler warned
+            // about it. An entry with no parent cannot be placed anywhere.
+            val parentPath = original.parentFile?.absolutePath ?: continue
+            val parentUri = created[parentPath] ?: continue
+            createOneInSaf(entry, parentUri, treeUri, mirrorRoot, access, mutation)?.let { result ->
+                if (result.localFile.isDirectory) {
+                    created[original.absolutePath] = result.uri
+                    movedDirectories[original.absolutePath] = result.localFile.absolutePath
+                    made++
+                } else if (result.delivered) {
+                    delivered?.add(original.absolutePath)
+                    made++
+                }
+            }
+        }
+        // The walk's own answer, not `entries.size >= MAX_UPLOAD_ENTRIES`. That test
+        // reported a directory holding exactly the cap as incompletely copied when every
+        // entry of it had just been created, because the walk stops at the cap and so
+        // can never return more than it.
+        val capped = plan.truncated
+        if (capped) {
+            Logger.w(tag, "Stopped at $MAX_UPLOAD_ENTRIES entries under ${localDir.name}; " +
+                "the rest were not copied to the device")
+        }
+        Logger.i(tag, "Created $made of ${entries.size} entries under ${localDir.name}")
+
+        // One notice for the directory, not one per entry. `made` already counts both
+        // ways an entry can be lost: a creation the provider refused, and a child
+        // skipped because its own parent was never created. Reading the shortfall off
+        // that count is what keeps a new silent branch from appearing here later, the
+        // way one did when this reported only to the log.
+        //
+        // The comment above the cap used to say a log line was the only place that
+        // could say so. That was true when it was written and stopped being true when
+        // the notice channel arrived, which is the shape a reason comment rots in.
+        val lost = entries.size - made
+        if (lost > 0 || capped) onUploadIncomplete(localDir, lost, capped)
+    }
+
+    /**
+     * Looks up a direct child of [parentDocId] by display name, from the provider.
+     *
+     * Deliberately not through [docIdCache]: both callers use the answer to choose
+     * between writing into a document and making a new one, and the cache can still
+     * name a document deleted since it was filled.
+     */
+    private fun findChildDocId(treeUri: Uri, parentDocId: String, name: String): String? =
+        try {
+            findChildDocument(treeUri, parentDocId, name)?.docId
+        } catch (_: Exception) {
+            null
+        }
+
+    /**
+     * [findChildDocId] with what kind of document the provider says it is.
+     *
+     * A name is not an identity: a folder and a file can take the same name in turn, and a
+     * caller that writes into what it found by name has to know it found the kind it meant.
+     * [ChildDocument.isDirectory] is null where the provider reported no usable type, and
+     * a caller treats that as unknown rather than as a file.
+     */
+    private fun findChildDocument(treeUri: Uri, parentDocId: String, name: String): ChildDocument? {
+        val childrenUri = DocumentsContract.buildChildDocumentsUriUsingTree(treeUri, parentDocId)
+        val listing = context.contentResolver.query(
+            childrenUri,
+            arrayOf(
+                DocumentsContract.Document.COLUMN_DOCUMENT_ID,
+                DocumentsContract.Document.COLUMN_DISPLAY_NAME,
+                DocumentsContract.Document.COLUMN_MIME_TYPE,
+            ),
+            null, null, null,
+        ) ?: throw IOException("The device directory listing is unavailable")
+        return listing.use { cursor ->
+            if (cursor.extras?.let {
+                    it.getBoolean(DocumentsContract.EXTRA_LOADING) ||
+                        it.containsKey(DocumentsContract.EXTRA_ERROR)
+                } == true
+            ) throw IOException("The device directory listing is incomplete")
+            val idIndex = cursor.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_DOCUMENT_ID)
+            val nameIndex = cursor.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_DISPLAY_NAME)
+            val mimeIndex = cursor.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_MIME_TYPE)
+            var found: ChildDocument? = null
+            while (cursor.moveToNext()) {
+                if (cursor.getString(nameIndex) != name) continue
+                if (found != null) throw IOException("The device directory has ambiguous names")
+                val mime = cursor.getString(mimeIndex)
+                found = ChildDocument(
+                    cursor.getString(idIndex),
+                    mime?.takeIf { '/' in it }
+                        ?.let { it == DocumentsContract.Document.MIME_TYPE_DIR },
+                )
+            }
+            found
+        }
+    }
+
+    private class CreatedDocument(val uri: Uri, val localFile: File, val delivered: Boolean)
+
+    private fun movedMirrorFile(file: File, moved: Map<String, String>): File {
+        val parent = moved.keys.filter { file.absolutePath.startsWith(it + File.separator) }
+            .maxByOrNull { it.length } ?: return file
+        return File(moved.getValue(parent) + file.absolutePath.removePrefix(parent))
+    }
+
+    /** A direct child of a device directory: its id, and whether it is a directory when known. */
+    private class ChildDocument(val docId: String, val isDirectory: Boolean?)
+
+    /**
+     * Gives an existing device document a new display name, in place.
+     *
+     * The whole point is what it does *not* touch: the provider moves the document itself,
+     * so everything beneath it travels along, including the `.git` and `node_modules` the
+     * mirror never held and the files past [MAX_UPLOAD_ENTRIES] it could not have re-sent.
+     * Nothing else here can move a subtree that the mirror does not fully contain.
+     *
+     * @return the renamed document's URI, or null if the provider refused it.
+     */
+    private fun renameInSaf(safDocUri: Uri, newName: String): Uri? = try {
+        DocumentsContract.renameDocument(context.contentResolver, safDocUri, newName)
+    } catch (e: Exception) {
+        Logger.w(tag, "Could not rename a document to $newName: ${e.javaClass.simpleName}")
+        null
+    }
+
+    /**
+     * Moves an existing device document into a different parent, in place.
+     *
+     * The counterpart to [renameInSaf] for the half of the problem a rename cannot
+     * express. It carries the subtree for the same reason: the provider relocates the
+     * document itself, so the `.git` and `node_modules` the mirror never held travel with
+     * it. Without this, dragging `src/util` into `src/legacy/` left the old copy standing
+     * on the device, and reopening the folder copied it back down beside the new one.
+     *
+     * `moveDocument` is a different call from `renameDocument` behind a different flag
+     * (`FLAG_SUPPORTS_MOVE` rather than `FLAG_SUPPORTS_RENAME`), so a provider may offer
+     * one and not the other. A null return puts the caller back on the pre-existing
+     * fallback: build the new name from the mirror and leave the old copy alone.
+     *
+     * @return the document's URI in its new parent, or null when the provider would not
+     *   move it.
+     */
+    private fun moveInSaf(safDocUri: Uri, sourceParentUri: Uri, targetParentUri: Uri): Uri? = try {
+        DocumentsContract.moveDocument(
+            context.contentResolver, safDocUri, sourceParentUri, targetParentUri
+        )
+    } catch (e: Exception) {
+        Logger.w(tag, "Could not move a document between directories: ${e.javaClass.simpleName}")
+        null
+    }
+
+    /**
+     * Deletes a document from the SAF tree.
+     */
+    /**
+     * Removes the document, and answers whether the device folder agreed.
+     *
+     * The Boolean is the point. `deleteDocument` reports a refusal by returning
+     * false as readily as by throwing, and both used to end here: the mirror
+     * entry is unlinked either way, so the file left the editor while the device
+     * kept it, and the next open copied it back. What a user sees is a file they
+     * deleted returning, with nothing in between saying why.
+     */
+    private fun deleteFromSaf(safDocUri: Uri): Boolean = try {
+        DocumentsContract.deleteDocument(context.contentResolver, safDocUri)
+    } catch (e: Exception) {
+        Logger.w(tag, "Failed to delete from SAF: ${e.javaClass.simpleName}")
+        false
+    }
+
+    // -- Internal: Write-back Processing --
+
+    private fun processWriteBack(session: WatchSession, job: SyncJob) {
+        val mirrorRoot = job.mirrorRoot ?: session.root
+        val access = mirrorRoot?.let {
+            outboundAccess(it, job.generation ?: session.generation)
+        }
+        // Small debounce: skip a job that a more recent one for the same path makes
+        // pointless, see [supersededByLaterJob]. Scoped to the session the job came off,
+        // so it cannot see, or be blinded by, the jobs of a folder that is closing or one
+        // that has just opened.
+        if (session.queue.any {
+                it.localPath == job.localPath && it.timestamp > job.timestamp &&
+                    supersededByLaterJob(job, it)
+            }
+        ) {
+            return
+        }
+
+        Logger.d(tag, "Write-back: ${job.type} ${job.localPath}")
+
+        when (job.type) {
+            SyncType.MODIFY -> {
+                val localFile = File(job.localPath)
+                if (!localFile.exists()) return
+                if (job.safDocUri != null) {
+                    // [handleMirrorEvent]'s unread-document guard again, where the write
+                    // happens, because a job can outlive the answer it was queued under. A
+                    // reopen while the closing drain is still inside a slow provider read
+                    // can find the device copy unreadable and leave the listed stamp as
+                    // what [keepsDeviceEdit] compares against, so a save queued before
+                    // the reopen, or the hold that read leaves once it fails, went over a
+                    // document nothing had read. A [retryHeldBack] job never passes that
+                    // guard at all. Asked as the delete's recheck asks it, through
+                    // [providerHolds], so only a device that answers "gone" lets the save
+                    // through: a stamp query asked instead read an unanswered query as no
+                    // document, and the save went over the one the reopen could not read. A
+                    // try carries no tree to walk, so one of such a file is refused. The
+                    // hold ends with the refusal, or the loop would try it again on every
+                    // idle turn. This and the delete's recheck in [keepsDeviceDocument] ask
+                    // this engine's own [unfetched]. Generation admission below also rejects
+                    // a drain whose mirror was reopened by a replacement engine.
+                    if (holdsUnread(job.localPath, isDirectory = false) &&
+                        writeWouldReplaceUnreadDocument(
+                            job.localPath,
+                            job.safTreeUri?.let { providerHolds(it, job.relativePath) } != false,
+                        )
+                    ) {
+                        heldBack.remove(job.localPath)
+                        settledHeldWait.remove(job.localPath)
+                        refuseUnreadDocument(localFile, localFile.name)
+                    } else if (mirrorRoot == null) {
+                        announceLost(localFile)
+                    } else if (withCurrent(access) { true } == null) {
+                        // Wait for a previous mutation without holding admission over provider reads.
+                        announceLost(localFile)
+                    } else {
+                        val mutation = claimProviderMutation(job.safDocUri)
+                        if (mutation == null) {
+                            deferWriteBack(localFile, job.safDocUri)
+                        } else try {
+                            if (!keepsDeviceEdit(localFile, job.safDocUri, mirrorRoot, access, preserveUnknown = true)) {
+                                if (withCurrent(access) { writeLocalToSaf(localFile, job.safDocUri, mirrorRoot, mutation) } == null) {
+                                    announceLost(localFile)
+                                }
+                            }
+                        } finally {
+                            releaseProviderMutation(mutation)
+                        }
+                    }
+                } else if (job.safTreeUri != null) {
+                    // FileObserver may report MODIFY instead of CREATE for new files
+                    // (e.g., `echo > file` on Android API 36). Fall through to CREATE.
+                    Logger.d(tag, "MODIFY on unknown file, treating as CREATE: ${localFile.name}")
+                    createInQueuedParent(job, localFile, access, mirrorRoot)
+                }
+            }
+            SyncType.CREATE -> {
+                val localFile = File(job.localPath)
+                if (localFile.exists()) createInQueuedParent(job, localFile, access, mirrorRoot)
+            }
+            SyncType.DELETE -> {
+                // A null uri is NOT the same outcome as a refusal, though it used to
+                // share the branch: [findChildDocId] folds a failed provider query into
+                // the null it returns for genuine absence, so "could not be resolved"
+                // and "is not there" arrive here as one answer. Only the first leaves
+                // the device holding what the editor no longer shows; for the second
+                // both clauses of the notice are false, and it tells the user to go and
+                // delete a file that is not there.
+                //
+                // [providerHolds] is the three-valued form of the same question and is
+                // what the DELETE guard above already uses. Announce unless the device
+                // positively answers "gone": a provider that cannot answer is still
+                // treated as holding, so a transient failure keeps the warning it used
+                // to give.
+                //
+                // A rename queued ahead of this job is the other way a document that was
+                // missing when the event arrived is there by now: after `mv a b && rm -r b`
+                // in one poll the rename runs first, and the children of `b` exist on the
+                // device under that name. That is reported too, and not looked up again by
+                // path and deleted. A deletion cannot be undone, and a lookup at the drain
+                // finds whatever sits at the path by then, which is no longer the document
+                // the event named. The Explorer's own folder delete already leaves the
+                // device copy for the same reason, and deleting the folder again after the
+                // next open resolves it at once.
+                var replacedLocally = false
+                val refused = when {
+                    job.safDocUri == null ->
+                        job.safTreeUri != null &&
+                            providerHolds(job.safTreeUri, job.relativePath) != false
+                    else -> {
+                        val handled = withCurrent(access) {
+                            val mutation = claimProviderMutationWithin(job.safDocUri, providerClaimWaitMs)
+                            if (mutation == null) {
+                                keptOnDevice.add(job.localPath)
+                                keepUnread(File(job.localPath), job.relativePath, job.isDirectory, changed = true)
+                                return@withCurrent true
+                            }
+                            try {
+                                val current = File(job.localPath)
+                                val currentKind = when {
+                                    current.isDirectory -> true
+                                    current.isFile -> false
+                                    else -> null
+                                }
+                                replacedLocally = !isLink(current) && currentKind != null &&
+                                    (currentKind == job.isDirectory ||
+                                        documentIsDirectory(job.safDocUri) == currentKind)
+                                val alreadyGone = !replacedLocally && job.isDirectory && job.safTreeUri != null &&
+                                    providerHolds(job.safTreeUri, job.relativePath) == false
+                                replacedLocally || alreadyGone || keepsDeviceDocument(job, job.safDocUri, access) ||
+                                    deleteFromSaf(job.safDocUri)
+                            } finally {
+                                releaseProviderMutation(mutation)
+                            }
+                        }
+                        if (handled == null) {
+                            keepUnread(File(job.localPath), job.relativePath, job.isDirectory, changed = true)
+                        }
+                        handled == false
+                    }
+                }
+                if (replacedLocally) return
+                if (refused) {
+                    announceDeleteRefused(File(job.localPath))
+                }
+                // Both cleanups below run whatever the device folder decided.
+                // The mirror entry is already unlinked, so what they remove is
+                // stale either way, and skipping them on a refusal would leave
+                // the reclaim reporting the copy for ever as holding work the
+                // device does not have.
+                //
+                // The enqueue resolved that path to the document it was about to
+                // remove, and the resolution is cached. Left behind, the entry
+                // answers for a name the device no longer holds: the next event
+                // on a recreated path writes into the dead document, and a rename
+                // into that name is refused its pair. Nothing else removes these,
+                // so the delete that strands them is the delete that clears them.
+                withCurrentMemory(access) {
+                    if (job.relativePath.isNotEmpty() && job.safTreeUri != null) {
+                        forgetCachedSubtree(job.safTreeUri, job.relativePath)
+                    }
+                    // And the upload record, for the same reason and with the same
+                    // reach. A journal line is keyed by the mirror path and is removed
+                    // only by a write of that path that lands, so a write-back that gave
+                    // up left one standing, deliberately, and nothing ever retired it
+                    // once the file it names went away. Since a file rename arrives here
+                    // as MOVED_FROM, one failed save followed by renaming the file in the
+                    // editor was enough to strand a line for ever, and a stranded line is
+                    // not inert: `SafStorageManager.mayReclaim` reads any line under a
+                    // mirror as "this mirror holds a write that never reached the device",
+                    // so the launch pass kept the mirror and the storage screen described
+                    // it as holding work the device does not, all on the strength of a file
+                    // that is not there. Not that the removal is refused: the bridge
+                    // extension sends `force` for exactly the rows this mislabels, so what
+                    // the user gets is a modal saying the copy holds files that exist
+                    // nowhere else and then the deletion they asked for.
+                    // The claims are what keep this off a path somebody is streaming
+                    // into right now; see [consumeStaleUploadRecord].
+                    if (!File(job.localPath).isFile) consumeStaleUploadRecord(job.localPath)
+                    // A save held back for this path has nothing left to send, and a file
+                    // made again under the name is a new document that its own create
+                    // writes, which ends a hold too. Left standing until then, the hold was
+                    // tried against the deleted document whenever the loop found its queue
+                    // empty before the create's event arrived, which on a provider whose
+                    // ids are not paths fails and reports the new file's save as lost.
+                    heldBack.remove(job.localPath)
+                    settledHeldWait.remove(job.localPath)
+                }
+            }
+            SyncType.RENAME -> {
+                // safDocUri is the document under the *old* name here, and localPath the
+                // new one. Falling back to a create when the provider will not rename is
+                // not a nicety: without it a provider lacking FLAG_SUPPORTS_RENAME would
+                // leave the new name absent from the device entirely, which is worse than
+                // the duplicate this job exists to avoid.
+                //
+                // A rename that succeeds does not re-upload anything, and it should not:
+                // the watcher has been writing every change in that subtree back as it
+                // happened, so re-sending it would be a file-by-file rewrite of a copy
+                // that is already correct, 1500 provider writes for a renamed `src/`,
+                // with every save queued behind them. What that rewrite would also have
+                // done is push mirror files that never reached the device because their
+                // directory fell past [MAX_WATCHED_DIRECTORIES] and no observer ever
+                // reported them. Those stay mirror-only. They were mirror-only before the
+                // rename too, this does not lose them, it just stops incidentally
+                // rescuing them.
+                //
+                // A move to a different directory is a second call and has to come first:
+                // `moveDocument` returns the document's URI in its new home, and renaming
+                // before moving would rename in the old one and then move a URI this code
+                // no longer holds. Where the parents match, `safSourceParentUri` is null
+                // and nothing here changes.
+                //
+                // The destination parent is re-resolved when the event could not resolve
+                // it, because "could not" is usually timing rather than absence:
+                // `mkdir lib && mv util lib/` delivers the MOVED_TO while lib's own
+                // create job is still ahead of this one in the queue, and the answer
+                // from event time cannot see a document that lands a tick later.
+                val localFile = File(job.localPath)
+                val targetParentUri = job.safParentUri
+                    ?: if (job.safSourceParentUri != null && job.relativePath.isNotEmpty()) {
+                        // Only while the cache still belongs to this job's tree. A
+                        // drain can outlive its folder, and a cache refilled for the
+                        // next one answers a relative path with the wrong folder's
+                        // documents; declining costs the documented stale-copy
+                        // fallback, which the pre-existing behaviour was anyway.
+                        job.safTreeUri?.takeIf { it == cacheTree }?.let {
+                            resolveDocumentUri(it, File(job.relativePath).parent ?: "", access)
+                        }
+                    } else {
+                        null
+                    }
+                if (withCurrent(access) {
+                    val mutation = job.safDocUri?.let { claimProviderMutationWithin(it, providerClaimWaitMs) }
+                    if (mutation == null) {
+                        announceLost(localFile)
+                        return@withCurrent
+                    }
+                    try {
+                        val moved = when {
+                            job.safSourceParentUri != null && targetParentUri != null ->
+                                moveInSaf(job.safDocUri, job.safSourceParentUri, targetParentUri)
+                            // A rename inside one directory has nothing to move. This arm is
+                            // only that case: [handleMirrorEvent] does not offer a RENAME at
+                            // all when the pair crossed directories and the source parent
+                            // could not be resolved, because renaming in the parent the
+                            // document is already in is not the move that was asked for.
+                            job.safSourceParentUri == null -> job.safDocUri
+                            // A cross-directory move that could not be attempted has not
+                            // happened, whatever an unchanged name implies; reporting it
+                            // done is what left the device holding the old parent forever.
+                            else -> null
+                        }
+                        // Renaming is skipped when the name did not change, which is the common
+                        // shape of a move: dragging `src/util` into `src/legacy/` keeps the name.
+                        // Decided from the two paths rather than from the moved document's URI,
+                        // because a document ID is not required to be a path and reading a name
+                        // out of one is only right on the providers where it happens to be.
+                        val nameUnchanged = job.previousName == localFile.name
+                        val renamed = moved?.let {
+                            if (nameUnchanged) it else renameInSaf(it, localFile.name)
+                        }
+                        // Whether the document is now where the user put it, under whatever
+                        // name. The second arm of the `when` above hands back the document that
+                        // never moved, so a non-null [moved] on its own does not mean a move
+                        // happened; only the first arm calls `moveDocument`, and it is the arm
+                        // that requires a source parent.
+                        val relocated = moved != null && job.safSourceParentUri != null
+                        val storedUri = renamed ?: moved?.takeIf { relocated }
+                        if (storedUri != null) {
+                            job.previousPath?.let { previous ->
+                                heldBack.keys.removeAll { it == previous || it.startsWith(previous + File.separator) }
+                                settledHeldWait.keys.removeAll { it == previous || it.startsWith(previous + File.separator) }
+                            }
+                            val storedName = storedDocumentName(storedUri)
+                            if (storedName != null && isSafeSegment(storedName)) {
+                                val actualFile = File(localFile.parentFile, storedName)
+                                val actualMirror = mirrorNamedAsStored(storedUri, localFile, storedName)
+                                job.previousPath?.let {
+                                    renameDeviceMemoryUnder(File(it), actualFile)
+                                }
+                                if (job.safTreeUri != null && job.mirrorRoot != null) {
+                                    val actualPath = actualFile.relativeTo(job.mirrorRoot).path
+                                    forgetCachedSubtree(job.safTreeUri, job.relativePath)
+                                    cacheDocId(job.safTreeUri, actualPath, DocumentsContract.getDocumentId(storedUri))
+                                    if (actualMirror == actualFile) {
+                                        val following = if (actualMirror != localFile) {
+                                            session.queue.filter {
+                                                (it.type == SyncType.CREATE || it.type == SyncType.MODIFY) &&
+                                                    it.localPath.startsWith(localFile.absolutePath + File.separator)
+                                            }.map { it.relativePath }
+                                        } else emptyList()
+                                        replayRenamedWrites(job, actualMirror, job.renamedSaves + following, mutation)
+                                    }
+                                }
+                            } else {
+                                // The provider moved, but its new path cannot be verified yet.
+                                unfetched.add(localFile.parentFile.absolutePath)
+                                announceLost(localFile)
+                            }
+                        }
+                        if (renamed == null && !relocated && localFile.exists() &&
+                            targetParentUri != null && job.safTreeUri != null
+                        ) {
+                            if (mirrorRoot != null) createInSaf(localFile, targetParentUri, job.safTreeUri, mirrorRoot, mutation = mutation)
+                            else announceLost(localFile)
+                        } else if (renamed == null && relocated) {
+                            // The move landed and the rename did not, which a provider carrying
+                            // FLAG_SUPPORTS_MOVE and not FLAG_SUPPORTS_RENAME produces. The
+                            // create fallback is the wrong answer here and used to run anyway:
+                            // the device would keep the whole moved subtree under its OLD name
+                            // in the NEW parent and gain a second copy under the new name, built
+                            // from the mirror, capped at [MAX_UPLOAD_ENTRIES] and missing
+                            // everything [SKIP_DIRECTORIES] kept out. The fallback exists for
+                            // the case where nothing moved at all, where the alternative is the
+                            // new name being absent from the device entirely. That is not this
+                            // case: the content is on the device, whole, in the right place, and
+                            // wearing the old name.
+                            Logger.w(
+                                tag,
+                                "Moved ${localFile.name} on the device but could not rename it; " +
+                                    "it is in the right folder under its previous name",
+                            )
+                        }
+                    } finally {
+                        releaseProviderMutation(mutation)
+                    }
+                } == null) onWriteBackFailed(localFile)
+            }
+        }
+    }
+
+    /** Replays queued writes without repeating a file whose upload already completed. */
+    private fun replayRenamedWrites(job: SyncJob, directory: File, paths: List<String>, mutation: ProviderMutation) {
+        val treeUri = job.safTreeUri ?: return
+        val root = job.mirrorRoot ?: return
+        val delivered = mutableSetOf<String>()
+        for (path in paths.distinct().sortedBy { it.count { character -> character == '/' } }) {
+            val suffix = path.removePrefix(job.relativePath + "/")
+            val file = File(directory, suffix)
+            if (file.absolutePath in delivered) continue
+            if (!file.exists() || isLink(file)) continue
+            val parentPath = file.parentFile.relativeTo(root).path
+            val parentUri = resolveDocumentUri(treeUri, parentPath)
+            if (parentUri == null) {
+                announceLost(file)
+                continue
+            }
+            val created = createOneInSaf(file, parentUri, treeUri, root, mutation = mutation)
+            if (created == null) announceLost(file)
+            else if (created.localFile.isDirectory) {
+                createChildrenInSaf(created.localFile, created.uri, treeUri, root, delivered = delivered, mutation = mutation)
+            }
+        }
+    }
+
+    /**
+     * Creates [localFile] in its folder on the device for a job whose event could not
+     * name that folder.
+     *
+     * The event resolved the folder when it arrived, and the job that makes or renames
+     * that folder was still ahead of it in the queue, so a folder the device holds by
+     * now was not there yet. Dropped on that, a save inside a folder renamed a moment
+     * earlier never reached it, and nothing said so.
+     *
+     * Asking again is not enough on its own, because dropping was also what kept a burst
+     * of files in a new folder (a clone, an install) from being sent twice: the folder's
+     * own create uploads whatever the mirror holds when it runs and remembers each
+     * document it makes, so a path already remembered was carried and has nothing left
+     * to do. A renamed folder's children are not remembered, [forgetCachedSubtree]
+     * dropped them and the rename does not refill them, so they go through. A folder
+     * that is still not on the device leaves the file in the mirror only, and the user
+     * is told, while the cache still speaks for the job's tree: a drain can outlive its
+     * folder, and then the file may well have been carried by its folder's create, so no
+     * notice is given for it. A link is never uploaded, so one queued here has nothing
+     * to report.
+     */
+    private fun createInQueuedParent(job: SyncJob, localFile: File, access: OutboundAccess?, mirrorRoot: File?) {
+        val treeUri = job.safTreeUri ?: return
+        if (mirrorRoot == null) {
+            announceLost(localFile)
+            return
+        }
+        var parentUri = job.safParentUri
+        if (parentUri == null) {
+            // Built by something other than [handleMirrorEvent]: nothing to ask about.
+            if (job.relativePath.isEmpty()) return
+            if (treeUri != cacheTree) return
+            if (cachedDocId(treeUri, job.relativePath) != null) return
+            if (isLink(localFile)) return
+            parentUri = resolveDocumentUri(treeUri, File(job.relativePath).parent ?: "", access)
+            if (parentUri == null) {
+                announceLost(localFile)
+                return
+            }
+        }
+        createInSaf(localFile, parentUri, treeUri, mirrorRoot, access)
+    }
+
+    // -- FileObserver --
+
+    /**
+     * Watches one directory and enqueues write-back jobs for what changes inside it.
+     *
+     * [path] arrives as inotify's own `name` field (the bare entry name within the
+     * watched directory, not a path relative to the mirror root), so [dir] is what it
+     * has to be resolved against. Covering the tree is [watchTree]'s job: one observer
+     * per directory, because a watch descriptor covers a directory and not a tree.
+     */
+    private inner class DirectoryObserver(
+        private val dir: File,
+        private val rootDir: File,
+        private val safTreeUri: Uri,
+        private val owner: WatchSession,
+    ) : FileObserver(dir, MODIFY or CREATE or DELETE or MOVED_FROM or MOVED_TO) {
+        override fun onEvent(event: Int, path: String?) {
+            if (path == null || !isWatching) return
+            handleMirrorEvent(event, File(dir, path), rootDir, safTreeUri, owner)
+        }
+    }
+
+    /**
+     * Turns one inotify event on [localFile] into the watch bookkeeping and the
+     * write-back job it implies.
+     *
+     * On the engine rather than on [DirectoryObserver] so a test can drive it without
+     * one: constructing a [FileObserver] runs a static initializer that reaches native
+     * code a JVM test has no way to satisfy, and what happens to the device copy is
+     * decided here.
+     */
+    internal fun handleMirrorEvent(
+        event: Int,
+        localFile: File,
+        rootDir: File,
+        safTreeUri: Uri,
+        sourceSession: WatchSession = session,
+    ) {
+        // The session this event belongs to, captured rather than read at the offer at the
+        // end. Everything in between is provider round trips, a query per path segment
+        // and several of them, and a stop can run to completion inside that window: it
+        // installs a fresh session that nothing drains, since only [startWatching]
+        // starts a worker and it opens with a stop that clears that queue again. A save
+        // offered there went nowhere and said nothing. Read at entry, a late offer lands
+        // in the queue the closing folder's drain is still emptying, which is what the
+        // grace period exists for; if that drain has already finished, the offer below
+        // says so, because the stop's own count cannot. That count is read and the queue
+        // cleared in microseconds on an idle folder, while this event is still inside the
+        // provider, so the one job it can see is one that was already queued.
+        //
+        // A capture rather than a liveness re-check, because the answer has to be the
+        // same object for the whole event: two threads polling one queue is what the
+        // session split exists to prevent, and this offers into a queue exactly one
+        // worker was ever started for.
+        //
+        // The observer captures its owner when registered, so even a callback paused
+        // before entering here cannot adopt a reopened folder's session or generation.
+        val target = sourceSession
+        val access = outboundAccess(rootDir, target.generation.takeIf { target.root == rootDir })
+        // Nothing here touches the cache's label. An event whose tree the cache does not
+        // speak for is one that was still inside its provider round trips when the
+        // folder was switched, arriving after the next folder's sync has relabelled the
+        // cache and is filling it; every resolution below then walks the provider and
+        // caches nothing, which [cachedDocId] and [cacheDocId] decide per access. This
+        // used to clear the cache and adopt it for the event's own tree, and the clear
+        // and the sync's fill interleaved: the sync went on writing its entries under
+        // the old folder's label, the event wrote the old folder's directories beside
+        // them, and the new folder's phase 2b read one of those for a same-named path.
+        // Where one granted folder sits inside another, that directory is writable, and
+        // the write opens it with "wt", which truncates at open. A drain that outlived
+        // its folder is unaffected either way: its one cache read is guarded by the same
+        // label (see [processWriteBack]'s late-parent resolution).
+        val relativePath = localFile.relativeTo(rootDir).path
+
+        val type = when (event and FileObserver.ALL_EVENTS) {
+            FileObserver.MODIFY -> SyncType.MODIFY
+            FileObserver.CREATE, FileObserver.MOVED_TO -> SyncType.CREATE
+            FileObserver.DELETE, FileObserver.MOVED_FROM -> SyncType.DELETE
+            else -> return
+        }
+        // inotify reports this alongside the event type when the entry is a
+        // directory, and for a delete it is the only way to know: there is nothing
+        // left to stat by then.
+        val isDirectory = (event and IN_ISDIR) != 0 || localFile.isDirectory
+        if (target !== session) {
+            if (type != SyncType.DELETE && shouldWriteBack(relativePath, isDirectory)) {
+                onWriteBackFailed(localFile)
+            }
+            return
+        }
+
+        val expectedMove = if (isDirectory) target.normalizedDirectories.remove(localFile.absolutePath) else null
+        val normalizedMove = expectedMove != null &&
+            (event and FileObserver.ALL_EVENTS) == FileObserver.MOVED_TO &&
+            runCatching {
+                Files.readAttributes(localFile.toPath(), BasicFileAttributes::class.java,
+                    LinkOption.NOFOLLOW_LINKS).fileKey()
+            }.getOrNull() == expectedMove.second
+
+        // A directory arriving or leaving changes what has to be watched. Unwatching
+        // is unconditional because it is a no-op for anything never watched.
+        when (type) {
+            SyncType.CREATE ->
+                if (isDirectory && !shouldSkip(localFile.name, isDir = true)) {
+                    watchTree(localFile, rootDir, safTreeUri, target)
+                }
+            SyncType.DELETE -> unwatchTree(localFile, target)
+            else -> Unit
+        }
+
+        if (normalizedMove) {
+            synchronized(vanishedLock) {
+                vanishedDirectories.removeAll { it.localPath == expectedMove!!.first }
+            }
+            return
+        }
+
+        if (!shouldWriteBack(relativePath, isDirectory)) return
+
+        // Placed here rather than in the write-back branches: this covers CREATE,
+        // MODIFY and the arriving half of a move in one statement, and stops the job
+        // being queued at all.
+        //
+        // A delete is excluded and handled below instead, and the exclusion is the
+        // whole of why the type is read here at all. Both refusals are correct and
+        // they are correct for opposite reasons: a refused write leaves the edit
+        // inside the app, a refused delete leaves the document on the device and
+        // nowhere else. Answering for a delete here said the first sentence about
+        // the second situation, sending the user into the app after a file the app
+        // had never held, and spent that path's one refusal notice on it, so the
+        // save that came afterwards, the one that really did stay inside the app,
+        // was silent for the rest of the session.
+        //
+        // The provider is asked rather than trusted from the set alone, because
+        // the set is a memory of what this sync could not read and the document
+        // may have been deleted on the device since. When it has, the local file
+        // is an ordinary new file and uploads normally. The binder walk costs
+        // something only for paths in the set, which is normally empty.
+        //
+        // The set is therefore tested twice, here and inside the predicate, and the
+        // outer one is not a duplicate: it is what keeps [providerHoldsDocument] off
+        // the common path. [createOneInSaf] needs no such guard, because there the
+        // provider's answer is already in hand.
+        if (type != SyncType.DELETE &&
+            holdsUnread(localFile.absolutePath, isDirectory) &&
+            writeWouldReplaceUnreadDocument(
+                localFile.absolutePath,
+                providerHoldsDocument(safTreeUri, relativePath),
+            )
+        ) {
+            refuseUnreadDocument(localFile, relativePath)
+            return
+        }
+
+        val now = System.currentTimeMillis()
+
+        // A directory that moved away is one half of a rename, and the device holds the
+        // only complete copy of it. Android does not expose inotify's cookie, so the
+        // MOVED_FROM and the MOVED_TO cannot be paired by the kernel's own identifier and
+        // this half arrives as a plain delete, which on a directory document is
+        // `deleteDocument` taking everything beneath it on the device. What the other half
+        // gives back is the mirror's copy, and the mirror is not all of it:
+        // [createChildrenInSaf] stops at [MAX_UPLOAD_ENTRIES], and the mirror never held
+        // the `.git` or `node_modules` that [SKIP_DIRECTORIES] kept out of it, so those go
+        // and never return. Renaming a folder of 3000 files therefore left 1000 of them
+        // nowhere but the mirror, which is reclaimed as soon as the folder's permission
+        // lapses.
+        //
+        // So the delete is never propagated, it is held instead, for the MOVED_TO that a
+        // rename sends a moment later. That one renames the device's *own* document into
+        // the new name, which carries the subtree the mirror could not because the
+        // provider moves it in place, and leaves nothing under the old name.
+        //
+        // When nothing claims it the record expires and the device keeps a stale copy
+        // under the old name, and that copy is durable, not merely untidy: reopening the
+        // folder copies it back down, so the old name reappears in the editor beside the
+        // new one, and an unclaimed move leaves one more of them every time. Nothing
+        // removes it on the user's behalf, and the Explorer's own Delete does not
+        // either: measured on an API 37 emulator, the workbench deletes a folder by
+        // renaming it into its temporary directory first, so what arrives here is
+        // this MOVED_FROM, the pair never comes, and the device keeps the folder. An
+        // outright DELETE for a directory comes from a real unlink, `rm -r` in the
+        // terminal, `git clean`, a build script, and is acted on below unless the
+        // directory holds documents this sync never read.
+        if (isDirectory && (event and FileObserver.ALL_EVENTS) == FileObserver.MOVED_FROM) {
+            dropVanished { now - it.atMillis > RENAME_PAIR_WINDOW_MS }
+            synchronized(vanishedLock) {
+                vanishedDirectories.add(
+                    VanishedDirectory(relativePath, now, localFile.absolutePath)
+                )
+            }
+            Logger.i(
+                tag,
+                "Directory moved away; keeping the device copy of $relativePath until a " +
+                    "rename claims it"
+            )
+            return
+        }
+
+        // A delete the device holds the only copy of, at either level.
+        //
+        // On a directory document `deleteDocument` takes everything beneath it on the
+        // device, and the mirror is not all of it: a child skipped for size, or one
+        // whose copy failed, was never in the mirror, so the editor showed the
+        // directory without it, the user deleted what they could see, and the device
+        // lost a 60 MB archive nothing on screen had mentioned. A file arrives here for
+        // the same reason one step down: what the user deleted in the editor was a
+        // mirror entry that was never the document, and the document on the device is
+        // the only copy of itself.
+        //
+        // Matched by prefix and by its own path for a directory, since a directory
+        // holds what is under it and [unfetched] carries a file for each document this
+        // sync did not read plus the directory itself where it read none of them, and
+        // by its own path or an unread ancestor for a file. The separator keeps
+        // `docs` from matching `docs2` and `notes.md.bak` from matching `notes.md`.
+        //
+        // Below the MOVED_FROM hold rather than above it, deliberately. A directory
+        // with unread children is renamed by the same event pair as any other, and
+        // the hold is what turns the pair into one provider move, which is the one
+        // path that carries those children to the new name. Refusing the MOVED_FROM
+        // would have left the pair unclaimed: the new name created from the mirror
+        // without them, the old one standing on the device with them. Only an
+        // outright DELETE therefore reaches here as a directory. A file has no pair to
+        // protect, so both halves of its delete, the unlink and the move away, reach
+        // this and are kept the same way.
+        //
+        // The provider is asked for the reason the write guard asks it: the set is a
+        // memory, and the document may have been deleted on the device since, in
+        // which case there is nothing left to keep. Only a provider that positively
+        // answers "gone" lets the delete through. An unavailable or partial listing
+        // therefore keeps the document, as the write guard keeps an unread document. One scan of a set that is normally
+        // empty, on the observer thread; the binder walk is paid only on a match.
+        if (type == SyncType.DELETE) {
+            val unread = holdsUnread(localFile.absolutePath, isDirectory)
+            if ((unread || isDirectory && holdsKept(localFile.absolutePath)) &&
+                providerHolds(safTreeUri, relativePath) != false
+            ) {
+                keepUnread(localFile, relativePath, isDirectory, changed = !unread)
+                return
+            }
+        }
+
+        // Resolve the SAF URI for this file via its relative path, except where
+        // nothing reads it. A file arriving as CREATE (which is also where a file's
+        // MOVED_TO lands) is the one shape with no reader: the claim gate below is
+        // reached only by a directory, and [processWriteBack]'s CREATE arm takes the
+        // parent and the tree and never the document. Resolving anyway is not free and
+        // is paid on the worst thread for it: a name the mirror has just gained misses
+        // [docIdCache] by construction, so every one of them walked the provider a
+        // query per path segment, each query a full linear scan of that directory's
+        // cursor, inline on FileObserver's single process-wide ObserverThread, which is
+        // also the thread that has to keep up with every inotify event for the whole
+        // mirror. A `git checkout` adding two thousand files paid it two thousand
+        // times for an answer nothing looked at, while the events behind it queued.
+        // [createOneInSaf] asks the provider for the same child again on the path that
+        // does need the answer, so nothing here is lost by not asking early.
+        val safDocUri =
+            if (type == SyncType.CREATE && !isDirectory) null
+            else resolveDocumentUri(safTreeUri, relativePath, access)
+        val safParentUri = resolveDocumentUri(
+            safTreeUri,
+            File(relativePath).parent ?: "",
+            access,
+        )
+
+        // The other half. Claiming is refused unless the device has nothing under the new
+        // name. A null [safDocUri] has already asked: the resolution above missed the
+        // cache and walked the provider on this very event, so the walk is only
+        // repeated where a non-null answer can be stale, which is the cache hit and
+        // the not-yet-visible rename:
+        // `renameDocument` handed a name the folder already holds is the same trap as
+        // `createDocument`, and providers answer it by inventing "util (1)", which
+        // would leave the user two directories again, one of them named nonsense. But
+        // the cache can name a document deleted since it was filled, a DELETE job
+        // here, or a device-side removal no job of ours saw, and a dead entry
+        // answering for the new name is what refuses the pair whose other half is
+        // holding the only complete copy. A swap, `mv dist dist.old; mv dist.new
+        // dist`, is refused by the same test, because the first rename is still in
+        // the queue when the second pair arrives and the device still answers for
+        // `dist`. Its second half falls back to being created from the mirror, which
+        // is what it did before; its first half still moves in one piece.
+        val renamedFrom =
+            if (isDirectory &&
+                (event and FileObserver.ALL_EVENTS) == FileObserver.MOVED_TO &&
+                hasVanishedCandidate(now) &&
+                (safDocUri == null || !providerHoldsDocument(safTreeUri, relativePath))
+            ) claimVanishedDirectory(relativePath, now) else null
+        // The upload records follow the directory, and the claim is the only point that
+        // can move them: it is the one place holding both names. The job carries only
+        // the old base name, and a RENAME job can be superseded by a newer one, cleared
+        // by a stop, or never run at all, while this has to be true from the instant the
+        // disk changed.
+        //
+        // Nothing here is conditioned on what the device does. A line records that the
+        // MIRROR holds an edit the device never received, so a provider that refuses the
+        // rename, or an old name that resolves to no document, changes nothing about
+        // where those files now are. Left behind, the line names a path that no longer
+        // exists: the next sync cannot consume it (its repair branch needs the file to
+        // be there), so it copies the device's own truncated upload over the mirror's
+        // only complete copy, and until then it refuses the removal the user asked for.
+        //
+        // Only a claimed pair, because only a claimed pair re-uploads nothing. An
+        // unclaimed one falls back to createInSaf, which writes every child out again
+        // and brackets each write with the journal itself.
+        //
+        // This is also the one place where a wrong claim can cost bytes rather than
+        // placement, because these lines land under the ARRIVING directory's paths and
+        // the next sync's repair acts on whatever real file it finds there. The window
+        // and why it is left where it is are in [renameSourceFor].
+        //
+        // This runs on the observer thread while write-backs run on their own, so a save
+        // can be streaming out of the directory that is moving. Its claim travels with
+        // the lines, which is why [UploadClaim] carries a path rather than being found by
+        // one: a writer that released the name it opened with would leave the moved line
+        // standing for a write that landed.
+        if (renamedFrom != null) {
+            withCurrentMemory(access) {
+                renameUploadsUnder(File(rootDir, renamedFrom), localFile)
+            }
+        }
+        // Resolved after the claim rather than when the directory vanished, so that the
+        // provider is only asked on the events that turn out to be renames. Null means
+        // the device has no document under the old name, there is nothing to rename and
+        // nothing to duplicate, so this falls back to creating the new name outright.
+        val renamedFromUri = renamedFrom?.let { resolveDocumentUri(safTreeUri, it, access) }
+        if (renamedFrom != null && renamedFromUri != null) {
+            withCurrentMemory(access) { forgetCachedSubtree(safTreeUri, renamedFrom) }
+        }
+
+        // Only for a pair that crosses directories, and resolved from where the document
+        // actually is rather than from the destination: `moveDocument` refuses a source
+        // parent the document is not in. Resolving it unconditionally would ask the
+        // provider on every ordinary rename for a value nothing would read.
+        val crossesDirectories = renamedFrom != null && renamedFromUri != null &&
+            parentPathOf(renamedFrom) != parentPathOf(relativePath)
+        val sourceParentUri =
+            if (crossesDirectories) {
+                resolveDocumentUri(safTreeUri, parentPathOf(renamedFrom!!), access)
+            } else {
+                null
+            }
+
+        // A pair that crossed directories and whose source parent did not resolve is not
+        // a rename this write-back can carry out, so it is not offered as one. Both
+        // reasons for a null source parent used to arrive at the same place -- a pair
+        // inside one directory, which genuinely has nothing to move, and a cross-directory
+        // pair whose old parent the provider would not answer for -- and the arm they
+        // shared hands the write-back the document under its OLD name with nothing to
+        // move it. On the common shape of a move, dragging `src/util` into `src/legacy/`,
+        // the name does not change either, so the write-back performed no call at all and
+        // still reported the move done: the device kept `src/util`, never received
+        // `src/legacy/util`, and the create fallback that would have delivered it was
+        // skipped. Declining the pairing puts the job back on the ordinary create path,
+        // which is what an unclaimed move has always fallen back to, and leaves the old
+        // copy standing on the device where the user can see it.
+        val pairedRename = renamedFromUri != null && !(crossesDirectories && sourceParentUri == null)
+
+        // Asked before the offer, never after. A session that has stopped being polled
+        // never starts again, so an answer taken here cannot go stale in the two
+        // instructions that follow, while the other order would report a job the drain
+        // had already taken as lost. Still offered: the queue is the honest record of
+        // what was asked for, and the mirror keeps the file either way. What is missing
+        // is the user knowing, and that is what this line is.
+        if (target.abandoned) {
+            Logger.w(
+                tag,
+                "Write-back of $relativePath arrived after the drain ended; the save is " +
+                    "in the mirror only until the folder is opened again",
+            )
+        }
+
+        val renamedSaves = if (pairedRename) {
+            val prefix = File(rootDir, renamedFrom).absolutePath + File.separator
+            target.queue.filter {
+                (it.type == SyncType.MODIFY || it.type == SyncType.CREATE) && it.localPath.startsWith(prefix)
+            }
+                .map { relativePath + "/" + it.localPath.removePrefix(prefix) }.distinct()
+        } else emptyList()
+        target.queue.offer(
+            SyncJob(
+                type = if (pairedRename) SyncType.RENAME else type,
+                localPath = localFile.absolutePath,
+                safDocUri = if (pairedRename) renamedFromUri else safDocUri,
+                safParentUri = safParentUri,
+                safTreeUri = safTreeUri,
+                timestamp = now,
+                safSourceParentUri = sourceParentUri,
+                previousName = if (pairedRename) renamedFrom?.let { File(it).name } else null,
+                relativePath = relativePath,
+                isDirectory = isDirectory,
+                mirrorRoot = rootDir,
+                generation = access.generation,
+                renamedSaves = renamedSaves,
+                previousPath = if (pairedRename) File(rootDir, renamedFrom).absolutePath else null,
+            )
+        )
+    }
+
+    /**
+     * Whether [path] is a document this sync never read or, for a directory, holds one at
+     * any depth: what [handleMirrorEvent]'s delete guard asks, and [keepsDeviceDocument]
+     * again where the delete happens.
+     *
+     * A directory is matched by its own path as well as by prefix. It is recorded by its
+     * own mirror path when this sync did not read what is under it, either because the name
+     * is skipped or because enumerating it failed. Files under unread directories are held
+     * too. The prefix test for descendants alone cannot match
+     * that entry: `below` carries a trailing separator the entry does not have. Deleting the
+     * directory itself is exactly the case those entries exist to refuse. Both guards ask
+     * [holdsKept] of a directory too.
+     */
+    private fun holdsUnread(path: String, isDirectory: Boolean): Boolean {
+        if (writeWouldReplaceUnreadDocument(path, true)) return true
+        if (!isDirectory) return false
+        val below = path + File.separator
+        return unfetched.any { it.startsWith(below) }
+    }
+
+    private fun writeWouldReplaceUnreadDocument(path: String, deviceHoldsDocument: Boolean): Boolean =
+        writeWouldReplaceUnreadDocument(path, deviceHoldsDocument, unfetched, path in fetchedPaths)
+
+    /**
+     * Whether the directory [path] holds a file whose delete [keepsDeviceDocument] declined
+     * ([keptOnDevice]), which deleting the directory would take with it. Its own question
+     * rather than part of [holdsUnread], because the notice says a different thing for it.
+     */
+    private fun holdsKept(path: String): Boolean {
+        val below = path + File.separator
+        return keptOnDevice.any { it.startsWith(below) }
+    }
+
+    /**
+     * Whether the provider itself answers for [relativePath], asked segment by
+     * segment rather than through [docIdCache].
+     *
+     * The cache is the right answer for the paths jobs write into, but it is a
+     * record of what was true when it was filled, and nothing maintains it
+     * against deletions the provider performed. A decision that turns on the
+     * device *not* holding a name has to ask the device.
+     */
+    /**
+     * Whether the device still holds anything at [relativePath]: true, false, or null
+     * when the provider could not be asked. Type-agnostic, because it walks display
+     * names, which is what the delete guard needs: it asks the same question of a
+     * directory and of the document inside one.
+     *
+     * Loading and error listings, null cursors and failed queries answer unknown.
+     * Both write and delete guards treat only a complete answer of "gone" as permission
+     * to replace a document this sync never read.
+     */
+    private fun providerHolds(treeUri: Uri, relativePath: String): Boolean? {
+        var currentDocId = DocumentsContract.getTreeDocumentId(treeUri)
+        for (segment in relativePath.split("/")) {
+            val childrenUri = DocumentsContract.buildChildDocumentsUriUsingTree(treeUri, currentDocId)
+            val next = try {
+                context.contentResolver.query(
+                    childrenUri,
+                    arrayOf(
+                        DocumentsContract.Document.COLUMN_DOCUMENT_ID,
+                        DocumentsContract.Document.COLUMN_DISPLAY_NAME
+                    ),
+                    null, null, null
+                )?.use { cursor ->
+                    if (cursor.extras?.let {
+                            it.getBoolean(DocumentsContract.EXTRA_LOADING) ||
+                                it.containsKey(DocumentsContract.EXTRA_ERROR)
+                        } == true
+                    ) return null
+                    val idIndex = cursor.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_DOCUMENT_ID)
+                    val nameIndex = cursor.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_DISPLAY_NAME)
+                    var found: String? = null
+                    while (cursor.moveToNext()) {
+                        if (cursor.getString(nameIndex) == segment) {
+                            found = cursor.getString(idIndex)
+                            break
+                        }
+                    }
+                    found ?: return false
+                } ?: return null
+            } catch (e: Exception) {
+                Logger.d(tag, "Lookup of $segment under $currentDocId failed: ${e.message}")
+                return null
+            }
+            currentDocId = next
+        }
+        return true
+    }
+
+    private fun providerHoldsDocument(treeUri: Uri, relativePath: String): Boolean =
+        providerHolds(treeUri, relativePath) != false
+
+    /**
+     * Whether any vanished directory is still claimable at [now], without consuming
+     * anything.
+     *
+     * Asked before the provider walk in the claim decision, because it is a lock
+     * and a size check while the walk is a binder round trip per path segment on
+     * the observer thread, and most directory MOVED_TO events have nothing to
+     * pair with: a folder arriving from outside the mirror, a build tool swapping
+     * trees. Those used to pay the walk for an answer the cheap check settles.
+     *
+     * [now] is a parameter rather than a reading taken here so that this and
+     * [renameSourceFor] judge one event against one clock. Without the window this
+     * answered "yes" for an entry [renameSourceFor] would decline as expired, and
+     * because entries are otherwise pruned only when the next directory MOVED_FROM
+     * arrives, one departure that never found a partner (`mv dist /sdcard/...`) left
+     * the filter answering yes for the rest of the session: every directory a
+     * `git checkout` or an `npm install` created then paid the per-segment provider
+     * walk on the observer thread, which is the thread that has to keep up with every
+     * inotify event for the whole mirror. Pruning here as well as on the add is what
+     * stops it: the verdict is unchanged, since [renameSourceFor] applies the same
+     * window, and the walk it saves is the point.
+     *
+     * Pruning through [dropVanished] rather than off the list here, so that a departure
+     * expiring at this reader retires the upload records left under it exactly as one
+     * expiring at any other does. That reads the journal, one small file in `filesDir`,
+     * and only when something did expire, which is a fraction of the binder walk this
+     * check exists to keep off the observer thread.
+     */
+    internal fun hasVanishedCandidate(now: Long): Boolean {
+        dropVanished { now - it.atMillis > RENAME_PAIR_WINDOW_MS }
+        return synchronized(vanishedLock) { vanishedDirectories.isNotEmpty() }
+    }
+
+    /**
+     * Takes the vanished directory a MOVED_TO on [newRelativePath] may be the other half
+     * of, or null when none of them can be claimed. A claimed entry is consumed.
+     */
+    private fun claimVanishedDirectory(newRelativePath: String, now: Long): String? =
+        synchronized(vanishedLock) {
+            val source = renameSourceFor(vanishedDirectories, newRelativePath, now)
+            if (source != null) vanishedDirectories.removeAll { it.relativePath == source }
+            source
+        }
+
+    /**
+     * Drops [relativePath] and everything under it from [docIdCache].
+     *
+     * Called when the device document behind that path has been renamed, which is the one
+     * event that invalidates a whole branch of the cache at once. Two things go wrong
+     * without it, and both are quiet: on a provider whose document IDs are paths, every
+     * cached ID under the old name now names a document that does not exist; and on a
+     * provider whose IDs survive a rename, [createOneInSaf]'s reverse lookup can find the
+     * *old* path for the renamed document and file new children under a relative path the
+     * mirror no longer has. Dropping them costs a tree walk on the next lookup of a path
+     * below the new name, which is the slow path that already exists for new files.
+     */
+    private fun forgetCachedSubtree(treeUri: Uri, relativePath: String) {
+        val prefix = "$relativePath/"
+        synchronized(docIdCache) {
+            if (cacheTree == treeUri) docIdCache.keys.removeAll { it == relativePath || it.startsWith(prefix) }
+        }
+    }
+
+    /**
+     * Resolves a document URI within a SAF tree given a relative path.
+     * Uses [docIdCache] for O(1) lookup when available, falling back to tree
+     * traversal on a cache miss.
+     */
+    private fun resolveDocumentUri(treeUri: Uri, relativePath: String, access: OutboundAccess? = null): Uri? {
+        if (relativePath.isEmpty()) {
+            val rootDocId = DocumentsContract.getTreeDocumentId(treeUri)
+            return DocumentsContract.buildDocumentUriUsingTree(treeUri, rootDocId)
+        }
+
+        // Fast path: use cached docId if available, and only while the cache speaks
+        // for this tree.
+        val cached = cachedDocId(treeUri, relativePath)
+        if (cached != null) {
+            return DocumentsContract.buildDocumentUriUsingTree(treeUri, cached)
+        }
+
+        // Slow path: walk the tree segment by segment (for newly created files)
+        var currentDocId = DocumentsContract.getTreeDocumentId(treeUri)
+        for (segment in relativePath.split("/")) {
+            currentDocId = findChildDocId(treeUri, currentDocId, segment) ?: return null
+        }
+
+        // Cache for next time, unless the cache moved on to another tree during the
+        // walk above; then this answer belongs to a folder it no longer speaks for.
+        withCurrentMemory(access) { cacheDocId(treeUri, relativePath, currentDocId) }
+        return DocumentsContract.buildDocumentUriUsingTree(treeUri, currentDocId)
+    }
+
+    companion object {
+        private const val MAX_ENUMERATION_DEPTH = 128
+        /**
+         * What [usableSpaceOf] starts as in every engine: the room the filesystem reports.
+         *
+         * A variable so the unit suite can stand it down for the whole JVM. The floor in
+         * [copyDocumentToLocal] refuses every fetch below [OPEN_SPACE_FLOOR_BYTES], and a test
+         * that leaves this alone is asking the machine it runs on: with the temp volume that
+         * low, the document is never copied and the save or delete for it is refused as
+         * unread, which no test about those rules expects to be decided by a disk.
+         */
+        @SuppressLint("UsableSpace")
+        internal var defaultUsableSpaceOf: (File) -> Long = { it.usableSpace }
+
+        private const val UPLOAD_JOURNAL_HEADER = "#vscodroid-saf-uploads 1"
+        private const val COPY_BUFFER_SIZE = 8192
+        private const val WRITEBACK_POLL_MS = 200L
+
+        /**
+         * The type every file is created on the device with, and the file's NAME is the
+         * reason it is this one.
+         *
+         * `createDocument` takes a name and a type, and the platform provider settles a
+         * disagreement between them by rewriting the name. Measured on an API 33
+         * emulator's own `framework.jar` rather than read from a source tree:
+         * `FileSystemProvider.createDocument` (classes4.dex) calls
+         * `FileUtils.buildValidFatFilename` and then `FileUtils.buildUniqueFile(parent,
+         * mimeType, displayName)`, whose `splitFileName` (classes2.dex, source lines
+         * 1216-1217) keeps the requested extension only while the type is the one the
+         * platform's own table gives that extension, or the extension is the one it gives
+         * that type, and otherwise sets `name = displayName; ext = extFromMimeType`.
+         *
+         * A table of guesses therefore decided what the user's file was called. `.kt`,
+         * `.java` and `.md` were all claimed to be `text/plain`, whose extension is `txt`
+         * (`res/android.mime.types:85`), while those tables give `md` to `text/markdown`,
+         * `java` to `text/x-java` and have no `kt` entry at all, so both tests failed and
+         * `Main.kt` was stored on the device as `Main.kt.txt`. Nothing noticed: the name
+         * was never read back, and every reopen enumerated the mangled name into the
+         * mirror beside the original and made one more.
+         *
+         * This is the one value that cannot do that, whatever the extension. The same
+         * method maps `ContentResolver.MIME_TYPE_DEFAULT` to a null `extFromMimeType`
+         * (0x0033-0x003b in the same disassembly), so a mismatch takes `name =
+         * displayName` with nothing to append, and `buildFile` appends no dot for an empty
+         * extension. It costs nothing where the type is read back either: the same
+         * provider reports `COLUMN_MIME_TYPE` from the file's own extension
+         * (`getDocumentType`, classes4.dex), not from what a create asked for.
+         */
+        internal const val CREATED_FILE_MIME_TYPE = "application/octet-stream"
+
+        /** How long [stopWatching] waits for queued writes to reach the device. */
+        private const val DRAIN_GRACE_MS = 2000L
+
+        /**
+         * How long a save [keepsDeviceEdit], [writeLocalToSaf], or an open arm holds back
+         * waits before [retryHeldBack] tries it again. Each hold after that doubles the wait,
+         * up to [HELD_BACK_RETRY_MAX_MS].
+         */
+        internal const val HELD_BACK_RETRY_FIRST_MS = 30_000L
+
+        /** The longest a held-back save waits between tries. */
+        internal const val HELD_BACK_RETRY_MAX_MS = 5 * 60_000L
+
+        /**
+         * Suffix for a copy still being written; moved into place when complete.
+         *
+         * Internal because the reclaim pass has to recognise the one of these that
+         * outlives its own writer: [writeSyncedRecord] puts a record's scratch file
+         * beside the mirror rather than inside it, where nothing else in `saf-mirrors`
+         * would ever look at it again.
+         */
+        internal const val PARTIAL_SUFFIX = ".vscodroid-partial"
+
+        /** The default for [outboundTurnWaitMs]. */
+        internal const val OUTBOUND_TURN_WAIT_MS = 120_000L
+
+        /**
+         * The default for [providerClaimWaitMs]: ten seconds.
+         *
+         * Far below [OUTBOUND_TURN_WAIT_MS] on purpose. A delete, a rename and the create inside a
+         * turn wait for the claim while holding their mirror's turn, and a save of the same mirror
+         * is waiting for that turn; the longer wait is the one that gives up on a stalled provider,
+         * and this one must not be the reason it does.
+         */
+        internal const val PROVIDER_CLAIM_WAIT_MS = 10_000L
+
+        /**
+         * What [setAsideDivergedMirror] puts in front of the mirror copy's own
+         * modification time when it moves one out of a newer device copy's way.
+         *
+         * Deliberately not a [PARTIAL_SUFFIX]-shaped name. A machine-temporary name is
+         * excluded from every outbound path in this engine, and the whole point of the
+         * file it names here is that it holds work only this app has: it has to be
+         * uploadable, watchable and visible in the explorer like any other file.
+         */
+        internal const val LOCAL_COPY_SUFFIX = ".local-"
+
+        /**
+         * What [setAsideDeviceCopy] puts in front of the device document's own
+         * modification time when it fetches one out of a newer mirror copy's way.
+         *
+         * A different word from [LOCAL_COPY_SUFFIX] because the two copies come from
+         * opposite sides, and which side an edit came from is the one thing the user
+         * needs to know when merging the two. The same rule about the name's shape
+         * applies: it has to be uploadable, watchable and visible like any other file.
+         */
+        internal const val DEVICE_COPY_SUFFIX = ".device-"
+
+        /**
+         * The file, inside [android.content.Context.getFilesDir], naming every mirror
+         * path with an upload in flight. See the journal's users for why it exists.
+         */
+        internal const val UPLOADS_IN_FLIGHT_FILE = "saf-uploads-in-flight"
+
+        /**
+         * Serialises every access to [UPLOADS_IN_FLIGHT_FILE], across engine
+         * instances: a write-back drain can outlive the activity whose engine
+         * started it, and the next activity's engine reads and rewrites the same
+         * one file on its own monitor otherwise.
+         */
+        private val uploadJournalLock = Any()
+
+        /**
+         * The write-backs streaming into a mirror path right now, one entry per writer,
+         * across engine instances and guarded by [uploadJournalLock].
+         *
+         * The journal line means "an upload of this path did not finish", and one line
+         * cannot carry two writers: [initialSync] writes a newer mirror copy back on the
+         * IO dispatcher while a drain that outlived its folder is still streaming the
+         * same file, and whichever landed first used to remove the line for both. The
+         * next sync then read a device copy another writer was still part way through as
+         * a finished one, and copied it over the mirror. Reopening the same folder is
+         * what makes the two paths identical, because the mirror is named by a hash of
+         * the folder rather than by the session.
+         *
+         * A claim per writer rather than a count per path, because the two records of one
+         * write have to move together. [renameUploadsUnder] moves the journal line when
+         * the directory above it is renamed mid-stream, and a count keyed by the name the
+         * writer opened with could no longer name the line that writer has to retire.
+         * Each writer releases its own [UploadClaim], whatever its path is called by then.
+         *
+         * In memory rather than in the file, because the writers are threads of one
+         * process. A process that dies mid-write leaves the line behind, which is exactly
+         * what the journal is for.
+         */
+        private val uploadClaims = mutableListOf<UploadClaim>()
+
+        /**
+         * Active document reads and truncating writers, shared across engine instances.
+         * Tree grants can spell one document differently, so identity is authority plus
+         * document ID. A reader retains the write generation until its stream closes,
+         * rejecting bytes touched by a write even when that write has already finished.
+         * Entries disappear once no read or write uses them. A contending writer holds
+         * its save for [retryHeldBack] without waiting indefinitely.
+         */
+        private val documentAccess = mutableMapOf<Pair<String?, String>, DocumentAccess>()
+
+        // Recursive provider deletes include child IDs that overlapping grants spell differently.
+        private val providerMutations = mutableMapOf<String?, ProviderMutation>()
+
+        private fun providerMutationKey(uri: Uri): String? = uri.authority?.takeIf { it.isNotEmpty() }
+
+        private fun claimProviderMutation(uri: Uri): ProviderMutation? = synchronized(providerMutations) {
+            val key = providerMutationKey(uri)
+            if (providerMutations.containsKey(key)) null else ProviderMutation(key).also {
+                providerMutations[key] = it
+            }
+        }
+
+        /**
+         * [claimProviderMutation], waiting up to [waitMs] for the claim to come free.
+         *
+         * For a delete, a create and a rename, which were refused with a notice and had to be
+         * repeated when they met another folder's write to the same provider, so that a closing
+         * write still running as the next folder opens cost the user a refusal. A save does not
+         * use it: it is held back and tried again on its own. Woken by
+         * [releaseProviderMutation], so a write that ends in a second costs the waiter a second.
+         *
+         * Bounded, and once per holder. The first waiter to run out of time marks the holder
+         * [ProviderMutation.waitedOut], and everyone after it is refused at once for as long as
+         * that holder has the claim, so a provider call that never returns costs one wait and not
+         * one per queued delete, which is what the drain of a removed tree would otherwise be. A
+         * refusal is what these paths did before this existed, so a wait that runs out changes
+         * nothing about what happens next.
+         *
+         * An interrupt ends the wait as a refusal and is handed back: the thread is a write-back
+         * drain, and an interrupt is it being told to stop.
+         */
+        private fun claimProviderMutationWithin(uri: Uri, waitMs: Long): ProviderMutation? {
+            val key = providerMutationKey(uri)
+            val deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(waitMs)
+            var waited = false
+            return synchronized(providerMutations) {
+                var claim: ProviderMutation? = null
+                while (true) {
+                    val holder = providerMutations[key]
+                    if (holder == null) {
+                        claim = ProviderMutation(key).also { providerMutations[key] = it }
+                        break
+                    }
+                    val left = deadline - System.nanoTime()
+                    if (holder.waitedOut || left <= 0) {
+                        if (waited) holder.waitedOut = true
+                        break
+                    }
+                    try {
+                        @Suppress("PLATFORM_CLASS_MAPPED_TO_KOTLIN")
+                        (providerMutations as Object).wait(TimeUnit.NANOSECONDS.toMillis(left).coerceAtLeast(1))
+                        waited = true
+                    } catch (_: InterruptedException) {
+                        Thread.currentThread().interrupt()
+                        break
+                    }
+                }
+                claim
+            }
+        }
+
+        private fun ownsProviderMutation(uri: Uri, mutation: ProviderMutation): Boolean =
+            synchronized(providerMutations) {
+                mutation.key == providerMutationKey(uri) && providerMutations[mutation.key] === mutation
+            }
+
+        private fun releaseProviderMutation(mutation: ProviderMutation) {
+            synchronized(providerMutations) {
+                if (providerMutations[mutation.key] === mutation) {
+                    providerMutations.remove(mutation.key)
+                    @Suppress("PLATFORM_CLASS_MAPPED_TO_KOTLIN")
+                    (providerMutations as Object).notifyAll()
+                }
+            }
+        }
+
+        private fun documentWriteKey(safDocUri: Uri): Pair<String?, String> {
+            val authority = safDocUri.authority?.takeIf { it.isNotEmpty() }
+            val docId = authority?.let {
+                runCatching { DocumentsContract.getDocumentId(safDocUri) }
+                    .getOrNull()
+                    ?.takeIf { it.isNotEmpty() }
+            }
+            return if (authority != null && docId != null) {
+                authority to docId
+            } else {
+                null to safDocUri.toString()
+            }
+        }
+
+        private fun anotherMirrorWritesDocument(safDocUri: Uri, mirrorRoot: File): Boolean =
+            synchronized(documentAccess) {
+                documentAccess[documentWriteKey(safDocUri)]?.writer
+                    ?.let { it != mirrorRoot.absolutePath } == true
+            }
+
+        /** Reads outside a writer claim, retaining its version until the stream closes. */
+        private fun <T> withStableDocumentRead(docUri: Uri, read: () -> T): T {
+            val document = documentWriteKey(docUri)
+            val (state, generation) = synchronized(documentAccess) {
+                val current = documentAccess.getOrPut(document) { DocumentAccess() }
+                if (current.writer != null) {
+                    throw DocumentWriteDuringReadException()
+                }
+                current.readers++
+                current to current.generation
+            }
+            try {
+                val result = try {
+                    read()
+                } catch (failure: Exception) {
+                    synchronized(documentAccess) {
+                        if (state.generation != generation) {
+                            throw DocumentWriteDuringReadException().apply { addSuppressed(failure) }
+                        }
+                    }
+                    throw failure
+                }
+                synchronized(documentAccess) {
+                    // A writer may finish entirely during the read, leaving no active stream.
+                    if (state.generation != generation) throw DocumentWriteDuringReadException()
+                }
+                return result
+            } finally {
+                synchronized(documentAccess) {
+                    state.readers--
+                    if (state.readers == 0 && state.writer == null) documentAccess.remove(document)
+                }
+            }
+        }
+
+        /**
+         * Mirror files a sync is streaming a device document into right now, keyed by
+         * absolute mirror path.
+         *
+         * The inbound twin of [documentAccess], in this object for the reason
+         * that one is: two syncs over one mirror are routinely in two different engines.
+         * A mirror is named by a hash of the tree URI rather than by the session, and
+         * [initialSync]'s phase-2 loop contains no suspension point, so cancelling the
+         * coroutine an activity started does not stop it: an activity destroyed mid-open
+         * leaves one sync copying while its replacement opens the same folder and starts
+         * another.
+         *
+         * Both used to write the same scratch path, `<name>.vscodroid-partial`, so one
+         * writer's rename into place carried the other writer's open stream with it and
+         * the rest of that copy landed inside the finished mirror file, which
+         * [recordIdentity] had already vouched for by then. Scratch names are unique per
+         * copy now; what the loser still has to be kept from is choosing the same
+         * preserved-copy name. The vouched identity is what
+         * [reconcileDeletions] and [holdsOnlyVouchedCopies] later act on, so a corrupted
+         * file was also a deletable one.
+         *
+         * The loser declines rather than waits, exactly as [documentAccess]'s
+         * loser does and for the same measured reason: a `ContentResolver` stream to a
+         * network or MTP provider has no timeout, so waiting would trade a race for an
+         * unbounded stall of a folder open behind a dialog with `setCancelable(false)`.
+         * What the loser gives up is one copy of a document the winner is already
+         * copying, and it vouches for nothing at that path, which is the direction
+         * that costs disk rather than work. It does record the path as one it did
+         * not read: this set is shared between the two engines and `unfetched` is
+         * not, so the loser is the only thing that can arm its own write-back
+         * guard, and the loser is routinely the engine that outlives the winner.
+         */
+        private val mirrorCopiesInFlight = ConcurrentHashMap.newKeySet<String>()
+        private val inboundScratchPaths = mutableSetOf<InboundScratchKey>()
+        private val mirrorAccess = ConcurrentHashMap<String, MirrorAccess>()
+
+        /**
+         * Suffix of the sibling file recording copies known to have reached the device.
+         *
+         * A sibling and not a child: the mirror directory is the folder VS Code opens,
+         * and a bookkeeping file inside it would show up in the explorer and in search.
+         * Being a sibling is also why whatever removes a mirror has to remove this too,
+         * which is what [SafStorageManager] uses it for.
+         */
+        internal const val SYNCED_RECORD_SUFFIX = ".synced"
+
+        /**
+         * First line of the record, and the only thing that says which format follows.
+         *
+         * Field count is not a version. A later format that also has three fields with
+         * different meanings would be read as this one and acted on, and acting means
+         * deleting. A record whose first line is not exactly this is ignored, which is
+         * how a record from the build before headers is already treated, and in the same
+         * direction: unverifiable means keep.
+         *
+         * Not bumped for the digest a line may carry as a fourth field ([recordLine]), and
+         * that is the safer choice for a build before it, which then reads such a line,
+         * wherever it needs the whole identity, as one it cannot verify, and keeps: its
+         * [reconcileDeletions] skips a line that is not three fields, and its readers that
+         * compare whole lines find no match. A bumped header would have that build discard
+         * the whole record instead, and with no record [setAsideDivergedMirror] and
+         * [deviceChangedSinceRecord] answer false, the direction that loses an edit. A record
+         * from before the digests reads here as it always did.
+         */
+        internal const val RECORD_HEADER = "#vscodroid-saf-sync 2"
+
+        /**
+         * A relative path as the record spells it: the tab, the two line breaks and the
+         * backslash each behind a backslash, so a name holding any of them stays one
+         * field of one line.
+         *
+         * The header is not bumped for this, and that is by measurement rather than
+         * oversight. A record the previous build wrote holds none of the four: the walk
+         * refuses a display name with a backslash before it is composed into a path
+         * ([isSafeSegment]), and [recordIdentity] left a name with the other three out
+         * of the record altogether. So unescaping an older record is the identity, and
+         * an older build reading a newer one misreads only the lines it could never have
+         * written, as paths no file has, which every reader treats as "keep".
+         */
+        internal fun escapeRecordPath(path: String): String =
+            path.replace("\\", "\\\\").replace("\t", "\\t").replace("\n", "\\n").replace("\r", "\\r")
+
+        /**
+         * A record line: [identity], as [identityLine] spells it, with the SHA-256 of the copy
+         * it names after it where [digest] is not null, in base64, whose alphabet holds no tab
+         * or line break.
+         */
+        internal fun recordLine(identity: String, digest: ByteArray?): String =
+            if (digest == null) identity
+            else identity + '\t' + Base64.getEncoder().encodeToString(digest)
+
+        /**
+         * [line] taken apart into the identity [identityLine] spells and the digest
+         * [recordLine] put after it. A line with no digest, or one this build cannot read,
+         * comes back whole and with none, so each reader keeps or drops it as it always has.
+         */
+        internal fun splitRecordLine(line: String): Pair<String, ByteArray?> {
+            val fields = line.split('\t')
+            val digest = if (fields.size != 4) null else try {
+                // Thirty-two bytes, a SHA-256; anything else is not a digest this build wrote.
+                Base64.getDecoder().decode(fields[3]).takeIf { it.size == 32 }
+            } catch (e: IllegalArgumentException) {
+                null
+            }
+            return if (digest == null) line to null else line.substringBeforeLast('\t') to digest
+        }
+
+        /** The inverse of [escapeRecordPath]. A stray backslash is kept as it is. */
+        internal fun unescapeRecordPath(field: String): String {
+            if ('\\' !in field) return field
+            val out = StringBuilder(field.length)
+            var i = 0
+            while (i < field.length) {
+                val c = field[i]
+                if (c == '\\' && i + 1 < field.length) {
+                    when (field[i + 1]) {
+                        '\\' -> { out.append('\\'); i += 2; continue }
+                        't' -> { out.append('\t'); i += 2; continue }
+                        'n' -> { out.append('\n'); i += 2; continue }
+                        'r' -> { out.append('\r'); i += 2; continue }
+                    }
+                }
+                out.append(c)
+                i++
+            }
+            return out.toString()
+        }
+
+        /**
+         * inotify's flag for "the entry this event is about is a directory".
+         *
+         * [FileObserver] does not expose it, but it passes the kernel's mask through
+         * untouched, which is also why the existing `event and ALL_EVENTS` is needed
+         * to read the event type at all.
+         */
+        private const val IN_ISDIR = 0x40000000
+
+        /**
+         * How long a directory that left the mirror stays claimable as a rename source.
+         *
+         * A rename(2) emits MOVED_FROM and MOVED_TO back to back and `FileObserver`
+         * delivers them from one thread in that order, so the true pair is milliseconds
+         * apart; this is slack for a busy observer thread, not a guess at how long a user
+         * might take. Widening it does not make pairing more likely to succeed, it makes
+         * a mis-pair more likely, because it is the only thing bounding how far apart two
+         * *unrelated* moves can be and still be joined.
+         */
+        internal const val RENAME_PAIR_WINDOW_MS = 1_000L
+
+        /**
+         * Which vanished directory a MOVED_TO on [newRelativePath] is the other half of,
+         * or null when the question cannot be answered.
+         *
+         * inotify's cookie is what would answer it; `FileObserver` does not expose it, so
+         * this is a heuristic and it declines rather than guesses. **When it is wrong:**
+         * one directory leaves the mirror for good (`mv dir ~/elsewhere`, a build tool
+         * swapping trees) and, within [RENAME_PAIR_WINDOW_MS], an unrelated directory
+         * arrives in the same parent. The two are then joined, and the device ends up with
+         * the departed directory's subtree under the arriving one's name while the
+         * arriving one's own contents stay in the mirror. No document is deleted in that
+         * case, reopening the folder brings the misplaced subtree back down where it can
+         * be seen and moved, which is why the pairing is allowed to be a heuristic at
+         * all, and why a rule that cannot be sure says no. It is not the whole cost
+         * though; the paragraph below the two rules has the part that can reach bytes.
+         *
+         * - **Exactly one candidate.** Two directories in flight at once cannot be told
+         *   apart by arrival order alone once their events interleave, and pairing the
+         *   wrong two would put each subtree under the other's name.
+         * - **Recent.** See [RENAME_PAIR_WINDOW_MS].
+         *
+         * A third rule required the two halves to share a parent, and it was dropped once
+         * the write-back learned `moveDocument`. It was never about pairing being less
+         * certain across parents; it was that `renameDocument` cannot express a move, so a
+         * pair the engine could not act on was better left unclaimed. Dragging `src/util`
+         * into `src/legacy/` is an ordinary thing to do and used to leave the old copy on
+         * the device, reappearing beside the new one on every reopen. Removing the rule
+         * does widen the mis-pair window: an unrelated arrival anywhere in the mirror can
+         * now be joined to a departure, where before it had to arrive in the same
+         * directory. The two surviving rules are what bound it.
+         *
+         * **What a mis-pair costs, stated exactly, because "nothing is deleted" is not
+         * the whole of it.** For the device documents themselves it is placement and not
+         * bytes: [moveInSaf] relocates the document rather than removing it, and
+         * reopening the folder brings the misplaced subtree back down. The one path that
+         * does reach bytes runs through the journal. A claim also calls
+         * [renameUploadsUnder], which re-files the departed directory's upload records
+         * under paths beneath the ARRIVING directory; where a real mirror file sits at
+         * one of those paths, the next [initialSync] reads it as this app's own
+         * interrupted upload, keeps it, and writes it over the device's document, so an
+         * edit made on the device to that file is gone.
+         *
+         * Not closed by narrowing the pairing, and that is a choice rather than an
+         * oversight. The rule that would close most of it is that a real directory move
+         * keeps either its parent or its basename, so a candidate would be claimed only
+         * when `parentPathOf(from) == parentPathOf(to) || File(from).name ==
+         * File(to).name`. That declines the cross-mirror coincidence; it also declines
+         * `mv src/util src/legacy/helpers`, which is a move a person makes and which
+         * `SafRenamePairingTest` pins as claimable. And it would still not decline the
+         * coincidence that lands in the departed directory's own parent, which is where
+         * the window sat before the third rule went. So the bound stays the two rules
+         * above, and this is written down so the byte-losing path is read alongside them
+         * rather than found later.
+         *
+         * Declining costs exactly what the code did before there was any pairing: the
+         * device keeps the copy under the old name.
+         */
+        internal fun renameSourceFor(
+            vanished: List<VanishedDirectory>,
+            newRelativePath: String,
+            now: Long
+        ): String? = vanished
+            .filter { now - it.atMillis <= RENAME_PAIR_WINDOW_MS }
+            .singleOrNull()
+            ?.relativePath
+
+        /**
+         * Whether [later], queued after [job] for the same path, makes running [job]
+         * pointless.
+         *
+         * A save is made from the mirror as it is when it runs, so any later job for the
+         * path redoes it and the earlier one can go. A rename goes only for a later rename
+         * onto the same name: nothing else puts the move on the device, but two cannot
+         * both land, and the second would be asked to rename into a name the device holds
+         * by then, which providers answer with an invented one. A delete goes for a later
+         * delete and for a later write of the same kind, and for no other. A file removed and written again is
+         * overwritten in place, and the save queued behind a checkout's unlink holds the
+         * document the delete would have removed, so the delete has to be the one that is
+         * dropped. A file replaced by a folder, or a folder by a file, is not the document
+         * the later write would find, and dropping the delete left the device with the
+         * old kind.
+         */
+        internal fun supersededByLaterJob(job: SyncJob, later: SyncJob): Boolean = when (job.type) {
+            SyncType.CREATE, SyncType.MODIFY -> true
+            SyncType.RENAME -> later.type == SyncType.RENAME
+            SyncType.DELETE -> later.type == SyncType.DELETE ||
+                ((later.type == SyncType.CREATE || later.type == SyncType.MODIFY) &&
+                    later.isDirectory == job.isDirectory)
+        }
+
+        /** The directory part of a mirror-relative path; empty for a top-level entry. */
+        internal fun parentPathOf(relativePath: String): String =
+            File(relativePath).parent ?: ""
+
+        /**
+         * Ceiling on watched directories.
+         *
+         * Each watch is a kernel inotify descriptor drawn from a per-uid budget
+         * (`fs.inotify.max_user_watches`, commonly 8192), and this process is not the
+         * only claimant: the file watcher the VS Code server runs draws on the same
+         * pool. [SKIP_DIRECTORIES] already excludes what generates most of the count,
+         * so a real project tree lands in the low hundreds; this is the backstop for
+         * the folder that does not. Past it, deeper directories go unwatched and their
+         * changes stay in the mirror, which is the behaviour the whole engine had
+         * before and is better than starving the editor's own watcher.
+         */
+        private const val MAX_WATCHED_DIRECTORIES = 2048
+
+        /** Max file size to sync (50 MB). Larger files are skipped. */
+        internal const val MAX_FILE_SIZE = 50L * 1024 * 1024
+
+        /**
+         * The length [deviceMovedPast] gives a stamp the provider did not answer, which no
+         * answer carries: [walkTree] and [deviceStamp] read a missing size column, and a
+         * negative size, as 0. [setAsideDeviceCopy] stops its fetch at [MAX_FILE_SIZE] for it.
+         */
+        private const val UNANSWERED_SIZE = -1L
+
+        /**
+         * Free space below which a fetch into the mirror is not attempted: the app's own
+         * critically-low line plus one [MAX_FILE_SIZE] fetch, because the check runs
+         * before a fetch and one fetch can spend that much. Read live from the disk, so
+         * it needs no slack for block rounding the way a predicted total does.
+         *
+         * The [MAX_FILE_SIZE] half holds only for documents whose provider reports a
+         * size. One reported as 0 passes the size gate unmeasured, and a single such
+         * fetch can still run from the floor to a full disk.
+         */
+        internal const val OPEN_SPACE_FLOOR_BYTES = StorageManager.LOW_STORAGE_BYTES + MAX_FILE_SIZE
+
+        /**
+         * How many bytes of the copies an open kept rather than fetched, and that the record
+         * holds no digest for, it reads to digest them, newest first; see [digestKeptCopies].
+         * A copy read once is not read again while its identity stands, so this bounds the
+         * opens after an update from a build that recorded none: a typical source tree fits
+         * in the first, and a folder of photos or data is read over several rather than in
+         * full by one.
+         *
+         * 64 MB, decimal like every size a user reads ([StorageManager.formatSize]), because
+         * the user guide and the changelog give the figure.
+         */
+        internal const val KEPT_COPY_DIGEST_BYTES = 64_000_000L
+
+        /**
+         * How many entries one directory-create is allowed to copy to the device.
+         *
+         * A rename normally moves a handful of files, but nothing stops it moving a
+         * whole project, and every entry here is a provider round trip on the main
+         * sync path. The cap bounds that; reaching it is logged, because past it the
+         * copy on the device is genuinely incomplete and nothing else would say so.
+         */
+        internal const val MAX_UPLOAD_ENTRIES = 2000
+
+        /**
+         * How many bytes phase 2 would have to fetch for [documents] into [mirrorDir].
+         *
+         * Counts only what a copy would actually spend: a directory costs nothing, a
+         * document past [MAX_FILE_SIZE] is skipped rather than copied, and one the mirror
+         * already holds at the same length and no older is kept rather than fetched.
+         * Without those two exclusions, reopening a folder of large files reads as
+         * needing the whole folder again.
+         *
+         * A length the provider does not report arrives as 0 and is counted as 0, so a
+         * provider omitting `COLUMN_SIZE` makes the whole sync look free rather than made
+         * to fit a number nobody measured. That is the direction to fail in: the caller
+         * chooses the wording of a notice with this and refuses nothing, so a prediction
+         * that cannot be made must not become a claim.
+         */
+        internal fun bytesToFetch(documents: List<DocumentInfo>, mirrorDir: File): Long =
+            documents.asSequence()
+                .filterNot { it.isDirectory }
+                .filter { it.size in 1..MAX_FILE_SIZE }
+                .filterNot { doc ->
+                    val mirrored = File(mirrorDir, doc.relativePath)
+                    mirrored.isFile && mirrored.length() == doc.size &&
+                        mirrored.lastModified() >= doc.lastModified
+                }
+                .sumOf { it.size }
+
+        /**
+         * Whether writing [localPath] back would replace a device document this sync
+         * never read.
+         *
+         * Extracted because three paths ask it and one of them cannot be reached from a JVM
+         * test. [handleMirrorEvent] asks before queueing a job, and [processWriteBack] again
+         * just before it writes a save; [createOneInSaf] asks while walking into a
+         * directory, which no event-driven test can drive here at all, since delivering a
+         * directory event constructs a `FileObserver` and that runs a static initializer
+         * reaching native code (see [SafWatchCoverageTest]). Naming the rule once is what
+         * lets it be asserted for that path at all, and what stops the call sites drifting
+         * apart, which is how the directory walk came to be missing it.
+         *
+         * [deviceHoldsDocument] is the provider's answer, not a guess: the set alone is a
+         * memory of what this sync could not read, and the document may have been deleted
+         * on the device since, in which case the local file is an ordinary new file.
+         */
+        internal fun writeWouldReplaceUnreadDocument(
+            localPath: String,
+            deviceHoldsDocument: Boolean,
+            unfetched: Set<String>,
+            fetched: Boolean = false,
+        ): Boolean = deviceHoldsDocument && unfetched.any {
+            localPath == it || (!fetched && localPath.startsWith(it + File.separator))
+        }
+
+        /**
+         * Whether the mirror copy may be replaced with the one from the device folder.
+         *
+         * Opening a folder re-runs the whole copy, so this is what stands between a
+         * reopen and the loss of edits not yet written back.
+         *
+         * Timestamps alone are not enough to decide this, for two reasons found the
+         * hard way:
+         *
+         * - A size mismatch decides the tie, and only when the two timestamps agree.
+         *   Writers that preserve mtime (unzip, cp -p, rsync -t, git checkout) land
+         *   there with different lengths and still have to copy. Size came first once,
+         *   against a copy cut short leaving a short file with a *fresh* mtime, and it
+         *   cost far more than it saved: almost every edit changes a file's length, so
+         *   almost every unsaved edit read as "not a copy of the source" and was
+         *   overwritten by the older device copy. That truncation case is closed
+         *   elsewhere now, by [copyDocumentToLocal] staging the bytes outside the mirror
+         *   and renaming only once the stream finished, so an interrupted copy leaves no
+         *   file at the destination at all.
+         * - An unknown source timestamp (0) is decided by [mirrorIsOurCopy], not by the
+         *   clock, because there is no clock to ask. COLUMN_LAST_MODIFIED is optional and
+         *   arrives as 0 from MTP, some USB-OTG and some network providers.
+         *
+         *   Both obvious answers are wrong. "Always copy" freezes nothing but replaces a
+         *   local edit on every reopen, which is what this used to do. "Always keep"
+         *   protects the edit and freezes the folder for ever, since nothing in the app
+         *   can clear a mirror. The record settles it without guessing: if the mirror is
+         *   still exactly what the last sync wrote there, it is this app's own copy and
+         *   the device is entitled to replace it, so the folder still heals. If it is
+         *   not, it holds something written since, and that is the only copy.
+         *
+         * The comparison is only sound because [copyDocumentToLocal] stamps the mirror
+         * with the source's own timestamp, so both sides come from the same clock.
+         */
+        internal fun shouldOverwriteMirror(
+            mirrorExists: Boolean,
+            mirrorModified: Long,
+            mirrorSize: Long,
+            sourceModified: Long,
+            sourceSize: Long,
+            /**
+             * Whether the mirror file is byte-identical to the line the last sync
+             * recorded for it. No default: there is one production caller and it has the
+             * record in hand, and a default here would let a future caller answer the
+             * question by not thinking about it.
+             *
+             * A function, not a value, and the laziness belongs here rather than at the
+             * call site. Only the unknown-time branch below asks, and answering costs
+             * the caller a read of the whole synced record; passed by value, that read
+             * happened for every file on every provider, including the ones that report
+             * a time and never reach the branch. The alternative was for the caller to
+             * repeat `sourceModified == 0L` before computing it, which puts this
+             * function's branch condition in the caller and goes stale the moment a
+             * second branch here wants the same answer.
+             */
+            mirrorIsOurCopy: () -> Boolean,
+        ): Boolean = when {
+            !mirrorExists -> true
+            // The provider did not report a time, so the record answers instead: our
+            // own copy may be replaced, anything else is the only copy. A mirror with no
+            // record behind it is not ours to overwrite either, which is the direction
+            // reconcileDeletions already fails in.
+            //
+            // ⚠️ What this costs, and what gets it back. A file answering false here is
+            // kept and is not vouched, and while it stays that way device changes stop
+            // arriving and the mirror cannot be reclaimed. It does not stay that way by
+            // itself: the caller compares the two sides' bytes, and when they agree,
+            // which is where an edit the watcher carried to the device ends up, it
+            // records the file and this clause answers true again on the next sync.
+            //
+            // What no branch recovers is an edit the watcher never delivered. With no
+            // clock there is nothing to say whether the device copy is older or newer,
+            // so neither side is pushed over the other.
+            //
+            // Kept anyway, because the alternative is worse and is what shipped: with no
+            // timestamp there is nothing to tell a device edit from a local one, and the
+            // old answer assumed the device always won, so every reopen destroyed the
+            // local edit. This one assumes the local edit wins once the two diverge. It
+            // loses updates; the other lost work. Note the divergence usually resolves
+            // itself in content if not in bookkeeping: the watcher writes the local edit
+            // out on the next save, after which both sides hold the same bytes.
+            //
+            // Content is what tells a device change from a local one without a clock,
+            // and the caller reads both sides to ask. It is affordable because the
+            // question is only asked for files this clause kept, which on a healthy
+            // folder is none: every other file is answered true here and copied, which
+            // reads the device document anyway.
+            sourceModified == 0L -> mirrorIsOurCopy()
+            sourceModified > mirrorModified -> true
+            // A newer local copy wins, whatever its size. Checking size before this
+            // was the defect: almost every edit changes a file's length, so almost
+            // every unsaved edit looked like "not a copy of the source" and was
+            // overwritten, the exact case this guard exists for.
+            mirrorModified > sourceModified -> false
+            // Same timestamp, different content. Writers that preserve mtime (unzip,
+            // cp -p, rsync -t, git checkout) land here.
+            else -> mirrorSize != sourceSize
+        }
+
+        /**
+         * Directories to skip during sync: auto-generated and too large.
+         *
+         * "build" and ".vscode" are deliberately absent. build/ holds real
+         * source in many projects (Gradle build scripts, C output kept in
+         * tree), and .vscode/ holds launch.json, settings.json and
+         * extensions.json, the workspace settings users most want synced.
+         * Adding either back silently stops those files reaching the device.
+         */
+        internal val SKIP_DIRECTORIES = setOf(
+            "node_modules",
+            ".git",
+            "__pycache__",
+            ".gradle",
+            ".idea",
+            "venv",
+            ".env"
+        )
+
+        /**
+         * Whether a provider's display name can stand as one path segment, as it is.
+         *
+         * `COLUMN_DISPLAY_NAME` is whatever text the provider returned; nothing promises
+         * it is a single name. [walkTree] composes it into a relative path and the copy
+         * turns that into a real one with [File], creating directories along the way, so
+         * a value carrying a separator or a parent reference would land outside the
+         * mirror, somewhere the engine has no business writing and no record of having
+         * written.
+         *
+         * Worth knowing when judging the cost: a platform provider derives the name from
+         * a real filename and cannot return such a value, so this never fires for the
+         * common case. Providers that relay names from elsewhere (cloud, WebDAV, SMB)
+         * have no such guarantee.
+         *
+         * [reconcileDeletions] already declines to act on a path that resolves out of the
+         * mirror. This is the same check one step earlier, where the path is composed
+         * rather than consumed; having it on only one side was the oversight.
+         */
+        internal fun isSafeSegment(name: String?): Boolean =
+            !name.isNullOrEmpty() && name != "." && name != ".." &&
+                name.none { it == '/' || it == '\\' }
+
+        /**
+         * Whether the directory [path] really sits at or under [confine], which is a
+         * canonical directory path with a trailing separator.
+         *
+         * The separator is appended to [path] as well, so the confining directory itself
+         * answers true: a file at the root of the mirror has the mirror as its parent,
+         * and refusing that would refuse the whole folder.
+         *
+         * The question [isSafeSegment] cannot answer, because it looks at one display
+         * name and this looks at what the filesystem does with the whole path. A mirror
+         * is routinely a checked-out repository, so a link inside one is
+         * attacker-supplied in the ordinary case, and every stream in this engine reads
+         * and writes *through* a link. [isLink] is deliberately about the entry rather
+         * than about its parents, which is right where it is used and wrong here: what
+         * puts a device document outside the granted folder is a link one or more levels
+         * above it.
+         *
+         * A path that will not resolve is not inside anything, so it answers false. That
+         * is the direction the rest of this engine fails in, and it is what
+         * [reconcileDeletions] does with the same question on the other side.
+         */
+        internal fun resolvesInside(path: File?, confine: String): Boolean = try {
+            path != null && (path.canonicalPath + File.separator).startsWith(confine)
+        } catch (e: Exception) {
+            false
+        }
+
+        /** Testable: checks if a directory should be skipped during sync. */
+        internal fun shouldSkip(name: String, isDir: Boolean): Boolean {
+            if (!isDir) return false
+            return name in SKIP_DIRECTORIES
+        }
+
+        /**
+         * Everything under [root] that has to be created on the device when [root]
+         * itself is created, parents before children.
+         *
+         * A directory that simply appears in the mirror is the case this serves: without
+         * the walk the create put an empty directory on the device and the files stayed
+         * in the local mirror, which is reclaimed as soon as the permission lapses.
+         *
+         * What it cannot do is stand in for a copy the device already has: the cap bounds
+         * it, and [SKIP_DIRECTORIES] excludes directories the mirror never held a copy of
+         * in the first place. That is why a rename [handleMirrorEvent] could pair goes to
+         * `renameDocument` instead of coming through here, and why an unpaired one leaves
+         * the old name on the device rather than deleting it and rebuilding from here.
+         *
+         * Breadth-first so the cap, when it bites, spends the budget on the shallow
+         * entries a person is likelier to be looking at. Parents precede children by
+         * construction, which the caller needs: a child cannot be created until its
+         * parent document exists.
+         *
+         * [UploadPlan.truncated] is how the caller learns the cap bit at all. The list
+         * cannot say so on its own, which is what the walk below collects one entry past
+         * the cap to answer.
+         *
+         * Only the entries [counts] accepts are listed and spend the cap; the walk still
+         * descends through every directory, accepted or not. The default accepts
+         * everything, which is what a directory-create needs, since every entry under it
+         * is a provider round trip. [uploadMirrorOnlyDocuments] accepts only the files
+         * the device lacks, because there the entries it already has cost the provider
+         * nothing and a cap spent on them was permanent for the folder.
+         *
+         * Symbolic links are not followed. A mirror is routinely a checked-out
+         * repository, so a link inside one is attacker-supplied in the ordinary case,
+         * and following it would copy files from outside the folder the user granted.
+         */
+        internal fun uploadPlan(
+            root: File,
+            limit: Int,
+            counts: (File) -> Boolean = { true },
+        ): UploadPlan {
+            // [root] is tested for being a link before anything else, and that is not
+            // symmetry with the children loop below -- it is the case that reaches
+            // outside the folder the user granted. `File.isDirectory` follows links,
+            // and so does the observer that produces these jobs
+            // (`(event and IN_ISDIR) != 0 || localFile.isDirectory`), so a symlink to
+            // a directory arrives here looking exactly like a directory. Walking it
+            // would list the *target's* contents and copy them onto the device: point
+            // one at a home directory inside a synced folder and the whole of it
+            // uploads.
+            if (limit <= 0 || isLink(root) || !root.isDirectory) {
+                return UploadPlan(emptyList(), truncated = false)
+            }
+
+            val found = mutableListOf<File>()
+            val pending = ArrayDeque<File>()
+            pending.addLast(root)
+
+            // One entry past the cap, which is what makes the truncation answer exact:
+            // a walk that stops at exactly [limit] cannot tell a directory that ends
+            // there from one with a thousand more files below it, and the extra entry
+            // exists only in the second case.
+            //
+            // Written as `<= limit` rather than as a `limit + 1` ceiling because a
+            // caller passing Int.MAX_VALUE would overflow that into a negative one and
+            // get an empty plan for a folder full of files.
+            while (pending.isNotEmpty() && found.size <= limit) {
+                val dir = pending.removeFirst()
+                val children = dir.listFiles() ?: continue
+                for (child in children.sortedBy { it.name }) {
+                    if (found.size > limit) break
+                    if (isLink(child)) continue
+                    val isDir = child.isDirectory
+                    if (isDir && shouldSkip(child.name, isDir = true)) continue
+                    // The same filter every other local-to-device path applies.
+                    // shouldWriteBack drops these for single-file events, and the
+                    // recursion was the one route around it -- so a directory
+                    // appearing while an editor held a `.swp`, or while a mirror
+                    // copy was still `.vscodroid-partial`, put that scratch file on
+                    // the user's device folder under its temporary name, where
+                    // nothing later removes it.
+                    if (!isDir && isMachineTemporary(child.name)) continue
+                    if (counts(child)) found.add(child)
+                    if (isDir) pending.addLast(child)
+                }
+            }
+            // The extra entry is reported and then dropped: what the caller creates is
+            // still capped at [limit], and a prefix of a breadth-first walk keeps
+            // parents ahead of their children, which is what the caller creates by.
+            val truncated = found.size > limit
+            return UploadPlan(if (truncated) found.take(limit) else found, truncated)
+        }
+
+        /**
+         * Whether two local files hold the same bytes.
+         *
+         * Lengths first, so the read is skipped for the pair that cannot match, which is
+         * the usual shape of an edit. Deliberately not a length test on its own: writers
+         * that keep a file's size while changing it are ordinary, and the whole reason
+         * [setAsideDivergedMirror] asks is to tell an edit from a copy of the same thing.
+         *
+         * A read that fails answers false, which sends the caller down the preserving
+         * branch. That costs a spare copy of a file in the mirror and never a byte.
+         */
+        internal fun sameBytes(a: File, b: File): Boolean {
+            if (a.length() != b.length()) return false
+            return try {
+                a.inputStream().use { left ->
+                    b.inputStream().use { right ->
+                        val one = ByteArray(COPY_BUFFER_SIZE)
+                        val two = ByteArray(COPY_BUFFER_SIZE)
+                        while (true) {
+                            val read = readFully(left, one, one.size)
+                            if (read != readFully(right, two, two.size)) return false
+                            if (read == 0) return true
+                            // Only the bytes this chunk filled, for the reason
+                            // [deviceMatchesMirror] gives: the previous, longer chunk's
+                            // tail is still in the buffer otherwise.
+                            if (!java.util.Arrays.equals(one, 0, read, two, 0, read)) return false
+                        }
+                        @Suppress("UNREACHABLE_CODE") false
+                    }
+                }
+            } catch (e: Exception) {
+                false
+            }
+        }
+
+        /**
+         * The SHA-256 of what [input] holds and how many bytes that is, or null as soon as
+         * it holds more than [limit].
+         */
+        private fun sha256(input: InputStream, limit: Long): Pair<ByteArray, Long>? {
+            val digest = MessageDigest.getInstance("SHA-256")
+            val buffer = ByteArray(COPY_BUFFER_SIZE)
+            var total = 0L
+            var read = input.read(buffer)
+            while (read >= 0) {
+                total += read
+                if (total > limit) return null
+                digest.update(buffer, 0, read)
+                read = input.read(buffer)
+            }
+            return digest.digest() to total
+        }
+
+        /**
+         * Fills [buffer] from [input] until [length] bytes are in it or the stream ends, and
+         * answers how many that was: zero for an end that came first, where `read` says -1.
+         *
+         * `InputStream.readNBytes(byte[], int, int)` with the same contract, which is API 33.
+         * The loop is the one the JDK's own default runs, so a short read is waited out and
+         * not taken for the end of the document, which is what the three comparisons above
+         * depend on.
+         */
+        private fun readFully(input: InputStream, buffer: ByteArray, length: Int): Int {
+            var filled = 0
+            while (filled < length) {
+                val count = input.read(buffer, filled, length - filled)
+                if (count < 0) break
+                filled += count
+            }
+            return filled
+        }
+
+        /**
+         * Copies [input] into [output] and answers how many bytes that was, or null as soon as
+         * it holds more than [limit], having written no more than [limit] of them.
+         */
+        private fun copyAtMost(input: InputStream, output: OutputStream, limit: Long): Long? {
+            val buffer = ByteArray(COPY_BUFFER_SIZE)
+            var total = 0L
+            var read = input.read(buffer)
+            while (read >= 0) {
+                total += read
+                if (total > limit) return null
+                output.write(buffer, 0, read)
+                read = input.read(buffer)
+            }
+            return total
+        }
+
+        /**
+         * Whether [file] is a symbolic link, without following it.
+         *
+         * `File.exists()` follows links, so it cannot answer this. Comparing the
+         * canonical path against the absolute one can: they differ exactly when some
+         * component of the path was a link. The parent is canonicalised first so a
+         * link *above* this file -- which is not this file's problem -- does not make
+         * every entry beneath it look like one.
+         */
+        private fun isLink(file: File): Boolean = try {
+            val parent = file.parentFile?.canonicalFile ?: return false
+            File(parent, file.name).let { it.canonicalPath != it.absolutePath }
+        } catch (e: Exception) {
+            true
+        }
+
+        /**
+         * The directories a watch has to cover for [root], one per directory, capped
+         * at [limit] and spent breadth-first.
+         *
+         * [root] itself is included, and below it everything the walk would have
+         * mirrored: the exclusions are [SKIP_DIRECTORIES], the set [walkTree] already
+         * obeys, so nothing inside them is mirrored in and a watch there would spend a
+         * kernel descriptor on changes with nowhere to go. That is also what keeps the
+         * count survivable: one `node_modules` runs to thousands of directories on its
+         * own.
+         *
+         * The order matters only once the cap bites, and then it decides which
+         * directories go unwatched: breadth-first spends the budget on the shallow
+         * ones, which is where a person edits, rather than on wherever a depth-first
+         * descent happened to reach first.
+         *
+         * Symbolic links are not followed, for the same reason [uploadPlan]
+         * refuses them and with the same words: a mirror is routinely a checked-out
+         * repository, so a link inside one is attacker-supplied in the ordinary
+         * case, and inotify follows a symlinked path. Watching through one spends
+         * this app's descriptor budget on a tree outside the granted folder, and
+         * every change there arrives as an event under a mirror-relative path that
+         * [shouldWriteBack] happily serves, copying content from outside the grant
+         * onto the device.
+         */
+        internal fun watchableDirectories(root: File, limit: Int): List<File> {
+            if (limit <= 0 || isLink(root) || !root.isDirectory) return emptyList()
+
+            val found = mutableListOf<File>()
+            val pending = ArrayDeque<File>()
+            pending.addLast(root)
+
+            while (pending.isNotEmpty() && found.size < limit) {
+                val dir = pending.removeFirst()
+                found.add(dir)
+                val children = dir.listFiles() ?: continue
+                for (child in children) {
+                    if (isLink(child)) continue
+                    if (child.isDirectory && !shouldSkip(child.name, isDir = true)) {
+                        pending.addLast(child)
+                    }
+                }
+            }
+            return found
+        }
+
+        /** Scratch files the machine makes for itself and is about to rename or drop. */
+        private fun isMachineTemporary(name: String): Boolean =
+            name.endsWith(PARTIAL_SUFFIX)
+
+        /**
+         * Whether a change at [relativePath] should be pushed back to the device.
+         *
+         * This is [shouldSkip] applied to a path rather than to a single entry, so that
+         * what the walk declines to mirror in is what this declines to write back out.
+         *
+         * The rule it replaces tested `relativePath.startsWith(".")`, which had no
+         * counterpart on the way in: [SKIP_DIRECTORIES] deliberately does not list
+         * `.vscode`, so workspace settings, `.gitignore` and `.editorconfig` were copied
+         * into the mirror and then never allowed back onto the device: edited in the
+         * editor, saved, and silently lost on the device side.
+         *
+         * [PARTIAL_SUFFIX] alone is reserved for unfinished engine copies. Other suffixes
+         * can name user files, so their saves must reach the device too.
+         */
+        internal fun shouldWriteBack(relativePath: String, isDirectory: Boolean): Boolean {
+            if (relativePath.isEmpty()) return false
+            val segments = relativePath.split('/')
+            val name = segments.last()
+            if (isMachineTemporary(name)) return false
+            // Every segment but the last is a directory by construction; the last one is
+            // only a directory when the caller says so.
+            if (segments.dropLast(1).any { shouldSkip(it, isDir = true) }) return false
+            return !shouldSkip(name, isDirectory)
+        }
+    }
+}
+
+// -- Data Classes --
+
+/**
+ * Thrown by [SafSyncEngine.initialSync] when the mirror is taken: another sync of it, or a
+ * save, delete or rename still being sent to the provider.
+ *
+ * Its own type because of when it is raised: before anything of the mirror was touched. A
+ * caller can therefore put the folder's watcher back even when the folder that was
+ * refused is the one being watched, which a sync that failed part-way through writing
+ * must never allow.
+ */
+class FolderBusyException : IOException("The folder is still syncing; try opening it again")
+
+internal data class DocumentInfo(
+    val uri: Uri,
+    val docId: String,
+    val relativePath: String,
+    val isDirectory: Boolean,
+    val size: Long,
+    /** Provider's last-modified time, or 0 when it does not report one. */
+    val lastModified: Long = 0
+)
+
+internal data class SyncJob(
+    val type: SyncType,
+    val localPath: String,
+    val safDocUri: Uri?,
+    val safParentUri: Uri?,
+    val safTreeUri: Uri?,
+    val timestamp: Long,
+    /**
+     * For a RENAME, the parent the document sits under *now*, which is what
+     * `moveDocument` needs alongside the destination and is not recoverable from
+     * the other fields: [safDocUri] names the document and [safParentUri] names
+     * where it is going. Null on every other job type, and on a rename that
+     * stays inside one directory.
+     */
+    val safSourceParentUri: Uri? = null,
+    /**
+     * For a RENAME, the name the document currently carries on the device, so
+     * the write-back can tell a move that keeps its name from one that does not
+     * without reading a name out of a document ID. Null on every other type.
+     */
+    val previousName: String? = null,
+    /**
+     * The path of [localPath] relative to the mirror's root, which the write-back
+     * thread has no other way to recover: it knows absolute paths and document
+     * URIs, and neither names the cache entries or the destination parent a
+     * rename needs. Empty only where a job was built by something other than
+     * [SafSyncEngine.handleMirrorEvent], which fills it.
+     */
+    val relativePath: String = "",
+    /**
+     * Whether [localPath] was a directory, as its event said, which a DELETE has no other
+     * way to know by the time it runs: the entry is already gone. Filled by
+     * [SafSyncEngine.handleMirrorEvent].
+     */
+    val isDirectory: Boolean = false,
+    /** The mirror and generation observed before resolving this event's provider IDs. */
+    val mirrorRoot: File? = null,
+    val generation: Any? = null,
+    /** Writes and creates queued under the old directory name before this rename claimed it. */
+    val renamedSaves: List<String> = emptyList(),
+    /** The full previous mirror path whose provider state moves only after relocation. */
+    val previousPath: String? = null,
+)
+
+internal enum class SyncType {
+    MODIFY, CREATE, DELETE, RENAME
+}
+
+/**
+ * What became of a device document that a newer mirror copy is about to replace.
+ *
+ * See [SafSyncEngine.setAsideDeviceCopy] for why the callers need four answers
+ * rather than a Boolean.
+ */
+internal enum class DeviceCopyOutcome {
+    /**
+     * A `.device-<time>` file is beside the mirror copy, and phase 2b or the live watcher
+     * may put it across.
+     */
+    PRESERVED,
+
+    /**
+     * Both sides held the same bytes, so the fetched copy was deleted again.
+     *
+     * The ordinary end of a delivered write-back rather than an exotic case: the record
+     * never learns the time that write left on the device, and a provider with coarse
+     * stamps reports one below the mirror's, so every reopen after a save arrives here.
+     */
+    IDENTICAL,
+
+    /**
+     * A writer is streaming into this device document, or began writing during
+     * the read, so the copy cannot establish stable bytes. Callers defer the write
+     * without marking the document unread, even if the other writer has finished.
+     */
+    IN_FLIGHT,
+
+    /**
+     * The device copy could not be brought over, so writing over it would lose it: the
+     * document would not open, the copy failed, another sync is already fetching it, or
+     * it is reported larger than [SafSyncEngine.MAX_FILE_SIZE], or holds more than that
+     * where the provider did not answer for its size.
+     */
+    UNAVAILABLE,
+}
+
+/**
+ * What [SafSyncEngine] last knew of one device document: the (COLUMN_LAST_MODIFIED,
+ * COLUMN_SIZE) its provider reported, or a placeholder no report equals where a read matched
+ * the bytes at a stamp query the provider did not answer, and the SHA-256 of what the open
+ * fetched from it or this app's last write streamed into it, or of the mirror copy the open
+ * kept, with the length of those bytes. That digest is null for a kept copy that no open has
+ * digested yet and this open's budget, [SafSyncEngine.KEPT_COPY_DIGEST_BYTES], did not
+ * reach, until a write of this app lands there, and after a write that does not land.
+ */
+private class DeviceState(
+    /**
+     * Null where an open found the device holding bytes it could not place, or where a stamp
+     * moved past the bytes this engine read and a read could not show them unchanged, so
+     * that no stamp the provider reports, or fails to report, lets a save or a delete through
+     * without the bytes being read. The digest is then the previous record's for the path,
+     * or the one the entry carried when the stamp moved, or null where there is none.
+     */
+    val stamp: Pair<Long, Long>?,
+    val sha256: ByteArray? = null,
+    val length: Long = 0,
+)
+
+/**
+ * A save [SafSyncEngine] held back: the document it was going to, when it is next tried,
+ * and how long it waited for that try.
+ */
+private class HeldBackSave(val docUri: Uri, val dueAt: Long, val wait: Long)
+
+private sealed interface DocumentCopyResult
+
+/** The installed copy's filesystem time and the number of bytes fetched. */
+private class LandedCopy(val lastModified: Long, val length: Long) : DocumentCopyResult
+
+private enum class FailedCopy : DocumentCopyResult { IN_FLIGHT, UNAVAILABLE }
+
+private class DocumentAccess {
+    var writer: String? = null
+    var generation = 0L
+    var readers = 0
+}
+
+private class ProviderMutation(val key: String?) {
+    /** A waiter has already given up on this holder, so the next one need not wait for it. */
+    @Volatile var waitedOut = false
+}
+
+private class DocumentWriteDuringReadException : IOException()
+
+/**
+ * What [SafSyncEngine.uploadPlan] found under a directory, and whether the cap stopped
+ * the walk short of the tree.
+ *
+ * The flag is carried rather than derived because the two part company at exactly the
+ * cap: [entries] is capped at the limit, so its size reads as "there was more" for a
+ * directory that ends there naturally as readily as for one with a thousand more files
+ * below.
+ */
+internal data class UploadPlan(val entries: List<File>, val truncated: Boolean)
+
+/**
+ * A directory that left the mirror and has not been accounted for yet.
+ *
+ * [relativePath] is where it was, which is all a later MOVED_TO needs to find the
+ * document still standing under that name on the device.
+ */
+internal data class VanishedDirectory(
+    val relativePath: String,
+    val atMillis: Long,
+    /**
+     * Where it was in the mirror, absolutely, which is the only spelling the upload
+     * journal answers to: its lines are absolute paths because one engine serves every
+     * folder in turn, while [relativePath] is what the device side needs. Carried on the
+     * record rather than rebuilt from a mirror root, because the readers that retire
+     * those lines ([SafSyncEngine.dropVanished]'s callers) run where no root is in hand.
+     */
+    val localPath: String
+)
+
+/**
+ * One write-back's claim on the mirror path it is streaming into, held from the moment
+ * its journal line is written until that write ends.
+ *
+ * [path] is a var because the directory above it can be renamed in the editor while the
+ * stream runs, and the claim and the line are two records of one write:
+ * [SafSyncEngine.renameUploadsUnder] moves both together, so the writer's release names
+ * the line as it is spelled then rather than as it was spelled when the stream opened.
+ * Identity is what a writer releases, so this is deliberately not a data class: two
+ * writers of one path hold two claims and each must retire only its own.
+ *
+ * Read and written only under the journal lock, which is what makes a plain var safe here.
+ */
+private class UploadClaim(var path: String)
+
+private data class InboundScratchKey(val parent: Any, val name: String)
+
+internal class OutboundPath(
+    val parent: SecureDirectoryStream<Path>,
+    val leaf: Path,
+    val directories: List<SecureDirectoryStream<Path>>,
+    val rootKey: Any,
+) : Closeable {
+    fun attributes(name: Path = leaf): BasicFileAttributes = parent.getFileAttributeView(
+        name, BasicFileAttributeView::class.java, LinkOption.NOFOLLOW_LINKS,
+    )?.readAttributes() ?: throw IOException("Source attributes are unavailable")
+
+    fun parentKey(): Any = parent.getFileAttributeView(BasicFileAttributeView::class.java)
+        ?.readAttributes()?.fileKey() ?: throw IOException("The directory has no identity")
+
+    fun sibling(name: String): Path = leaf.fileSystem.getPath(name).also {
+        if (it.isAbsolute || it.nameCount != 1 || name == "." || name == "..") {
+            throw IOException("The entry name is not a path segment")
+        }
+    }
+
+    fun input(name: Path = leaf): InputStream = Channels.newInputStream(parent.newByteChannel(
+        name, setOf<OpenOption>(StandardOpenOption.READ, LinkOption.NOFOLLOW_LINKS),
+    ))
+
+    fun modified(time: Long) {
+        val view = parent.getFileAttributeView(leaf, BasicFileAttributeView::class.java, LinkOption.NOFOLLOW_LINKS)
+            ?: throw IOException("The entry attributes are unavailable")
+        view.setTimes(FileTime.fromMillis(time), null, null)
+    }
+
+    override fun close() = closeOutboundResources(null, directories)
+}
+
+private class OutboundSource(
+    val input: InputStream,
+    val attributes: BasicFileAttributes,
+    val path: OutboundPath,
+) : Closeable {
+    override fun close() = closeOutboundResources(input, path.directories)
+}
+
+private fun closeOutboundResources(input: InputStream?, directories: List<SecureDirectoryStream<Path>>) {
+    var failure: Exception? = null
+    val resources = listOfNotNull<Closeable>(input) + directories.asReversed()
+    for (resource in resources) {
+        try {
+            resource.close()
+        } catch (closing: Exception) {
+            if (failure == null) failure = closing else failure.addSuppressed(closing)
+        }
+    }
+    failure?.let { throw it }
+}
+
+/**
+ * Reset and provider mutations share admission. A reset never waits for a provider; a write
+ * waits for another write, for a bounded time, and for nothing else.
+ */
+private class MirrorAccess {
+    val lock = ReentrantLock()
+    val stateLock = Any()
+    var syncing = false
+    @Volatile var generation: Any = Any()
+}
+
+private class OutboundAccess(
+    private val mirror: MirrorAccess,
+    val generation: Any,
+    private val turnWaitMs: Long,
+) {
+    private fun current() = synchronized(mirror.stateLock) {
+        !mirror.syncing && mirror.generation === generation
+    }
+
+    /**
+     * Runs [action] with the mirror to itself, or answers null when it must not run.
+     *
+     * Null means stale, and it is said at once for a write admitted under an older
+     * generation and for a mirror being reset: neither has anything left to tell the
+     * device, and the generation is read before the lock so such a write never contends
+     * with the current one. Another current write holding the mirror is a turn to wait
+     * for, not staleness: a folder switch leaves the closing drain finishing its queue
+     * while the restored watcher's drain starts, and both are entitled to write. The wait
+     * is polled, so a reset that begins meanwhile ends it, and bounded by [turnWaitMs], so
+     * a provider call that never returns costs the waiting save its place and a notice
+     * rather than a thread for good.
+     *
+     * An interrupt does not cut the wait short: the job has been taken off its queue and a
+     * thrown wait would lose it. It is set aside
+     * for the action, which must not meet it (a stream copy fails on a thread carrying
+     * one), and handed back after.
+     */
+    fun <T> run(action: () -> T): T? {
+        if (!current()) return null
+        var interrupted = false
+        try {
+            var held = mirror.lock.tryLock()
+            val deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(turnWaitMs)
+            while (!held) {
+                val left = deadline - System.nanoTime()
+                if (left <= 0 || !current()) return null
+                held = try {
+                    mirror.lock.tryLock(minOf(left, TURN_POLL_NANOS), TimeUnit.NANOSECONDS)
+                } catch (_: InterruptedException) {
+                    interrupted = true
+                    false
+                }
+            }
+            try {
+                if (Thread.interrupted()) interrupted = true
+                return if (current()) action() else null
+            } finally {
+                mirror.lock.unlock()
+            }
+        } finally {
+            if (interrupted) Thread.currentThread().interrupt()
+        }
+    }
+
+    fun <T> update(action: () -> T): T? = synchronized(mirror.stateLock) {
+        if (!mirror.syncing && mirror.generation === generation) action() else null
+    }
+
+    private companion object {
+        /** How often a waiting write looks again at whether a reset has overtaken it. */
+        val TURN_POLL_NANOS = TimeUnit.MILLISECONDS.toNanos(200)
+    }
+}
+
+/**
+ * One folder's write-back: the jobs its observers produced, and the thread sending them.
+ *
+ * Per folder rather than per engine, and that is what keeps two writers off one
+ * document. [SafSyncEngine.stopWatching] leaves a drain that outran its grace period
+ * holding this object and installs a fresh one, so the jobs of the folder opened next go
+ * somewhere the departing thread cannot reach, and the thread started for that folder
+ * polls a queue nothing else polls.
+ */
+internal class WatchSession(
+    /**
+     * The mirror this session's observers watch, whose held-back saves its loop tries
+     * again; null for a session no watcher serves.
+     */
+    val root: File? = null,
+    val generation: Any? = null,
+) {
+    val queue = ConcurrentLinkedQueue<SyncJob>()
+    /** One-shot inode checks for directory names already followed after provider creation or rename. */
+    val normalizedDirectories = ConcurrentHashMap<String, Pair<String, Any>>()
+
+    /** Cleared by [SafSyncEngine.stopWatching]; the loop's own termination condition. */
+    @Volatile var running = true
+
+    /**
+     * Whether [queue] has stopped being polled, which no session ever comes back from:
+     * a worker is started once, by the [SafSyncEngine.startWatching] that installed the
+     * session, and never again.
+     *
+     * What it buys is a sentence in a bug report. An event observed while the folder was
+     * open can finish its provider round trips after the drain has taken its last look,
+     * and the save it carries then reaches no device and nothing retries it. The stop's
+     * own count cannot see that one: on an ordinary folder switch the idle drain exits in
+     * microseconds, so the queue is counted and cleared while the event is still inside
+     * the provider, and the offer that follows is what has to say so.
+     *
+     * True from birth for the session [SafSyncEngine.stopWatching] installs, which is the
+     * one no worker is ever started for. An event that read [SafSyncEngine.isWatching]
+     * before that stop and the session after it is handed exactly that object, and its
+     * save is as undelivered as the one above.
+     */
+    @Volatile var abandoned = false
+
+    /** The thread draining [queue], or null before one is started and once it is joined. */
+    @Volatile var worker: Thread? = null
+}

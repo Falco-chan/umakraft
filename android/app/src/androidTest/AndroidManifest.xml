@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <queries>
+        <package android:name="com.vscodroid.debug" />
+    </queries>
+    <application>
+        <receiver
+            android:name="com.vscodroid.storage.SafProviderGrantReceiver"
+            android:exported="true"
+            android:permission="android.permission.DUMP"
+            android:process=":saf_test_provider" />
+        <provider
+            android:name="com.vscodroid.storage.SafDocumentsProvider"
+            android:authorities="com.vscodroid.test.saf.documents"
+            android:exported="true"
+            android:grantUriPermissions="true"
+            android:permission="android.permission.MANAGE_DOCUMENTS"
+            android:process=":saf_test_provider">
+            <intent-filter>
+                <action android:name="android.content.action.DOCUMENTS_PROVIDER" />
+            </intent-filter>
+        </provider>
+    </application>
+</manifest>

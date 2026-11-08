@@ -1,0 +1,303 @@
+package com.vscodroid.keyboard
+
+import com.vscodroid.SourceScan
+import org.junit.jupiter.api.Assertions.assertTrue
+import org.junit.jupiter.api.Test
+import java.io.File
+
+/**
+ * That the alternates window is owned by the row that opens it, and that the
+ * row itself never takes input focus.
+ *
+ * A [LongPressPopup] is a window, not a child view: nothing takes it down with
+ * the row it was anchored to. It used to be constructed and dropped on the
+ * floor, so the only things that could close it were the user selecting an
+ * alternate and the user touching outside it. A row torn down with one open,
+ * which is what finishing the activity does and what a configuration change
+ * outside `MainActivity`'s `configChanges` list does, left a window attached to
+ * a token that no longer exists.
+ *
+ * Source-reading, for the reason the rest of this package gives: [ExtraKeyRow]
+ * is a `View` whose initialiser reaches resources, colours and display metrics
+ * before its constructor finishes, so no JVM test can build one. Every case
+ * below opens with a control, so a scan that has stopped matching cannot report
+ * a clean row by finding nothing at all.
+ */
+class ExtraKeyRowPopupTest {
+
+    /**
+     * The row's source with comment lines dropped, so prose naming a call is
+     * not a call. Both comment forms, because both switch code off, and this
+     * file's subject is a `dismiss()` that the class comments also discuss.
+     */
+    private fun code(): List<String> {
+        val file = File("src/main/kotlin/com/vscodroid/keyboard/ExtraKeyRow.kt")
+        assertTrue(
+            file.isFile,
+            "ExtraKeyRow.kt is not at ${file.absolutePath}; this test would otherwise " +
+                "pass by reading nothing",
+        )
+        var inBlock = false
+        return file.readText().lines().filterNot { line ->
+            val start = line.trimStart()
+            when {
+                inBlock -> {
+                    if (line.indexOf("*/") >= 0) inBlock = false
+                    true
+                }
+                start.startsWith("/*") -> {
+                    if (line.indexOf("*/", line.indexOf("/*") + 2) < 0) inBlock = true
+                    true
+                }
+                else -> start.startsWith("//") || start.startsWith("*")
+            }
+        }
+    }
+
+    @Test
+    fun `the row keeps the popup it opened`() {
+        val lines = code()
+        val start = lines.indexOfFirst { it.contains("private fun showLongPressPopup(") }
+        assertTrue(start >= 0, "showLongPressPopup is no longer where this test looks")
+
+        val body = lines.drop(start).take(10).joinToString("\n")
+        assertTrue(
+            body.contains("LongPressPopup(context, alternates)"),
+            "the window found does not open the popup, so its verdict below is worth " +
+                "nothing. It reads:\n$body",
+        )
+        assertTrue(
+            body.contains("longPressPopup = LongPressPopup("),
+            "the popup is constructed and dropped, so nothing owned by the app can close " +
+                "it and a second long press stacks another window over it. It reads:\n$body",
+        )
+        assertTrue(
+            body.contains("longPressPopup?.dismiss()"),
+            "opening a popup no longer closes the one already up. It reads:\n$body",
+        )
+    }
+
+    @Test
+    fun `a configuration change closes the popup before deciding it changed nothing`() {
+        val lines = code()
+        val start = lines.indexOfFirst { it.contains("override fun onConfigurationChanged(") }
+        assertTrue(start >= 0, "onConfigurationChanged is no longer where this test looks")
+
+        val body = lines.drop(start).take(12)
+        val dismiss = body.indexOfFirst { it.contains("longPressPopup?.dismiss()") }
+        val earlyReturn = body.indexOfFirst { it.contains("if (repacked == pages && !densityChanged) return") }
+
+        // The control. Both landmarks have to be in the window this reads, or a
+        // renamed guard would leave the case passing on an empty comparison.
+        assertTrue(dismiss >= 0, "the config-change path no longer dismisses the popup at all")
+        assertTrue(
+            earlyReturn >= 0,
+            "the repack guard is no longer where this test looks, so the ordering below is " +
+                "being asserted about nothing",
+        )
+
+        assertTrue(
+            dismiss < earlyReturn,
+            "the popup is dismissed only after the repack guard has decided the pages did " +
+                "not change, and on a rotation they never do: smallestScreenWidthDp is the " +
+                "smaller dimension by definition, so turning the phone over always takes " +
+                "that return and leaves the alternates floating over the new layout",
+        )
+    }
+
+    @Test
+    fun `the popup goes down with the keyboard`() {
+        val lines = code()
+        val start = lines.indexOfFirst { it.contains("visibility = if (showRow)") }
+        assertTrue(
+            start >= 0,
+            "the row no longer drives its visibility from the IME insets, so this case is " +
+                "reading nothing",
+        )
+
+        // Bounded by the line that ends the listener's decision rather than by a
+        // line count. The branch below the anchor carries most of the reasoning
+        // that keeps it correct, so any window written as a number is a window a
+        // comment can push the code out of, silently.
+        val length = lines.drop(start).indexOfFirst { it.contains("Logger.d(") }
+        assertTrue(
+            length > 0,
+            "the listener no longer logs what it decided, so this case cannot tell where " +
+                "the decision it is reading ends",
+        )
+
+        val body = lines.drop(start).take(length).joinToString("\n")
+        assertTrue(
+            body.contains("resetModifiersIfNeeded()"),
+            "the hidden-IME branch is no longer where this test looks. It reads:\n$body",
+        )
+        assertTrue(
+            body.contains("longPressPopup?.dismiss()"),
+            "the row goes GONE with the keyboard and leaves the alternates window standing " +
+                "over the editor, with no key under it and nothing to say what it belongs " +
+                "to. It reads:\n$body",
+        )
+    }
+
+    /**
+     * A swipe that starts on a key with alternates and turns the page leaves no
+     * popup behind.
+     *
+     * The key's long press fires once the finger has stayed inside the touch
+     * slop for the long-press timeout, which a swipe that starts slowly does,
+     * and the pager takes the drag only after that. Measured on an API 36
+     * emulator: `{}` held 0.6 s and then swiped left `[` and `<` over the
+     * editor on the next page until a tap outside them.
+     *
+     * NEGATIVE CONTROL, measured: the row as it was at 54352514, which had no
+     * scroll-state callback, fails at the slice; dropping the dismiss fails the
+     * assertion.
+     */
+    @Test
+    fun `a drag on the pager closes the popup`() {
+        val source = SourceScan.withoutComments(
+            SourceScan.read("src/main/kotlin/com/vscodroid/keyboard/ExtraKeyRow.kt"),
+        )
+        val callback = SourceScan.body(source, "private fun setupPageChangeCallback(")
+        assertTrue(
+            callback.contains("registerOnPageChangeCallback("),
+            "the block read is not the pager's callback. It reads:\n$callback",
+        )
+        val scrollState = SourceScan.body(callback, "override fun onPageScrollStateChanged(")
+        assertTrue(
+            scrollState.contains("if (state != ViewPager2.SCROLL_STATE_DRAGGING) return") &&
+                scrollState.contains("longPressPopup?.dismiss()") &&
+                scrollState.contains("longPressPopup = null"),
+            "the pager can take a drag with the alternates open and slide the page away from " +
+                "under them. It reads:\n$scrollState",
+        )
+    }
+
+    @Test
+    fun `a row leaving its window takes the popup with it`() {
+        val lines = code()
+        val start = lines.indexOfFirst { it.contains("override fun onDetachedFromWindow()") }
+        assertTrue(
+            start >= 0,
+            "the row no longer closes its popup when it leaves the window, so an activity " +
+                "finished or recreated with the alternates open leaks that window",
+        )
+
+        val body = lines.drop(start).take(5).joinToString("\n")
+        assertTrue(
+            body.contains("super.onDetachedFromWindow()"),
+            "the override never reaches super, which is a different bug in the same " +
+                "place. It reads:\n$body",
+        )
+        assertTrue(
+            body.contains("longPressPopup?.dismiss()"),
+            "detaching the row no longer dismisses the popup, so the window outlives the " +
+                "view it is anchored to. It reads:\n$body",
+        )
+    }
+
+    /**
+     * The row cannot take input focus from the WebView.
+     *
+     * A real arrow the page leaves unused, which the trackpad now sends, makes
+     * the WebView move focus to the nearest focusable view, and ViewPager2's
+     * RecyclerView is focusable even in touch mode. Focus there hides the
+     * keyboard, and the row with it.
+     */
+    @Test
+    fun `nothing in the row can take input focus`() {
+        val source = SourceScan.withoutComments(
+            SourceScan.read("src/main/kotlin/com/vscodroid/keyboard/ExtraKeyRow.kt"),
+        )
+        val init = SourceScan.body(source, "init {")
+        assertTrue(
+            init.contains("orientation = VERTICAL"),
+            "the block read is not the row's initialiser. It reads:\n$init",
+        )
+        assertTrue(
+            init.contains("descendantFocusability = FOCUS_BLOCK_DESCENDANTS"),
+            "the row's children can take focus, so an unused arrow can move it into the " +
+                "pager and drop the keyboard. It reads:\n$init",
+        )
+    }
+
+    /**
+     * Hiding the row on the user's say-so leaves by the keyboard's door.
+     *
+     * The case above pins that the dismiss and the reset follow the visibility
+     * write; this pins that they are the body of `if (!showRow)` and that a
+     * hidden row reaches that branch. A gate on `imeVisible` alone, or a setter
+     * that wrote `visibility` itself, would hide the row with the alternates still
+     * open and a latched Ctrl still armed in the page, so the next letter typed on
+     * the soft keyboard would go out as a chord.
+     *
+     * Read through [SourceScan] rather than [code], so a trailing comment cannot
+     * satisfy a check and the setter is read to its closing brace rather than for
+     * a fixed number of lines.
+     */
+    @Test
+    fun `a row the user hides goes down the way the keyboard takes it`() {
+        val source = SourceScan.withoutComments(
+            SourceScan.read("src/main/kotlin/com/vscodroid/keyboard/ExtraKeyRow.kt"),
+        )
+        val listener = SourceScan.body(source, "fun setupWithRootView(")
+        val decision = listener.lines().singleOrNull { it.contains("val showRow =") }
+        assertTrue(
+            decision != null,
+            "the listener no longer makes one showRow decision, so this case is reading nothing",
+        )
+        assertTrue(
+            decision!!.contains("!hiddenByUser"),
+            "the user's choice is no longer part of the decision that dismisses the popup and " +
+                "clears the modifiers. It reads:\n$decision",
+        )
+
+        val hiding = SourceScan.body(listener, "if (!showRow)")
+        assertTrue(
+            hiding.contains("longPressPopup?.dismiss()") && hiding.contains("resetModifiersIfNeeded()"),
+            "the branch the showRow decision gates no longer dismisses the popup and clears the " +
+                "modifiers, so a row hidden by that decision leaves both behind. It reads:\n$hiding",
+        )
+
+        val setter = SourceScan.body(source, "var hiddenByUser")
+        assertTrue(
+            setter.contains("requestApplyInsets(this)"),
+            "the setter no longer asks the listener to decide again, so hiding waits for " +
+                "the next keyboard change. It reads:\n$setter",
+        )
+        assertTrue(
+            !setter.contains("visibility"),
+            "the setter changes visibility itself, bypassing the branch that dismisses the " +
+                "popup and clears a latched modifier. It reads:\n$setter",
+        )
+    }
+
+    /**
+     * A row the user hid stays hidden across a restart.
+     *
+     * `MainActivity` owns the record: the bridge callback flips and writes one
+     * preference, and the row is set from that same preference when the activity
+     * is built. The thread hop in the callback is pinned elsewhere, by
+     * `BridgeCallbackThreadHopTest`; this pins that both ends name the one key.
+     */
+    @Test
+    fun `a hidden row is restored from the preference the toggle writes`() {
+        val activity = SourceScan.withoutComments(
+            SourceScan.read("src/main/kotlin/com/vscodroid/MainActivity.kt"),
+        )
+        val setup = SourceScan.body(activity, "private fun setupExtraKeyRow(")
+        assertTrue(
+            setup.contains("hiddenByUser = workspacePrefs.getBoolean(KEY_EXTRA_KEY_ROW_HIDDEN, false)"),
+            "the row is no longer set from the saved choice when the activity is built, so a " +
+                "row the user hid comes back on every launch. It reads:\n$setup",
+        )
+        val toggle = SourceScan.body(activity, "onToggleExtraKeyRow = ")
+        assertTrue(
+            toggle.contains("!workspacePrefs.getBoolean(KEY_EXTRA_KEY_ROW_HIDDEN, false)") &&
+                toggle.contains("putBoolean(KEY_EXTRA_KEY_ROW_HIDDEN, hidden)") &&
+                toggle.contains("hiddenByUser = hidden"),
+            "the toggle no longer flips, saves and applies the same preference the launch " +
+                "reads. It reads:\n$toggle",
+        )
+    }
+}

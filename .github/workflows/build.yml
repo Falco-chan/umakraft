@@ -1,0 +1,536 @@
+name: Build
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+# Read by default. No job here publishes anything: what they upload is the debug
+# APK and the server tree this run built for itself, to its own run's artifacts.
+# Without this block the token's scope is whatever the repository's default
+# workflow permissions happen to be, which is a setting outside this file and
+# outside review. release.yml has said this since it was written.
+permissions:
+  contents: read
+
+jobs:
+  codeoss:
+    uses: ./.github/workflows/codeoss-build.yml
+
+  build:
+    name: Build Debug APK
+    needs: codeoss
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      # In the assets- cache key below, because the addons, the glibc shim, the
+      # exec interceptor and the trampoline in that cache are compiled with it
+      # and their steps are skipped on a hit. release.yml pins the same version
+      # on its own.
+      NDK_VERSION: "27.2.12479018"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # These jobs run Gradle plugins, npm postinstalls and the download
+          # scripts, and none of them pushes or holds a credential for a remote.
+          # A persisted checkout token would be readable by all of that for the
+          # length of the job. Where checkout stores it is deliberately not named:
+          # it has moved between major versions and this setting is right whatever
+          # the location is.
+          persist-credentials: false
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@77dd5b2ce225ea11469928ac317850245a74ae78 # v6.2.0
+        with:
+          java-version: "17"
+          distribution: "temurin"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@be39fa834029ff78f1a44aa3bb0819b8fc2bd8fd # v4.0.4
+
+      - name: Set up NDK
+        run: |
+          sdkmanager "ndk;${NDK_VERSION}" --channel=0
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/${NDK_VERSION}" >> "$GITHUB_ENV"
+
+      - name: Set up Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "24"
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@8da46b539cd8fe6ab27ca75128919a18d757604c # v6.4.1
+        with:
+          # Pinned to a non-commercial value, not left to the default.
+          #
+          # gradle/actions v6 added cache-provider and defaults it to 'enhanced',
+          # which the action's own description calls "the full-featured commercial
+          # caching service (gradle-actions-caching)". This project drops
+          # dependencies over their licences and publishes a source offer, so a
+          # dependency bump does not get to move it onto a commercial service.
+          # Naming the value also means a later default change cannot move it.
+          #
+          # `external` rather than `basic`: this action saves its cache even when
+          # the job failed (its post step runs unless cancelled), and the basic
+          # provider keeps the first entry written under a key, with no restore
+          # keys and no overwrite. A job that failed before Gradle had downloaded
+          # anything saved an empty entry (444 bytes, 2026-11-08), and every later
+          # job with the same Gradle files restored it and downloaded everything
+          # again. The Gradle home is cached by the actions/cache step below,
+          # which saves only after a successful job.
+          cache-provider: external
+
+      - name: Cache the Gradle user home
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          # Follows the Gradle scripts, the version catalogue and the wrapper. A
+          # change to any of them restores the newest earlier entry by prefix and
+          # saves a new one, so a build file edit no longer starts from nothing.
+          key: gradle-home-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('android/**/*.gradle.kts', 'android/gradle/**') }}
+          restore-keys: |
+            gradle-home-${{ runner.os }}-${{ runner.arch }}-
+
+      # Cache downloaded tarballs/debs
+      #
+      # The .deb entry reads debs/, not the directory above it. It read
+      # termux-packages/*.deb and matched none of the 72 files actually there,
+      # so that cache never held a single package and every run refetched the
+      # lot. Note the path list below is a literal block: a `#` line inside it
+      # is a path, not a comment. (before extraction) to avoid re-downloading ~200MB
+      - name: Cache download intermediates
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            server/*.tar.gz
+            toolchains/termux-packages/debs/*.deb
+            toolchains/termux-packages/Packages
+            toolchains/build/npm/
+            toolchains/extensions/
+            toolchains/musl/
+          key: downloads-${{ hashFiles('VSCODE_VERSION', 'VSCODE_COMMIT', 'patches/**', 'branding/**', 'scripts/build-vscode-oss.sh', 'scripts/patch-js-debug-env.py', 'scripts/patch-language-detection.py', 'scripts/test-language-detection.py', '.github/workflows/build-vscode-oss.yml', '.github/workflows/codeoss-build.yml', 'scripts/fetch-vscode-oss.sh', 'scripts/verify-server-tree.py', 'scripts/lib/termux-packages.sh', 'scripts/download-termux-tools.sh', 'scripts/download-node.sh', 'scripts/patch-default-shell.py', 'scripts/download-npm.sh', 'scripts/download-python.sh', 'scripts/download-extensions.sh', 'scripts/download-musl-loader.sh', 'scripts/verify-termux-index.sh', 'scripts/termux-repo-key.asc', 'scripts/alpine-devel-616ae350.rsa.pub', 'scripts/verify-android-elf.py', 'scripts/patch-python-platform.py', 'scripts/check-extension.py') }}
+          restore-keys: |
+            downloads-
+
+      # Cache the generated assets directory (extracted, patched VS Code server + tools).
+      # Every input to the server build is in the key even though no step here
+      # reads any of them: patches/, branding/, build-vscode-oss.sh and the
+      # scripts it runs over the tree shape the server tree, which the codeoss
+      # job builds for this revision. On an assets cache hit the download and
+      # fetch steps never run, so this key is the only thing standing between a
+      # change to one of those inputs and a stale cached tree going into the APK.
+      # A miss takes the tree from the codeoss job, and fetch-vscode-oss.sh is
+      # what refuses one older than patches/ or branding/.
+      #
+      # Which makes "every" a rule rather than a description: a script that edits
+      # the packaged tree belongs here the day it is written. patch-js-debug-env.py
+      # landed without it, and nothing else could have caught that. The patch
+      # fingerprints cover patches/*.patch and nothing else, and
+      # verify-server-tree.py counts occurrences of one string that script writes,
+      # which a tarball built before its latest edit carries just the same.
+      - name: Cache generated assets
+        id: cache-assets
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            android/app/src/main/assets/vscode-reh/
+            android/app/src/main/assets/usr/
+            android/app/src/main/assets/extensions/
+            android/app/src/main/assets/nls/
+            android/app/src/main/jniLibs/arm64-v8a/
+            server/vscode-reh/
+          key: assets-${{ env.NDK_VERSION }}-${{ hashFiles('VSCODE_VERSION', 'VSCODE_COMMIT', 'VSCODE_LOC_COMMIT', 'patches/**', 'branding/**', 'scripts/build-vscode-oss.sh', 'scripts/patch-js-debug-env.py', 'scripts/patch-language-detection.py', 'scripts/test-language-detection.py', '.github/workflows/build-vscode-oss.yml', '.github/workflows/codeoss-build.yml', 'scripts/fetch-vscode-oss.sh', 'scripts/package-assets.sh', 'scripts/build-nls-bundles.py', 'scripts/verify-server-tree.py', 'scripts/check-patch-fingerprints.py', 'scripts/check-editcontext-sync.py', 'scripts/lib/termux-packages.sh', 'scripts/download-termux-tools.sh', 'scripts/download-node.sh', 'scripts/patch-default-shell.py', 'scripts/download-npm.sh', 'scripts/download-python.sh', 'scripts/patch-venv-home.py', 'scripts/download-extensions.sh', 'scripts/download-musl-loader.sh', 'scripts/build-native-addons.sh', 'scripts/build-glibc-shim.sh', 'scripts/glibc-shim.c', 'scripts/gen-glibc-forwarders.py', 'scripts/build-termux-exec.sh', 'scripts/termux-exec.patch', 'scripts/build-exec-trampoline.sh', 'scripts/exec-trampoline.c', 'scripts/build-claude-shim.sh', 'scripts/seccomp-shim.c', 'scripts/claude-launch.c', 'android/app/src/main/assets/extensions/**', 'scripts/verify-termux-index.sh', 'scripts/termux-repo-key.asc', 'scripts/alpine-devel-616ae350.rsa.pub', 'scripts/verify-android-elf.py', 'scripts/patch-python-platform.py', 'scripts/check-extension.py') }}
+          # The fallback is what let a removed extension come back: it restores
+          # any earlier tree, and the run then saves that tree forward under its
+          # own key. It stays, because a partial hit still saves most of a build
+          # -- download-extensions.sh now sweeps the untracked extension
+          # directories it no longer manages, and the step below puts the
+          # committed ones back.
+          restore-keys: |
+            assets-
+
+      # The restore extracts over the checkout, so a committed extension file
+      # edited without renaming its directory came back as the cached copy, and
+      # download-extensions.sh leaves tracked directories alone. The debug APK
+      # built from 197ffe10 shipped the saf-bridge extension.js that commit
+      # replaced, with the unit tests green because they read the checkout. No -x on the clean:
+      # the downloaded extensions are gitignored and stay.
+      - name: Put the committed extensions back over the restored cache
+        run: |
+          git checkout -- android/app/src/main/assets/extensions
+          git clean -fdq -- android/app/src/main/assets/extensions
+
+      - name: Install system dependencies
+        if: steps.cache-assets.outputs.cache-hit != 'true'
+        # The runner image ships a baked apt index. Ubuntu keeps only the current
+        # version of a package in the pool, so once the indexed one is superseded
+        # the download 404s. Refresh the index before installing.
+        #
+        # Bounded, because an unbounded refresh is not a slow step, it is a lost
+        # job: when the Azure mirror stops answering apt falls through to the
+        # public archive and can sit there without output until the job's whole
+        # 30 minute budget is gone, and every later step is reported as skipped
+        # rather than as never reached. Measured twice on the same commit. Three
+        # short attempts clear a transient stall; a real outage now fails in
+        # minutes with the mirror named, and still fails, because installing off
+        # a stale index is what the refresh above exists to prevent.
+        timeout-minutes: 8
+        run: |
+          for attempt in 1 2 3; do
+            if sudo timeout 120 apt-get update; then
+              break
+            fi
+            echo "  apt-get update stalled or failed (attempt $attempt of 3)"
+          done
+          # gnupg is on the runner image today, but the Termux index check is a
+          # gate: naming it here keeps it from depending on what the image
+          # happens to bake in.
+          sudo apt-get install -y --no-install-recommends libarchive-tools gnupg
+
+      # Download and prepare all assets (only if not cached)
+      # Use the same revision's server without updating the published release.
+      - name: Download the server built for this revision
+        if: steps.cache-assets.outputs.cache-hit != 'true'
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: vscode-reh-web-linux-arm64-${{ needs.codeoss.outputs.version }}
+          path: ${{ runner.temp }}/codeoss
+
+      - name: Fetch Code - OSS server
+        if: steps.cache-assets.outputs.cache-hit != 'true'
+        env:
+          VSCODE_OSS_URL: file://${{ runner.temp }}/codeoss/vscode-reh-web-linux-arm64-${{ needs.codeoss.outputs.version }}.tar.gz
+          VSCODE_OSS_SHA256: ${{ needs.codeoss.outputs.sha256 }}
+        run: bash scripts/fetch-vscode-oss.sh
+
+      - name: Copy the server into assets
+        if: steps.cache-assets.outputs.cache-hit != 'true'
+        # The same copy scripts/package-assets.sh performs, called rather than
+        # restated. Two definitions of "packaging the server" stood here and in
+        # that script with nothing comparing them, while three Gradle failure
+        # messages told their reader to run `fetch-vscode-oss.sh &&
+        # package-assets.sh` as though it were the step CI takes. It is now.
+        run: bash scripts/package-assets.sh
+
+      # Reads out/nls.keys.json and out/nls.messages.json from the tree the step
+      # above just wrote, so it cannot run any earlier, and Gradle sizes the
+      # assets directory at configuration time (EXTRACTED_ASSET_BYTES), so it
+      # cannot run any later. Its output is gitignored, which is why
+      # assets/nls/ is in the cache path above: this step is skipped on a cache
+      # hit, and a restored tree without the bundles builds an APK that offers
+      # thirteen display languages and serves English for every one of them,
+      # with every gate in this workflow green.
+      - name: Build the translated string bundles
+        if: steps.cache-assets.outputs.cache-hit != 'true'
+        run: python3 scripts/build-nls-bundles.py
+
+      - name: Download Termux tools
+        if: steps.cache-assets.outputs.cache-hit != 'true'
+        run: bash scripts/download-termux-tools.sh
+
+      - name: Download npm
+        if: steps.cache-assets.outputs.cache-hit != 'true'
+        run: bash scripts/download-npm.sh
+
+      - name: Download Python
+        if: steps.cache-assets.outputs.cache-hit != 'true'
+        run: bash scripts/download-python.sh
+
+      - name: Download extensions
+        if: steps.cache-assets.outputs.cache-hit != 'true'
+        run: bash scripts/download-extensions.sh
+
+      # Claude Code is no longer bundled: the user installs the extension from
+      # the marketplace and the CLI comes inside it, so nothing of Anthropic's is
+      # redistributed here and the version is theirs to update. What this ships
+      # is musl's loader, which is the only way that CLI starts on Android.
+      - name: Download musl loader
+        if: steps.cache-assets.outputs.cache-hit != 'true'
+        run: bash scripts/download-musl-loader.sh
+
+      # Before the native addons on purpose: build-native-addons.sh pairs its
+      # headers against the runtime this step installs, and fails closed when
+      # nothing is there to pair against. With the addons built first that gate
+      # can never fire in CI: there is no runtime to compare the headers to yet,
+      # so the pairing it exists to enforce is skipped rather than checked.
+      - name: Fetch Node runtime
+        if: steps.cache-assets.outputs.cache-hit != 'true'
+        run: bash scripts/download-node.sh
+      - name: Build native addons
+        if: steps.cache-assets.outputs.cache-hit != 'true'
+        run: bash scripts/build-native-addons.sh
+
+      # libnode.so is Termux's nodejs-lts, not a hand-cross-compiled binary kept
+      # as a release asset. The old one ran but segfaulted inside the Claude Code
+      # CLI's subcommands, and there was no way to debug a build we could not
+      # reproduce. Its version also decides which VS Code releases are reachable.
+      # After the server tree is in place and after download-termux-tools.sh,
+      # which wipes assets/usr/lib before repopulating it -- the stubs live there
+      # and would not survive being built first.
+      #
+      # Scans for addons that were built against glibc and generates stub
+      # libraries so Bionic's loader will accept them. Objects needing libstdc++
+      # are reported and skipped: Android ships libc++, and the two are not two
+      # spellings of the same library.
+      - name: Build the glibc compatibility shim
+        if: steps.cache-assets.outputs.cache-hit != 'true'
+        env:
+          ANDROID_NDK_HOME: ${{ env.ANDROID_NDK_HOME }}
+        run: |
+          bash scripts/build-glibc-shim.sh \
+            --scan android/app/src/main/assets/vscode-reh \
+            --scan android/app/src/main/assets/extensions
+
+      # The library the terminals preload so a program under the app's own
+      # storage, which SELinux will not execve, starts through the system
+      # linker instead. Built from termux-exec's source with the repository's
+      # patch, and into assets/usr/lib, so it sits after the wipe for the same
+      # reason the shim does. Its script and its patch are in the assets- cache
+      # key above: on a hit this step is skipped, and a restored usr/ without
+      # the file would ship a terminal that behaves as before, with every gate
+      # green.
+      - name: Build the exec interceptor
+        if: steps.cache-assets.outputs.cache-hit != 'true'
+        env:
+          ANDROID_NDK_HOME: ${{ env.ANDROID_NDK_HOME }}
+        run: bash scripts/build-termux-exec.sh
+
+      # The one binary this repository compiles for the app itself rather than
+      # taking from Termux. It is what puts a downloaded toolchain's commands on
+      # PATH as real files, so anything that resolves a bare name and execve's
+      # the result -- an extension spawning `ruby`, a make recipe under mksh, a
+      # "type": "process" task -- can start them at all.
+      #
+      # Its script and its source are in the assets- cache key above, and that is
+      # not optional bookkeeping: this step is skipped on a cache hit, and a
+      # restored jniLibs directory without the trampoline in it ships an APK that
+      # behaves exactly as before with every gate in this workflow green.
+      - name: Build the execution trampoline
+        if: steps.cache-assets.outputs.cache-hit != 'true'
+        env:
+          ANDROID_NDK_HOME: ${{ env.ANDROID_NDK_HOME }}
+        run: bash scripts/build-exec-trampoline.sh
+
+      - name: Build the Claude Code seccomp shim
+        env:
+          ANDROID_NDK_HOME: ${{ env.ANDROID_NDK_HOME }}
+        run: bash scripts/build-claude-shim.sh
+      # Two `ls ... || true` lines stood here under this name, which is a
+      # listing rather than a check: nothing it could print would fail the job,
+      # an entirely empty assets tree included. That tree is gitignored build
+      # output, and an APK built without it is the quietest failure this project
+      # has -- it compiles, it installs, the splash screen appears, and then the
+      # screen stays white because there is no server to start. The release
+      # workflow's step of the same name at least weighed libnode.so.
+      # Runs where the libraries actually exist, which lint.yml is not: it
+      # builds stub assets, and a stub tree has nothing to attribute. Berkeley
+      # DB shipped under AGPL-3.0 for every release before this check existed,
+      # having arrived as a transitive Kerberos dependency that no step looked
+      # at.
+      - name: Check every shipped library is attributed
+        run: python3 scripts/check-library-attribution.py
+
+      # The wheels pip is offered are pinned for one Python minor version, and
+      # the interpreter is resolved from the Termux index at build time, so a
+      # bump can arrive without anyone deciding. Here rather than in lint.yml
+      # because it reads the asset tree, which lint.yml stubs.
+      - name: Check the wheelhouse matches the bundled Python
+        run: python3 scripts/check-wheelhouse-abi.py
+
+      # Deliberately not `if: cache-hit != 'true'`, and that is the whole point
+      # of the step. download-extensions.sh runs this after extracting, but that
+      # step is skipped on a cache hit, which is most pull requests -- and the
+      # rule that compares each tree's declared licence against the notices is
+      # the one an edit to NOTICE.md is most likely to break. The trees come
+      # back from the cache either way, so running it here reads them on every
+      # build. lint.yml keeps the committed half for checkouts with no trees.
+      - name: Check the bundled extensions match the notices
+        run: python3 scripts/check-bundled-extensions.py
+
+      - name: Verify assets
+        run: |
+          echo "=== Assets ==="
+          ls -la android/app/src/main/assets/
+          echo ""
+          echo "=== jniLibs ==="
+          ls -la android/app/src/main/jniLibs/arm64-v8a/
+          echo ""
+          server=android/app/src/main/assets/vscode-reh/out/server-main.js
+          libnode=android/app/src/main/jniLibs/arm64-v8a/libnode.so
+          for f in "$server" "$libnode"; do
+            if [ ! -f "$f" ]; then
+              echo "::error::$f is missing; this APK would install and open with nothing in it."
+              exit 1
+            fi
+          done
+          # The unit-test and lint jobs write a 64-byte libnode.so so Gradle will
+          # configure. Reaching a packaging job it would mean the real download
+          # never ran.
+          libnode_size="$(wc -c < "$libnode")"
+          if [ "$libnode_size" -lt 1000 ]; then
+            echo "::error::libnode.so is $libnode_size bytes -- that is the stub, not a runtime."
+            exit 1
+          fi
+          echo "server-main.js present; libnode.so $libnode_size bytes"
+
+      # Reads the packaged jniLibs, so it belongs here rather than with the
+      # source-only checks: the directory is empty until the download scripts
+      # above have run, and the gate refuses an empty one rather than passing
+      # over it. Deliberately not in lint.yml, which stubs the tree with a single
+      # 64-byte libnode.so so Gradle will run.
+      - name: Check the documented binary lists match what is packaged
+        run: python3 scripts/check-binary-lists.py
+
+      # Needs the extensions tree, so it runs here rather than beside the other
+      # cheap checks in lint. A pattern that matches nothing is invisible twice:
+      # the server keeps running, keeps counting against the phantom-process
+      # budget, and the details view built to explain that shows it as 'other'.
+      - name: Check the monitor recognises the language servers that ship
+        run: |
+          python3 scripts/check-langserver-patterns.py \
+            android/app/src/main/assets/vscode-reh/extensions
+
+      # The welcome screen is committed source describing runtimes resolved from
+      # the Termux index at build time, so anything it states about them is
+      # correct only until the next rebuild. It was wrong for two releases and
+      # nothing noticed, because a hardcoded string cannot disagree with itself.
+      - name: Check the welcome screen states nothing that goes stale
+        run: python3 scripts/check-welcome-claims.py
+
+      - name: Build debug APK
+        working-directory: android
+        run: ./gradlew assembleDebug
+
+      - name: Upload debug APK
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: debug-apk
+          path: android/app/build/outputs/apk/debug/*.apk
+          retention-days: 14
+
+  test:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Nothing in this job pushes, and its Gradle run reads only what is
+          # already in the workspace. A persisted checkout token would sit
+          # there readable by the Gradle plugins for the length of the job for
+          # no reason. Where checkout stores it is deliberately not named: it
+          # has moved between major versions and this setting is right
+          # whatever the location is.
+          persist-credentials: false
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@77dd5b2ce225ea11469928ac317850245a74ae78 # v6.2.0
+        with:
+          java-version: "17"
+          distribution: "temurin"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@be39fa834029ff78f1a44aa3bb0819b8fc2bd8fd # v4.0.4
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@8da46b539cd8fe6ab27ca75128919a18d757604c # v6.4.1
+        with:
+          # Pinned to a non-commercial value, not left to the default.
+          #
+          # gradle/actions v6 added cache-provider and defaults it to 'enhanced',
+          # which the action's own description calls "the full-featured commercial
+          # caching service (gradle-actions-caching)". This project drops
+          # dependencies over their licences and publishes a source offer, so a
+          # dependency bump does not get to move it onto a commercial service.
+          # Naming the value also means a later default change cannot move it.
+          #
+          # `external` rather than `basic`: this action saves its cache even when
+          # the job failed (its post step runs unless cancelled), and the basic
+          # provider keeps the first entry written under a key, with no restore
+          # keys and no overwrite. A job that failed before Gradle had downloaded
+          # anything saved an empty entry (444 bytes, 2026-11-08), and every later
+          # job with the same Gradle files restored it and downloaded everything
+          # again. The Gradle home is cached by the actions/cache step below,
+          # which saves only after a successful job.
+          cache-provider: external
+
+      - name: Cache the Gradle user home
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          # Follows the Gradle scripts, the version catalogue and the wrapper. A
+          # change to any of them restores the newest earlier entry by prefix and
+          # saves a new one, so a build file edit no longer starts from nothing.
+          key: gradle-home-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('android/**/*.gradle.kts', 'android/gradle/**') }}
+          restore-keys: |
+            gradle-home-${{ runner.os }}-${{ runner.arch }}-
+
+      # Unit tests only need compiled Kotlin, not the full assets.
+      # Create minimal directory structure so Gradle does not fail.
+      - name: Create minimal asset stubs
+        run: |
+          mkdir -p android/app/src/main/jniLibs/arm64-v8a
+          mkdir -p android/app/src/main/assets/vscode-reh/out
+          mkdir -p android/app/src/main/assets/usr
+          mkdir -p android/app/src/main/assets/extensions
+          printf '\x7fELF' > android/app/src/main/jniLibs/arm64-v8a/libnode.so
+          dd if=/dev/zero bs=1 count=60 >> android/app/src/main/jniLibs/arm64-v8a/libnode.so 2>/dev/null
+
+      - name: Run unit tests
+        working-directory: android
+        run: ./gradlew testDebugUnitTest
+
+      # Compiles the instrumented tests without running them, which is the only
+      # thing CI can do for them and is better than the nothing that was here.
+      #
+      # They cannot be RUN on any runner GitHub offers, and all three families
+      # have now been measured rather than assumed. The app is arm64-v8a only,
+      # so the emulator has to be arm64 too; ubuntu-latest has /dev/kvm but only
+      # accelerates x86_64, and ubuntu-24.04-arm reports no /dev/kvm and no
+      # virtualisation flag at all.
+      #
+      # macos-15 was the open question until 2026-08-16, because Apple silicon
+      # should mean HVF. It is itself a virtual machine, reporting
+      # "Apple M1 (Virtual)" with kern.hv_support absent, so nested
+      # virtualisation is not exposed and qemu fails with HV_UNSUPPORTED before
+      # the emulator reaches adb. Measured on API 34 and 36 alike.
+      #
+      # So an arm64 image would be pure software emulation everywhere, for a
+      # 340 MB APK that boots a Node server.
+      #
+      # What this does catch is the second way they were rotting: nothing
+      # compiled them either, so they could drift out of the app's API and stay
+      # broken indefinitely. See androidTest/README.md.
+      #
+      # Compiled here, run by a person: `scripts/device-test.sh --instrumented`
+      # is the only thing that executes them, and it needs an arm64 device or
+      # emulator attached. It is around a minute of wall clock, so skipping it
+      # before a tag is a choice rather than a constraint -- and the one case no
+      # other suite can replace is ExecTrampolineOnDeviceTest's control, which
+      # asserts that a payload under filesDir cannot be executed directly. That
+      # is a kernel policy decision, and the whole toolchain design rests on it.
+      #
+      # No count and no per-device timing here on purpose. Three of them were
+      # written down across this file and the README, all three went stale, and
+      # a figure in a comment is one nothing can check. The README carries them
+      # against the recorded run, and check-instrumented-inventory.py holds it
+      # to the sources.
+      #
+      # release.yml runs this same task, because a tag may name a commit that
+      # reached neither of this workflow's triggers.
+      - name: Compile the instrumented tests
+        working-directory: android
+        run: ./gradlew assembleDebugAndroidTest

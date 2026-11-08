@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- VS Code dark theme palette -->
+    <color name="colorPrimary">#007ACC</color>
+    <color name="colorPrimaryDark">#005A9E</color>
+    <color name="colorAccent">#007ACC</color>
+    <!-- The same brand blue is unreadable as TEXT on this app's dark grounds:
+         #007ACC measures 3.70:1 on the window and 3.40:1 on a card, and WCAG AA
+         asks 4.5:1 for text this size. It stays as a button GROUND, where white
+         sits on it; this lighter tone is for text buttons and links, and measures
+         5.43:1 and 4.99:1 on the same two grounds. -->
+    <color name="colorPrimaryText">#3794FF</color>
+
+    <!-- Editor surface colors -->
+    <color name="colorBackground">#1E1E1E</color>
+    <color name="colorSurface">#252526</color>
+    <color name="colorOnSurface">#CCCCCC</color>
+    <!-- Text on the editor's own colour where that is light: the setup screen
+         takes the colour the workbench last painted (SplashActivity). -->
+    <color name="colorOnLightBackground">#1E1E1E</color>
+
+    <!-- Extra key row colors -->
+    <color name="colorExtraKeyBg">#2D2D2D</color>
+    <color name="colorExtraKeyText">#CCCCCC</color>
+    <color name="colorExtraKeyActive">#007ACC</color>
+
+    <!-- Gesture trackpad. The crosshair and the border were literal ints in
+         GestureTrackpad.kt and the idle page dot one in ExtraKeyRow.kt, which
+         put three of this subsystem's colours somewhere no palette change and no
+         values-night qualifier could reach. -->
+    <color name="colorGestureTrackpadBg">#383838</color>
+    <color name="colorGestureTrackpadCrosshair">#888888</color>
+    <color name="colorGestureTrackpadBorder">#555555</color>
+
+    <!-- The page dots below the keys: the page showing uses
+         colorExtraKeyActive, the rest this. Deliberately translucent, so it
+         reads as an unfilled dot on whatever the row is drawn over. -->
+    <color name="colorExtraKeyPageDotIdle">#55FFFFFF</color>
+
+    <!-- Long-press popup -->
+    <color name="colorPopupBg">#3C3C3C</color>
+
+    <!-- Notification -->
+
+    <!-- Toolchain picker -->
+    <color name="colorCardSelected">#1A007ACC</color>
+    <color name="colorSuccess">#4EC9B0</color>
+    <color name="colorError">#F48771</color>
+</resources>

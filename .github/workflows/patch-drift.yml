@@ -1,0 +1,102 @@
+name: Patch drift
+
+# Do the Android adaptations still apply to upstream VS Code?
+#
+# The pinned commit is already covered elsewhere: build-vscode-oss.sh applies
+# every patch in patches/ and set -e fails the build when one stops fitting. That
+# check can only ever speak about the version already built. This one speaks
+# about the next one, which is where the cost lives: without it, the answer
+# arrives all at once, mid-bump, months after the upstream change that caused it.
+#
+# docs/08-RISK_MATRIX.md budgets five to ten days a month for patch maintenance
+# and lists this job as its own mitigation. It stayed unimplemented until now.
+# The version pin also moved exactly once in a year, but for a different reason
+# that this job would not have helped with: the bundled Node was a hand
+# cross-compiled 20.18.1 and no newer VS Code could run on it.
+#
+# ⚠️ Deliberately not run on pull requests, and do NOT add it to branch
+# protection. Patches can only target one upstream version at a time: they must
+# apply to the pinned commit for the build to work, so the moment upstream moves
+# past the pin this job is expected to fail, and it stays failing until the bump.
+# On a pull_request trigger that would paint every unrelated PR red for a reason
+# no PR caused. The state it reports is true and useful; it is not a gate.
+#
+# So read a red run as "there is rebase work queued for the next bump", not as a
+# broken build. The pinned tree is unaffected and still builds.
+
+on:
+  schedule:
+    # Monday 04:00 UTC, an hour after the shrinker cron so the two do not queue
+    # against each other on the same runner minute.
+    - cron: "0 4 * * 1"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Upstream tag to check against (blank = newest stable)"
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: patch-drift-${{ github.event_name }}-${{ github.ref }}
+  # Both triggers resolve to the default branch ref, so keying on the ref alone
+  # put the weekly run and a manual dispatch in one group with cancellation on:
+  # asking for an answer by hand cancelled the scheduled run mid-fetch, and that
+  # week recorded a cancellation instead of a verdict. r8.yml keys on the event
+  # for the same reason, and cancels within an event because a branch supersedes
+  # its own earlier run there. Nothing supersedes anything here.
+  #
+  # Nothing here is worth cancelling: there is no pull_request trigger, and the
+  # job is a 20-minute clone-and-apply whose result is the point.
+  cancel-in-progress: false
+
+jobs:
+  apply:
+    name: Patches apply upstream
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Nothing here pushes, so the checkout token would only sit in the
+          # workspace for the length of the job, readable by everything it runs.
+          # The rest of the workflows in this directory already say this.
+          persist-credentials: false
+
+      - name: Apply patches to upstream
+        # Through the environment, never interpolated into the command. A
+        # `${{ }}` expansion is spliced into the shell before any shell quoting
+        # applies, so a dispatch input carrying a `;` would run as a second
+        # command. The script validates the tag as well, but that validation runs
+        # after the splice and so cannot be what protects this.
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+        # A `bash ` prefix, to match every other workflow here, and not only for
+        # consistency: check-build-steps.py recognises a shell script CI runs by
+        # that exact form, so a bare `scripts/...` invocation is invisible to it
+        # and the script would count as one CI never runs.
+        #
+        # The verdict goes on the run's summary page, not only into the log.
+        # Nothing watches a scheduled job, so its whole output is one mark in a
+        # list, and the mark here does not mean what a red mark usually means:
+        # it means rebase work is queued for the next bump. A reader who has to
+        # open the log to learn WHICH patch stops opening it.
+        #
+        # `|| status=$?` rather than a pipeline, both halves measured. The step
+        # shell is `bash -e`, so without it the script's non-zero exit ends the
+        # step before the summary is written and the page stays empty. And
+        # `tee` would report 0 for a script that exited 1 or 2, losing the
+        # distinction between "a patch failed" and "the check could not run"
+        # that this script's header defines and a reader depends on.
+        run: |
+          status=0
+          bash scripts/check-patches-apply.sh "$INPUT_TAG" > drift.txt 2>&1 || status=$?
+          cat drift.txt
+          {
+            echo '```text'
+            cat drift.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit "$status"

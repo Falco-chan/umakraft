@@ -1,0 +1,180 @@
+package com.vscodroid.webview
+
+import org.junit.jupiter.api.Assertions.assertAll
+import org.junit.jupiter.api.Assertions.assertEquals
+import org.junit.jupiter.api.Assertions.assertFalse
+import org.junit.jupiter.api.Assertions.assertTrue
+import org.junit.jupiter.api.Test
+
+/**
+ * The two suffix tests that decide a proxied asset's cache header and its
+ * fallback MIME type, asked the way `proxyToLocalhost` asks them.
+ *
+ * That arm is handed the rewritten URL, not a path, and every such URL has ended
+ * in `tkn=<hex>` since the editor server began requiring a connection token
+ * (the CDN arm signs what `rewriteCdnUrl` builds with `withToken`). A plain
+ * `endsWith(".js")` over that string is false for every asset there is, so both
+ * fallbacks had quietly stopped being answerable: no caller changed and no
+ * branch was deleted, the question simply became one the string could not
+ * answer.
+ *
+ * Nothing user-visible rested on it, and that is stated rather than glossed: the
+ * `/{quality}-{commit}/static/...` route this arm proxies answers with a
+ * `Cache-Control` and a `Content-Type` of its own, so both fallbacks are expected
+ * to stay quiet. What is worth holding is that they CAN fire, because the day the
+ * server stops sending one of those headers is not the day anyone will think to
+ * re-read a suffix test.
+ *
+ * NEGATIVE CONTROL: drop `.substringBefore('?')` from
+ * `VSCodroidWebViewClient.assetPathOf` and every case naming a token below goes
+ * red, while the bare-path case stays green.
+ */
+class ProxiedAssetSuffixTest {
+
+    private val token = "0123456789abcdef0123456789abcdef"
+    private val staticRoot = "http://127.0.0.1:41293/stable-cd4ee3b1/static"
+
+    @Test
+    fun `a proxied script is still a static asset with the token appended`() {
+        assertTrue(
+            VSCodroidWebViewClient.isStaticAsset("$staticRoot/out/vs/workbench/workbench.js?tkn=$token"),
+            "the workbench's own scripts are versioned by commit hash and are the whole " +
+                "reason the immutable cache header exists",
+        )
+        assertTrue(
+            VSCodroidWebViewClient.isStaticAsset("$staticRoot/out/vs/workbench/workbench.css?tkn=$token"),
+        )
+    }
+
+    @Test
+    fun `a proxied script keeps its MIME type with the token appended`() {
+        assertEquals(
+            "application/javascript",
+            VSCodroidWebViewClient.guessMimeType("$staticRoot/out/vs/workbench/workbench.js?tkn=$token"),
+            "handed to the WebView as application/octet-stream, a script does not run",
+        )
+    }
+
+    @Test
+    fun `dropping the query does not make everything an asset`() {
+        // The other half. Without it, an assetPathOf that answered with a
+        // constant `.js` would satisfy both cases above.
+        assertFalse(
+            VSCodroidWebViewClient.isStaticAsset("$staticRoot/out/vs/code/browser/index.html?tkn=$token"),
+            "a document is not versioned by commit hash and must not be cached forever",
+        )
+        assertEquals(
+            "text/html",
+            VSCodroidWebViewClient.guessMimeType("$staticRoot/out/vs/code/browser/index.html?tkn=$token"),
+        )
+    }
+
+    @Test
+    fun `a bare path answers exactly as it did before`() {
+        // The second caller, `interceptResourceRequest`, passes `uri.path`, which
+        // has no query on it. Stripping one must leave that answer alone, or a
+        // fix aimed at the proxy would change what every extension webview
+        // resource is served as. That arm asks for the MIME type only: it stopped
+        // asking whether a file is a static asset when it stopped declaring one
+        // immutable, since the paths it resolves are the user's own and carry no
+        // version. The suffix answer is pinned here all the same, because the
+        // question is the same one either caller asks.
+        assertTrue(VSCodroidWebViewClient.isStaticAsset("/data/user/0/extensions/md/media/m.css"))
+        assertFalse(VSCodroidWebViewClient.isStaticAsset("/data/user/0/projects/app/notes.md"))
+        assertEquals(
+            "image/svg+xml",
+            VSCodroidWebViewClient.guessMimeType("/data/user/0/extensions/md/media/icon.svg"),
+        )
+        assertEquals(
+            "application/octet-stream",
+            VSCodroidWebViewClient.guessMimeType("/data/user/0/projects/app/notes.md"),
+        )
+    }
+
+    /**
+     * The types a webview resource has to be served as to work at all.
+     *
+     * Images are sniffed by Chromium and were rendering whatever this said, but a
+     * module script and `WebAssembly.instantiateStreaming` are both strict: an
+     * extension webview doing `import('./x.mjs')` or
+     * `instantiateStreaming(fetch('./x.wasm'))` through a `vscode-resource` URL
+     * failed on the MIME type alone. No bundled extension does either today, so
+     * the population is what a user installs from Open VSX. The media types are
+     * for the bundled `media-preview`.
+     */
+    @Test
+    fun `the types an extension webview needs are answered`() {
+        assertEquals("text/javascript", VSCodroidWebViewClient.guessMimeType("/x/m.mjs"))
+        assertEquals("application/wasm", VSCodroidWebViewClient.guessMimeType("/x/m.wasm"))
+        assertEquals("image/jpeg", VSCodroidWebViewClient.guessMimeType("/x/photo.jpg"))
+        assertEquals("image/jpeg", VSCodroidWebViewClient.guessMimeType("/x/photo.jpeg"))
+        assertEquals("image/gif", VSCodroidWebViewClient.guessMimeType("/x/anim.gif"))
+        assertEquals("image/webp", VSCodroidWebViewClient.guessMimeType("/x/pic.webp"))
+        assertEquals("video/mp4", VSCodroidWebViewClient.guessMimeType("/x/clip.MP4"))
+        assertEquals("audio/mpeg", VSCodroidWebViewClient.guessMimeType("/x/track.mp3"))
+    }
+
+    /**
+     * The two lists used to disagree, and `.jpg` is where: it was a static asset
+     * with no MIME type of its own, so a proxied JPEG went out as
+     * `application/octet-stream`. They come off one table now, so a type added to
+     * one is in the other.
+     */
+    @Test
+    fun `an extension in one list is in the other`() {
+        assertTrue(VSCodroidWebViewClient.isStaticAsset("/x/photo.jpg"))
+        assertEquals("image/jpeg", VSCodroidWebViewClient.guessMimeType("/x/photo.jpg"))
+    }
+
+    /**
+     * The charset comes off `Content-Type`, which is the only header carrying
+     * one. `WebResourceResponse` takes it as its second argument and used to be
+     * handed `Content-Encoding` instead -- a content coding, never a charset --
+     * while the charset the server did send was cut off one line above.
+     */
+    @Test
+    fun `the charset is read out of the content type`() {
+        assertEquals("iso-8859-1", VSCodroidWebViewClient.charsetOf("text/html; charset=iso-8859-1"))
+        assertEquals("utf-8", VSCodroidWebViewClient.charsetOf("text/html; charset=\"utf-8\""))
+        assertEquals(
+            "utf-8", VSCodroidWebViewClient.charsetOf("application/javascript"),
+            "a response that names no charset still needs one, and utf-8 is what the " +
+                "server tree is written in",
+        )
+        assertEquals("utf-8", VSCodroidWebViewClient.charsetOf(null))
+    }
+
+    @Test
+    fun `decoded resource paths retain literal question marks in their MIME lookup`() {
+        val cases = mapOf(
+            "/work/a?b/entry.mjs" to "text/javascript",
+            "/work/entry?draft.mjs" to "text/javascript",
+            "/work/a?b/entry.wasm" to "application/wasm",
+            "/work/a?b/style.css" to "text/css",
+            "/work/a?b/picture.svg" to "image/svg+xml",
+            "/work/looks.js?after/no-extension" to "application/octet-stream",
+        )
+        assertAll(cases.map { (path, expected) ->
+            org.junit.jupiter.api.function.Executable {
+                assertEquals(expected, VSCodroidWebViewClient.guessMimeType(path), path)
+            }
+        })
+    }
+
+    @Test
+    fun `complete proxied URLs still remove their actual query for suffix tests`() {
+        val url = "http://127.0.0.1:41293/stable-c/static/entry.js?tkn=dummy"
+        assertEquals("application/javascript", VSCodroidWebViewClient.guessMimeType(url))
+        assertTrue(VSCodroidWebViewClient.isStaticAsset(url))
+        val module = "https://host/a%3Fb/entry.mjs?tkn=dummy"
+        assertEquals("text/javascript", VSCodroidWebViewClient.guessMimeType(module))
+        assertTrue(VSCodroidWebViewClient.isStaticAsset(module))
+        assertFalse(VSCodroidWebViewClient.isStaticAsset("https://host/index.html?tkn=dummy"))
+    }
+
+    @Test
+    fun `decoded literal fragments remain file characters`() {
+        assertEquals("text/javascript", VSCodroidWebViewClient.guessMimeType("/work/a#b/entry.mjs"))
+        assertEquals("text/css", VSCodroidWebViewClient.guessMimeType("/work/style#draft.css"))
+    }
+}

@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="utf-8"?>
+<network-security-config xmlns:tools="http://schemas.android.com/tools">
+    <!-- Cleartext is permitted because this app is a development environment, and
+         the thing being developed is served over plain HTTP by every framework
+         there is. A dev server on this device answers at the device's own network
+         address, and previewing it in the editor - or reaching it from a laptop on
+         the same Wi-Fi - is the point of the product, not an edge case.
+
+         The obvious narrower rule cannot be written. Network security config
+         matches <domain> entries by hostname, an exact string with an optional
+         subdomain flag; it understands neither CIDR notation nor address ranges,
+         so "any private address" has no spelling here. The addresses in question
+         are also not known at build time - they change with the network the device
+         joins - and this file is static XML compiled into the APK, so they cannot
+         be added later either. The choice was between permitting cleartext and
+         telling users their own app is unreachable from the editor.
+
+         What this does not change: every remote service the editor talks to - the
+         extension marketplace, extension downloads, resource fetches - is HTTPS
+         and stays HTTPS. What changes is that the platform is no longer the thing
+         enforcing that.
+
+         Android's local network permission is a second gate on the same case,
+         not a separate matter. It covers traffic to and from local network
+         addresses in both directions, applied in the networking stack to every
+         API: this app connecting out to a dev server at 192.168.x.x, which is
+         the preview above, as much as a laptop connecting in. The ranges the
+         platform documentation lists as local (link-local, CGNAT, RFC 1918,
+         multicast and broadcast) do not include loopback, so the editor server
+         on 127.0.0.1 is outside it. Opt-in on Android 16 and enforced for apps
+         targeting Android 17, SDK 37, or higher, through a manifest permission
+         rather than anything in this file: android.permission.ACCESS_LOCAL_NETWORK,
+         which first appears in the android-37 platform jar and is absent from
+         android-36. Nothing declares it today and targetSdk is 36. Raising
+         targetSdk means declaring it, requesting it at run time where the user
+         asks to serve on the network, and keeping working when it is refused;
+         scripts/check-local-network-permission.py fails the build on the
+         declaration alone, and build.gradle.kts records the full contract. -->
+    <base-config cleartextTrafficPermitted="true" tools:ignore="InsecureBaseConfiguration" />
+</network-security-config>

@@ -1,0 +1,196 @@
+# VSCodroid Privacy Policy
+
+**Effective Date: February 13, 2026**
+**Last Updated: November 4, 2026**
+
+## Summary
+
+VSCodroid is a code editor that runs entirely on your Android device. **We** do not collect, transmit, or store any personal data, and there is no server of ours for anything to reach. Your code and files stay on your device unless you send them somewhere yourself, for example by pushing to a Git remote.
+
+Three exceptions to "nothing leaves the device", all under your control and none involving us. Android's own backup service copies your editor settings to your Google account if you have backup switched on (see **Android Backup** below). Anything you ask the app to fetch (an extension, a toolchain, an `npm install`) is a request you initiated, alongside several online lookups the editor performs on its own: it checks Open VSX for newer versions of your installed extensions and installs them, when you open a Python file without Black Formatter installed it looks that extension up on Open VSX so it can suggest it, and its built-in language features fetch JSON schemas, `npm` package metadata, and TypeScript type definitions when you work with files that use them (see **Network Access**).
+
+The third is different in kind and worth reading before you use it: the app bundles **GitHub Copilot Chat**, and once you sign in to GitHub and use it, what you ask it and the code it attaches as context go to GitHub. That is the one feature here that sends your own work to someone else. It has no account and no chat until you sign in, though while it is enabled it loads and runs in the background from the moment the editor starts, and it can be switched off.
+
+---
+
+## What Data We Collect
+
+**None.** VSCodroid does not collect any personal information, usage data, analytics, crash reports, or telemetry of any kind. There are no user accounts, no sign-up, no login, and no registration required to use the app.
+
+## How the App Works
+
+VSCodroid runs a local code editor server entirely on your Android device. The editor interface (VS Code Workbench) connects to this local server over `localhost` (127.0.0.1) -- your device talking to itself. No data is sent to any external server as part of normal app operation.
+
+All code execution -- whether Node.js, Python, Bash, or any other bundled runtime -- happens 100% on your device.
+
+The app asks for four Android permissions of its own. `INTERNET` covers the
+connections listed under **Network Access** below, and the loopback
+traffic between the editor page and the local server. `FOREGROUND_SERVICE` and
+`FOREGROUND_SERVICE_SPECIAL_USE` keep that local server alive while you are
+working. `POST_NOTIFICATIONS` is for the notification showing the server's
+status.
+
+Two more are added by libraries the app is built with, and the Play listing
+shows that merged set rather than ours, so they are named here as well.
+`FOREGROUND_SERVICE_DATA_SYNC` comes from Google's asset delivery library, which
+is what downloads a language toolchain when you pick one. The other is a
+permission the app defines for itself, `DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION`,
+added by AndroidX at signature protection level, which means only code signed
+with the same key as this app can use it; it exists so that a receiver the app
+registers while running cannot be reached by another app.
+
+There is no permission here for location, contacts, the camera, the microphone,
+the phone state, or any device identifier.
+
+## Network Access
+
+VSCodroid requires the INTERNET permission for the following purposes only:
+
+### Extension Marketplace
+
+When you browse, search for, or install extensions, the app connects to **Open VSX** (https://open-vsx.org), an open-source extension registry operated by the Eclipse Foundation. These requests are made by the VS Code Workbench running in the WebView, not by any analytics or tracking code. Open VSX has its own privacy policy at https://open-vsx.org/about.
+
+Not every one of these connections is one you asked for, which is why this section is not headed "user-initiated" like the ones below it. The editor asks Open VSX for newer versions of the extensions you have installed when it starts and every 12 hours after that, whether or not you open the Extensions view, and it installs the updates it finds without asking. Both behaviours come from the editor and are on by default; you can turn them off in its settings, under `extensions.autoCheckUpdates` and `extensions.autoUpdate`. What goes out is the list of extensions to check, never anything from your files.
+
+The app also asks the editor to recommend the Black Formatter extension (`ms-python.black-formatter`) for Python files. When you open a Python file while that extension is not installed, the editor looks it up on Open VSX to show the suggestion. What goes out is that extension's identifier, never anything from your files. The setting `extensions.ignoreRecommendations` turns it off.
+
+### Built-in Language Features
+
+Several of the editor's built-in language extensions fetch public metadata over HTTPS when you open or edit matching files, without waiting for an explicit command:
+
+- **JSON schemas**: When you open a JSON file (such as `package.json` or `tsconfig.json`) or a file declaring a `$schema` URL, the built-in JSON language server fetches the schema from the domain the editor or the file names (by default `json.schemastore.org` and the other hosts listed under `json.schemaDownload.trustedDomains`). What goes out is the schema URL, not the contents of your JSON file. You can turn this off with `json.schemaDownload.enable`.
+- **`package.json` package metadata**: When you edit `package.json`, the built-in `npm` extension queries `registry.npmjs.org` for package names, descriptions, and latest versions to power completions and hover text, and when you hover a dependency inside a folder that contains `package.json`, it runs `npm view` against the configured `npm` registry (`registry.npmjs.org` by default) for the package under the cursor. What goes out is the dependency name or prefix being completed or inspected. Set `npm.fetchOnlinePackageInfo` to `false` and disable the built-in `npm` extension from the Extensions view if you want to stop both lookups.
+- **TypeScript automatic type acquisition**: When you open a JavaScript or TypeScript project, the TypeScript language server can install missing `@types/*` packages from `registry.npmjs.org` into the editor's local cache so completions work for third-party libraries. What goes out is the package names imported or listed in your project. You can turn this off with `js/ts.tsserver.automaticTypeAcquisition.enabled` (set to `false`) or `typescript.disableAutomaticTypeAcquisition` (set to `true`).
+
+You can set these on either the **Remote** or **User** tab in Settings (settings on the **Remote** tab are included in Android Backup; see **Android Backup** below).
+
+### Signing In to a Service From the Editor (User-Initiated)
+
+If an extension asks you to sign in (to GitHub, for example), the app hands that extension's authorisation URL to your device's browser, and the sign-in happens there rather than inside the app. VSCodroid never sees your password: it is typed into the provider's own page in the browser.
+
+What comes back is a single opaque value that the editor itself issued and is waiting for. The app reads the request number it names, the secret it carries and the address it returns to, and passes that address to the editor page without storing it or sending it anywhere. It is accepted only for a sign-in this app started: every sign-in carries a request number and a secret of its own, both minted by the editor, and the app records them when it opens the browser. A callback is delivered only if it names a recorded number, carries that sign-in's own secret, and arrives within ten minutes of the launch. The secret travels to the provider as part of the address the browser is sent to and comes back in the redirect, so a callback that carries it came back from the sign-in you started. One for a sign-in the app never launched is discarded however recently a browser was opened, so another app on your device cannot inject one at will. The secret is removed before the address is handed to the editor.
+
+Any tokens the editor keeps afterwards are stored locally in the app's private storage on your device.
+
+### GitHub Copilot Chat (Bundled, User-Initiated)
+
+VSCodroid bundles **GitHub Copilot Chat**, published by GitHub, and the editor is configured to use it as its chat provider. When the extension is enabled, it loads when the editor starts.
+
+It has no account to work against until you sign in to GitHub, which happens through the browser flow described above, and its features are unavailable until you do.
+
+That sign-in does not have to be one you made for the chat. A GitHub session created for anything else in the editor, the built-in GitHub features for example, is available to GitHub Copilot Chat without a second prompt: the editor's product configuration lists it as trusted for GitHub accounts, and it appears as trusted, and cannot be unticked, in the editor's list of extensions with access to an account. So "signing in to GitHub" and "giving the chat an account" are the same act here.
+
+Once you are signed in and you use it, **what you send goes to GitHub**. That means the message you type and the material the extension decides to attach as context, which normally includes code from the file you are working in and can include other parts of the project. That exchange is between you and GitHub under GitHub's terms and privacy statement (https://docs.github.com/site-policy). It passes through the same on-device proxy described under Git Operations below, which tunnels the encrypted connection without reading it; VSCodroid does not read it or keep a copy, and this is the only feature in this app that sends anything you write to a service we did not have to name elsewhere in this policy.
+
+If you would rather it stayed off, use **Disable AI Features** on **GitHub Copilot Chat** in the Extensions view (or set `chat.disableAIFeatures` to `true`); the editor works without it. It ships inside the app rather than being downloaded, so the view offers **Disable AI Features** rather than Uninstall.
+
+### Git Operations (User-Initiated)
+
+When you push, pull, clone or fetch, the bundled Git client reaches the remote you configured: GitHub, GitLab, a self-hosted server, whatever you named. The connection goes through a proxy that runs inside the app, on your device, at `127.0.0.1`. It exists because some bundled programs cannot look up a hostname on Android by themselves, so the lookup happens there instead. For an `https` remote it opens a tunnel and passes the encrypted bytes through without reading them; nothing leaves your device except the connection to the remote you named. VSCodroid adds no destination of its own and keeps no record of where you push.
+
+### Toolchain Downloads (User-Initiated)
+
+Additional programming language toolchains (Ruby, Java 21, C/C++) can be downloaded on-demand. There are two delivery paths, and the app chooses between them at runtime by asking Android which package installed it:
+
+- **Installed from the Google Play Store** (the installing package is `com.android.vending`): the toolchain arrives as a Google Play Asset Delivery pack, handled by the Google Play Store infrastructure. Google's privacy policy applies to Play Store interactions: https://policies.google.com/privacy.
+- **Installed any other way** -- a sideloaded APK, a debug build, `adb install` -- or when the installing package cannot be read at all: the app downloads a ZIP over HTTPS from this project's GitHub Releases (https://github.com/rmyndharis/VSCodroid/releases), following GitHub's redirect to its release-asset host. GitHub's privacy policy applies to that download.
+
+VSCodroid does not collect any data during either process.
+
+### Package Installation (User-Initiated)
+
+When you run commands like `npm install` or `pip install` in the terminal, those package managers connect to their respective registries (npmjs.com, pypi.org, etc.) to download packages. This is standard developer tooling behavior and is entirely under your control.
+
+`pip` is also pointed at a page this project publishes on GitHub Pages, one per Python version (for the Python this app bundles, https://rmyndharis.github.io/VSCodroid/wheels/3.14/wheels.html), which lists prebuilt Android builds of a few packages that PyPI has none of, such as `numpy` and `psutil`. pip reads that page when it looks for a package to install, including when the Jupyter extension installs `ipykernel`, and downloads a listed package from this project's GitHub Releases. Nothing from your files or code is sent. Like every request pip makes, including those to pypi.org, GitHub receives your device's IP address and pip's User-Agent, which names the versions of pip, Python and OpenSSL, the Android version, and the processor architecture, plus the versions of setuptools and the Rust compiler when those are installed, and whether pip appears to be running on a continuous-integration service; GitHub's privacy policy applies to them. How to turn this off is in the user guide, under Python Packages Written in C.
+
+Some extensions you install carry a program of their own inside the extension package you install from Open VSX. The Claude Code extension, for example, brings its command line tool that way; VSCodroid only starts the program for you. The extension's own privacy policy applies to it.
+
+Programs you compile, install or write yourself run on your device, inside this app's own sandbox and with only this app's permissions. VSCodroid does not upload them, does not start them unless you do, and downloads no program of its own beyond the toolchains you pick (see Toolchain Downloads above).
+
+### SSH Connections (User-Initiated)
+
+If you use the bundled SSH client to connect to remote servers, those connections are initiated by you and go directly to the server you specify. VSCodroid does not proxy, monitor, or log SSH connections.
+
+### Internal Communication (Localhost Only)
+
+The VS Code editor UI communicates with the local server process over `localhost` (127.0.0.1). This traffic never leaves your device. The server listens on the loopback interface only, so nothing on your network can reach it, and almost every route requires a token held in the app’s private storage before it will answer a request.
+
+## Android Backup (On by Default)
+
+VSCodroid allows Android's own backup service, so **one directory does leave the device** if you have backup enabled in your Android settings: `~/.vscodroid/data/Machine`, which holds this device's machine-scoped editor settings (`settings.json`). That file is both what VSCodroid writes there for the device and anything you change yourself on the editor's Settings tab labelled **Remote [127.0.0.1:13337]** (the port can differ on your device), and all of it is in the backup. Settings and keybindings you change on the **User** tab are stored by the editor inside the WebView and are not. Android uploads the backup to your Google account, not to us. We never see it.
+
+This is written as an allowlist, so everything not named above is excluded rather than the other way round. In particular these are **not** backed up:
+
+- your SSH keys (`~/.ssh`) and the local server's connection token
+- your projects and any folder you opened from device storage
+- the bundled runtimes and any language toolchains you installed
+- app preferences, deliberately: restoring those onto a device with empty storage would make the app believe setup had already run
+
+To turn it off entirely, use Android's own control: **Settings → Google → Backup**, or the per-app backup setting your device provides. It is Android's switch, not ours.
+
+## What We Do NOT Do
+
+- We do **not** collect analytics or usage statistics
+- We do **not** send crash reports to any external service
+- We do **not** use any third-party tracking SDKs
+- We do **not** serve advertisements
+- We do **not** collect device identifiers, IP addresses, or location data
+- We do **not** use cookies for tracking purposes
+- We do **not** share any data with third parties. One thing this app ships does, and it is named rather than tucked under this line: GitHub Copilot Chat sends what you ask it, and the code it attaches as context, to GitHub, once you have signed in and used it. See the section above
+- We do **not** send Microsoft telemetry. To be exact about how: the telemetry code is still in the editor build, and it is switched off and given nowhere to report to. `telemetryOptIn` is false in the product configuration applied at build time, both `telemetryOptIn` and `enableTelemetry` are set false again at every start, and the built `product.json` carries no telemetry endpoint for it to reach. Disabled and unaddressed, rather than deleted
+
+## Data Stored on Your Device
+
+The following data is stored locally on your device:
+
+- **Your project files**: Stored in the app's private internal storage on a new install (which other apps cannot read and which Clear Data wipes), or in a folder you granted access to. An install that already kept its projects in the app's own area of shared storage (`Android/data/com.vscodroid/files/projects`) keeps them there; new installs no longer use that location because shared storage cannot hold the symbolic links that tools such as `npm install` write
+- **Copies of folders you open from device storage**: When you open a folder through the Android file picker, VSCodroid does not edit it in place. It copies the folder into the app's own storage, works on that copy, and writes your changes back to the original. Closing a folder or revoking its permission retains the local copy and pending saves. You can remove an unused copy through the app; uninstalling or clearing app data also removes it. Nothing about the copy leaves the device (it is excluded from backup), but you should know it is made
+- **Editor settings and preferences**: Stored locally as JSON configuration files
+- **Installed extensions**: Downloaded from Open VSX and stored locally
+- **SSH keys**: If you generate SSH keys using the built-in tool, they are stored in the app's private `~/.ssh/` directory. They never leave your device unless you explicitly copy or use them
+- **Terminal history**: Stored locally within the app
+- **Extension data**: Any data created by installed extensions is stored locally
+
+Uninstalling the app or clearing its data through Android Settings removes its private files and local copies of device folders. Original files in folders you granted access to remain in those folders.
+
+## Third-Party Services
+
+VSCodroid itself includes no third-party analytics, advertising, or tracking SDKs. The third-party services it integrates are:
+
+- **GitHub Copilot Chat**: Bundled with the app and configured as the editor's chat provider. It has no account and offers you no chat until you sign in to GitHub. While it is enabled it starts with the editor whether or not you are signed in, and whether it sends anything before you sign in is not something we have established. Once you have signed in and used it, what you ask and the code it attaches as context go to GitHub, under GitHub's terms and privacy statement. It can be turned off from the Extensions view (**Disable AI Features**), but not uninstalled, because it ships as a built-in.
+- **Google Play Asset Delivery**: Used solely for downloading optional language toolchain packs on Play Store installs. This is a Google Play Store feature and is governed by Google's privacy policy.
+- **GitHub Releases and GitHub Pages**: Used for downloading those same toolchain packs on installs that did not come from the Play Store, and for the prebuilt Python packages `pip` is pointed at (see **Package Installation**). Governed by GitHub's privacy policy.
+
+Extensions you install from Open VSX are third-party software. Each extension may have its own privacy practices. We recommend reviewing extension descriptions and privacy information before installing them.
+
+## Children's Privacy
+
+VSCodroid is a software development tool intended for developers. It is not directed at children under the age of 13. We do not knowingly collect any information from children. Since VSCodroid collects no data from any user, there is no risk of children's data being collected.
+
+## Data Security
+
+Because VSCodroid does not collect or transmit user data, there is no central database or server to secure. Your files and settings are protected by Android's app sandboxing, which prevents other apps from accessing VSCodroid's private storage. We recommend using your device's built-in security features (screen lock, encryption) to protect your data.
+
+## Changes to This Policy
+
+If we make changes to this privacy policy, we will update the "Last Updated" date at the top of this document. Material changes will be noted in the app's release notes on the Google Play Store. The current version of this policy is always available at our GitHub repository and on the Google Play Store listing.
+
+## Your Rights
+
+Since VSCodroid does not collect any personal data, there is no personal data to access, correct, delete, or port. If you want to remove all app data from your device, you can uninstall the app or clear its data through Android Settings > Apps > VSCodroid > Clear Data.
+
+## Open Source
+
+VSCodroid is open source software. You can review the complete source code to verify our privacy practices at:
+https://github.com/rmyndharis/VSCodroid
+
+## Contact
+
+If you have questions about this privacy policy, please contact us at:
+
+- **Email**: yudhi@rmyndharis.com
+- **GitHub Issues**: https://github.com/rmyndharis/VSCodroid/issues
+
+---
+
+_VSCodroid is built from the MIT-licensed Code - OSS source code. It is not affiliated with or endorsed by Microsoft Corporation. "Visual Studio Code" and "VS Code" are trademarks of Microsoft Corporation._

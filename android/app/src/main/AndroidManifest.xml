@@ -1,0 +1,199 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <!-- Network: localhost communication between WebView and Node.js server, and
+         every outbound connection: the extension marketplace, toolchain
+         downloads, dev-server previews on the local network, and whatever the
+         terminal or an extension fetches -->
+    <uses-permission android:name="android.permission.INTERNET" />
+
+    <!-- Foreground service: keep Node.js server alive -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+
+    <!-- Notifications: server status in notification shade -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+    <!-- largeHeap raises the ART heap CAP for this process and nothing else:
+         it does not reserve memory and no Kotlin here reads it. On an API 33
+         arm64 device with 4 GB of RAM the cap moves from
+         dalvik.vm.heapgrowthlimit=192m to dalvik.vm.heapsize=576m (measured
+         2026-08-23). The app's actual memory story belongs to a different
+         process family, the V8 ceiling ProcessManager.heapCeilingForDevice
+         derives from device RAM, which this attribute does not touch.
+
+         It was carried here with no comment and no measurement. Both readings
+         have now been taken on an API 33 arm64 emulator with 4 GB of RAM.
+         Splash screen, WebView pre-warmed: 8.8 MB of ART heap, 4.4 MB of it
+         allocated, 111 MB PSS. Workbench loaded through SplashActivity with a
+         folder open and a terminal running: 8.5 MB of ART heap, 4.3 MB
+         allocated, 113 MB PSS. The second reading is the one that was expected
+         to move and did not, because the WebView's browser-side allocations
+         are in a different process
+         (com.google.android.webview:sandboxed_process0), not in this one.
+
+         So the attribute is not load-bearing: this process uses about 2% of
+         the 192 MB it would be capped at without it. It stays because removing
+         it trades nothing measurable for an OOM path nobody has exercised, and
+         it is kept honest rather than kept silently. What is still unmeasured
+         is a heavy session (many open editors, several terminals); if that
+         reading also lands near 4 MB, delete the line.
+
+         The reading to take, with the package the build actually installs
+         (debug adds a .debug suffix):
+           adb shell dumpsys meminfo com.vscodroid -d | grep -A4 'App Summary'
+         The renderer is a separate process and is not the subject here. -->
+    <application
+        android:name=".VSCodroidApp"
+        android:allowBackup="true"
+        android:fullBackupContent="@xml/backup_rules"
+        android:dataExtractionRules="@xml/data_extraction_rules"
+        android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher_round"
+        android:label="@string/app_name"
+        android:localeConfig="@xml/locales_config"
+        android:supportsRtl="true"
+        android:networkSecurityConfig="@xml/network_security_config"
+        android:hardwareAccelerated="true"
+        android:largeHeap="true"
+        android:theme="@style/Theme.VSCodroid"
+        tools:targetApi="34">
+
+        <!-- Splash screen: shown during setup (first-run extraction, the
+             toolchain picker and its downloads). MainActivity, not this,
+             starts the server. -->
+        <!-- No android:noHistory, and its absence is load-bearing. It finishes an
+             activity whenever it is STOPPED, which the screen timing out and the
+             user pressing Home both do, and first-run extraction takes minutes
+             while nothing here holds the screen awake. Finishing destroys the
+             activity, which cancels the lifecycleScope runSetup() is launched in.
+             The extraction itself survives, because runSetupLocked's body is
+             blocking with no suspension point in it, so markSetupComplete() runs
+             and isFirstRun() goes false; what is lost is the continuation after
+             it, which offers the toolchain picker and opens the editor. The
+             picker is not lost with it: continueAfterSetup() offers it on every
+             launch until Continue or Skip writes toolchain_picker_shown, so this
+             cost is one more launch. The second cost is worse and needs no timing
+             argument: with the activity finished, the only thing holding the
+             process through the write of the whole asset tree is the setup hold
+             NodeService takes for it (SplashActivity.holdProcessForSetup), and a
+             kill there still costs whatever the interrupted file was.
+
+             Nothing is left in the back stack by dropping it: launchMain() calls
+             finish() on every route that reaches MainActivity, and the one screen
+             that does not reach it, a failed setup, offers Retry and is better
+             kept than silently dismissed.
+
+             The screen is still free to time out, which is the other half of this
+             and lives in the layout rather than here. -->
+        <!-- uiMode is in both lists below, and it is the only one of the eleven
+             undeclared qualifiers that fires with no user interaction at all: a
+             sunset-to-sunrise dark schedule and battery saver's forced dark both
+             flip it while the app is in use. Here a relaunch mid-extraction does
+             not stop the unpack, whose body blocks with no suspension point: the
+             replacement waits on setupMutex and takes the progress bar over
+             (FirstRunSetup.onProgress), so the cost is a rebuilt screen. In
+             MainActivity the cost is a full workbench reload: the fresh WebView
+             holds only the data: placeholder, folderFromUrl refuses an opaque
+             URI, and loadVSCode reopens the remembered folder
+             (rememberedWorkspaceFolder), an empty window if the user had closed
+             it, or the default projects directory if that folder is gone.
+
+             Safe to declare because almost nothing on these two screens resolves
+             by night. The module has no values-night directory at all, and every
+             colour these layouts render is a fixed @color: backgroundTint,
+             textColor, progressTint, indeterminateTint, and the card's
+             cardBackgroundColor. The one thing not pinned, stated because an
+             earlier version of this comment claimed there was nothing: the two
+             ProgressBars carry style="?android:attr/progressBarStyleHorizontal",
+             whose TRACK colour comes from the theme. Their fill is pinned by
+             progressTint, so what can go stale after a night flip is the shade of
+             a progress track, against a relaunch of either screen. Sweep for it
+             with '?[a-zA-Z:]*attr/', not '?attr/': the narrower pattern cannot
+             see ?android:attr and is what missed these.
+
+             uiMode is also wider than night. CONFIG_UI_MODE covers the whole
+             uiMode field, so this suppresses relaunch for car, desk, television,
+             appliance and vr-headset modes too. There are no ui-mode-qualified
+             resources here either, so that costs nothing today.
+
+             If anyone adds a values-night or values-television qualifier, or
+             switches one of these layouts to ?attr/colorSurface, this declaration
+             becomes a bug: the framework stops relaunching and nothing
+             re-resolves, leaving the screen in the previous appearance. Handle
+             onConfigurationChanged then, or take uiMode back out.
+
+             MainActivity also handles density because moving to another display
+             can change it during a session. Its key row rebuilds its pixel sizes
+             without destroying the WebView or pending sign-in requests.
+
+             locale, layoutDirection, fontScale, colorMode and fontWeightAdjustment
+             still recreate the native UI so its resources are resolved again. -->
+        <activity
+            android:name=".SplashActivity"
+            android:exported="true"
+            android:configChanges="orientation|screenSize|keyboard|keyboardHidden|screenLayout|smallestScreenSize|uiMode"
+            android:theme="@style/Theme.VSCodroid">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <!-- Main editor activity: hosts WebView with VS Code UI -->
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:launchMode="singleTask"
+            android:configChanges="orientation|screenSize|keyboard|keyboardHidden|screenLayout|smallestScreenSize|uiMode|density"
+            android:windowSoftInputMode="adjustResize"
+            android:theme="@style/Theme.VSCodroid">
+
+            <!-- Extension callback relay: vscodroid://callback?data=... -->
+            <!-- Bridges localStorage gap between Chrome (callback.html) and WebView -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+
+                <data android:scheme="vscodroid" android:host="callback" />
+            </intent-filter>
+
+            <!-- No VIEW filter for file:// or content:// here, and that is deliberate.
+                 Two of them used to advertise this app for about twenty source-file
+                 extensions, and nothing ever opened one: handleIntent() called
+                 window.__vscodroid.onFileOpen, which has had no consumer since the
+                 initial commit. Choosing VSCodroid from "Open with" brought up the
+                 editor on the default folder with no file, no message and nothing in
+                 the log to attach to a bug report.
+
+                 Implementing it is not a matter of wiring the hook up. A content://
+                 URI has no POSIX path, and the server only ever sees POSIX paths, so
+                 the file has to be materialised locally, at which point saving
+                 writes to a copy and the user's edits never reach the file they
+                 opened. Advertising nothing is honest; advertising this and silently
+                 dropping edits would not be. Folders still open through the SAF
+                 picker, which does have the sync engine that makes write-back work. -->
+        </activity>
+
+        <!-- Toolchain settings: manage on-demand language toolchains -->
+        <activity
+            android:name=".ToolchainActivity"
+            android:exported="false"
+            android:parentActivityName=".MainActivity"
+            android:theme="@style/Theme.VSCodroid" />
+
+        <!-- Node.js server service: runs the Code - OSS server locally -->
+        <service
+            android:name=".service.NodeService"
+            android:exported="false"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="Local development server for code editor" />
+        </service>
+
+    </application>
+
+</manifest>

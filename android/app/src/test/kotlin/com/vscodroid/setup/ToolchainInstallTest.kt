@@ -1,0 +1,702 @@
+package com.vscodroid.setup
+
+import android.content.Context
+import android.content.pm.InstallSourceInfo
+import android.content.pm.PackageManager
+import android.os.StatFs
+import com.google.android.gms.tasks.OnFailureListener
+import com.google.android.gms.tasks.Task
+import com.google.android.play.core.assetpacks.AssetPackManager
+import com.google.android.play.core.assetpacks.AssetPackManagerFactory
+import com.google.android.play.core.assetpacks.AssetPackStates
+import com.google.android.play.core.assetpacks.model.AssetPackStatus
+import com.vscodroid.util.Logger
+import io.mockk.Runs
+import io.mockk.every
+import io.mockk.just
+import io.mockk.mockk
+import io.mockk.mockkConstructor
+import io.mockk.mockkObject
+import io.mockk.mockkStatic
+import io.mockk.unmockkAll
+import io.mockk.verify
+import org.junit.jupiter.api.AfterEach
+import org.junit.jupiter.api.Assertions.assertEquals
+import org.junit.jupiter.api.Assertions.assertFalse
+import org.junit.jupiter.api.Assertions.assertTrue
+import org.junit.jupiter.api.BeforeEach
+import org.junit.jupiter.api.Test
+import org.junit.jupiter.api.io.TempDir
+import java.io.File
+import java.nio.file.Files
+import java.io.RandomAccessFile
+import java.util.Collections
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.ExecutorService
+import java.util.concurrent.TimeUnit
+
+/**
+ * The install flow, which had no test of any kind.
+ *
+ * This is the production delivery channel for both audiences at once, and which one
+ * a user gets is decided at runtime by [ToolchainManager.shouldUseHttpFallback]: a
+ * Play install fetches an asset pack, everything else downloads a ZIP from a GitHub
+ * release. Route a Play user down the HTTP path and the download is pointless where
+ * Play would have served it; route a sideloaded user down the Play path and
+ * `fetch()` fails quietly, because Play Asset Delivery has nothing to answer with on
+ * an app it did not install. Neither shows up as an error anyone reads.
+ *
+ * The other half is [ToolchainManager.installFromDirectory], where both routes
+ * converge. Its early returns are the reason first-run setup can finish: the queue
+ * advances on reported state, so a pack that returns without reporting anything
+ * stalls the progress screen forever rather than being skipped.
+ *
+ * No socket is opened here. The HTTP branch's background task checks free space
+ * before it downloads, and the constructor of `StatFs` is stubbed to report none --
+ * deliberately, rather than relying on the JVM's android.jar throwing `Stub!` at
+ * whatever the task happens to touch first.
+ */
+class ToolchainInstallTest {
+
+    @TempDir
+    lateinit var filesDir: File
+
+    private lateinit var context: Context
+    private lateinit var packageManager: PackageManager
+    private lateinit var packManager: AssetPackManager
+    private val managers = mutableListOf<ToolchainManager>()
+
+    /** Written by the caller thread and by ioExecutor, so it has to be synchronized. */
+    private val events: MutableList<Triple<String, Int, Int>> =
+        Collections.synchronizedList(mutableListOf())
+
+    /**
+     * Every failure reason reported, so a case can assert on WHY and not only
+     * that. The copy cases below are entirely about which of them the user is
+     * shown: the same exception used to arrive as NETWORK on one delivery path
+     * and INTERNAL on the other, and neither remedy was the right one.
+     */
+    private val reasons: MutableList<ToolchainFailure> =
+        Collections.synchronizedList(mutableListOf())
+    private val failed = CountDownLatch(1)
+
+    @BeforeEach
+    fun setUp() {
+        mockkStatic(Files::class)
+        mockkObject(Logger)
+        every { Logger.d(any(), any()) } just Runs
+        every { Logger.i(any(), any()) } just Runs
+        every { Logger.w(any(), any(), any()) } just Runs
+        every { Logger.e(any(), any(), any()) } just Runs
+
+        // Play Core is reached through field initialisation, so it runs before any
+        // method can be called on the manager.
+        packManager = mockk(relaxed = true)
+        mockkStatic(AssetPackManagerFactory::class)
+        every { AssetPackManagerFactory.getInstance(any()) } returns packManager
+
+        // No free space, so the HTTP branch stops at its pre-flight check and the
+        // download is never attempted.
+        mockkConstructor(StatFs::class)
+        every { anyConstructed<StatFs>().availableBytes } returns 0L
+
+        packageManager = mockk(relaxed = true)
+        context = mockk(relaxed = true)
+        every { context.filesDir } returns filesDir
+        every { context.cacheDir } returns File(filesDir, "cache")
+        every { context.packageManager } returns packageManager
+        every { context.packageName } returns "com.vscodroid"
+
+        File(filesDir, "home/.vscodroid").mkdirs()
+    }
+
+    @AfterEach
+    fun tearDown() {
+        val executors = managers.map { manager ->
+            ToolchainManager::class.java.getDeclaredField("ioExecutor")
+                .apply { isAccessible = true }.get(manager) as ExecutorService
+        }
+        try {
+            executors.forEach { it.shutdown() }
+            executors.forEach { executor ->
+                if (!executor.awaitTermination(10, TimeUnit.SECONDS)) {
+                    executor.shutdownNow()
+                    assertTrue(executor.awaitTermination(10, TimeUnit.SECONDS), "an install task outlived its fixture")
+                }
+            }
+        } finally {
+            executors.forEach { it.shutdownNow() }
+            unmockkAll()
+        }
+    }
+
+    private fun manager() = ToolchainManager(context).also { managers.add(it) }.apply {
+        onStateChange = { pack, status, pct, why, _ ->
+            if (why != null) reasons.add(why)
+            events.add(Triple(pack, status, pct))
+            if (status == AssetPackStatus.FAILED) failed.countDown()
+        }
+    }
+
+    private fun installedBy(installer: String?) {
+        val info = mockk<InstallSourceInfo>()
+        every { info.installingPackageName } returns installer
+        every { packageManager.getInstallSourceInfo(any()) } returns info
+    }
+
+    /** Private, and the only entry point both delivery routes share. */
+    private fun installFromDirectory(m: ToolchainManager, pack: String, dir: File) =
+        ToolchainManager::class.java
+            .getDeclaredMethod("installFromDirectory", String::class.java, File::class.java)
+            .apply { isAccessible = true }
+            .invoke(m, pack, dir)
+
+    private fun statuses() = synchronized(events) { events.map { it.second } }
+
+    /** Where an install notes the tree it is about to write, before it writes it. */
+    private fun marker(pack: String = "toolchain_java") =
+        File(filesDir, "home/.vscodroid/toolchain-installing/$pack.json")
+
+    /**
+     * A file of [bytes] length with no bytes actually written.
+     *
+     * `dirSize` sums `File.length()`, so a sparse file measures as the real thing
+     * without a test putting 40 MB through a temporary directory.
+     */
+    private fun sparseFile(path: String, bytes: Long) {
+        val file = File(filesDir, path)
+        file.parentFile?.mkdirs()
+        RandomAccessFile(file, "rw").use { it.setLength(bytes) }
+    }
+
+    /** What the pre-flight refusal says it needs, in the units it prints them in. */
+    private fun refusalNaming(requiredBytes: Long) =
+        "Not enough disk space: 0 MB available, ${requiredBytes / 1_000_000} MB required"
+
+    private val javaUnpacked = ToolchainRegistry.find("toolchain_java")!!.estimatedSize
+
+    private val javaName = ToolchainRegistry.find("toolchain_java")!!.displayName
+
+    /**
+     * The other half of the reservation, and it has to come from the registry
+     * too. The gate charges for the stage that holds the most at once, and for a
+     * credited reinstall that stage is the extraction, which holds the archive
+     * beside the tree it is expanding.
+     */
+    private val javaDownload = ToolchainRegistry.find("toolchain_java")!!.downloadSize
+
+    // ── which route a user gets ──────────────────────────────────────────
+
+    @Test
+    fun `a Play install fetches the asset pack and downloads nothing`() {
+        installedBy("com.android.vending")
+
+        manager().install("toolchain_java")
+
+        verify(exactly = 1) { packManager.fetch(listOf("toolchain_java")) }
+        // The HTTP branch reports PENDING synchronously, before it queues anything,
+        // so an empty list here is what distinguishes the two routes.
+        assertEquals(emptyList<Int>(), statuses(), "the HTTP branch ran on a Play install")
+    }
+
+    /**
+     * A fetch Play refuses outright delivers no `AssetPackState` at all, so the
+     * state listener never runs for this pack. The Task was the only place that
+     * refusal was ever reported, and it was discarded: the card sat on its last
+     * status for the rest of the session, every pack queued behind it was never
+     * requested, and nothing reached the log.
+     *
+     * NEGATIVE CONTROL: drop the `addOnFailureListener` from the fetch in
+     * `ToolchainManager.install` and this fails with an empty status list.
+     */
+    @Test
+    fun `a fetch Play refuses is reported instead of leaving the queue stalled`() {
+        installedBy("com.android.vending")
+        val refusal = IllegalStateException("Play refused this fetch")
+        every { packManager.fetch(listOf("toolchain_java")) } returns mockk(relaxed = true) {
+            every { addOnFailureListener(any<OnFailureListener>()) } answers {
+                firstArg<OnFailureListener>().onFailure(refusal)
+                self as Task<AssetPackStates>
+            }
+        }
+
+        manager().install("toolchain_java")
+
+        assertEquals(
+            listOf(AssetPackStatus.FAILED),
+            statuses(),
+            "a fetch Play refused was never reported, so the toolchain screen keeps " +
+                "its last status and the queue behind it never moves",
+        )
+    }
+
+    /**
+     * Play's own legacy package name, which is still the installer of record on
+     * a device whose app was installed by an older Store.
+     *
+     * Recognising only `com.android.vending` sent those devices down the HTTP
+     * route: a Play install fetching native binaries from a GitHub release,
+     * which is the one thing the Play route exists to avoid, on a device Play
+     * would have served the pack to for nothing.
+     *
+     * NEGATIVE CONTROL: take the name out of PLAY_INSTALLERS and this fails on
+     * the fetch, exactly as the sideload case one test below passes.
+     */
+    @Test
+    fun `a Play install recorded under the legacy installer name fetches the pack`() {
+        installedBy("com.google.android.feedback")
+
+        manager().install("toolchain_java")
+
+        verify(exactly = 1) { packManager.fetch(listOf("toolchain_java")) }
+        assertEquals(emptyList<Int>(), statuses(), "the HTTP branch ran on a Play install")
+    }
+
+    @Test
+    fun `a sideloaded install downloads over HTTP and never asks Play`() {
+        installedBy("com.example.sideloader")
+
+        manager().install("toolchain_java")
+
+        assertTrue(failed.await(10, TimeUnit.SECONDS), "the HTTP task never reported an outcome")
+        assertEquals(
+            listOf(AssetPackStatus.PENDING, AssetPackStatus.FAILED), statuses(),
+            "expected PENDING then the pre-flight refusal, got $events",
+        )
+        // The event sequence alone does not say WHICH failure this was: downloadViaHttp
+        // reports FAILED from the disk-space branch and from three catch blocks, and a
+        // runner with no network would produce exactly the same two events after three
+        // retries. Deleting the space check would leave the assertion above green while
+        // the test opened sockets. Only this line pins the branch.
+        verify { Logger.e(any(), match { it.startsWith("Not enough disk space") }, any()) }
+        verify(exactly = 0) { packManager.fetch(any()) }
+    }
+
+    @Test
+    fun `an unreadable install source takes the HTTP route rather than none`() {
+        // The catch in shouldUseHttpFallback reads an unreadable installer as
+        // not-Play, which is what selects the HTTP route. A device that will not
+        // say who installed the app is far more likely to be a sideload than a
+        // Play install, and guessing Play there leaves the user with a toolchain
+        // that never arrives and no error.
+        every { packageManager.getInstallSourceInfo(any()) } throws SecurityException("denied")
+
+        manager().install("toolchain_java")
+
+        assertTrue(failed.await(10, TimeUnit.SECONDS), "the HTTP task never reported an outcome")
+        assertEquals(AssetPackStatus.PENDING, statuses().first())
+        verify(exactly = 0) { packManager.fetch(any()) }
+    }
+
+    /**
+     * A record that exists and cannot be parsed is kept as it is, because it still names the
+     * files an uninstall would remove. That is not a storage problem, so the user is not told
+     * to free space, and it is refused before a ZIP is downloaded, not after.
+     */
+    @Test
+    fun `an unreadable record refuses a Play install before it fetches anything`() {
+        installedBy("com.android.vending")
+        File(filesDir, "home/.vscodroid/toolchains.json").writeText("[{\"name\":")
+
+        manager().install("toolchain_java")
+
+        assertEquals(listOf(AssetPackStatus.FAILED), statuses())
+        assertEquals(listOf(ToolchainFailure.INTERNAL), synchronized(reasons) { reasons.toList() })
+        verify(exactly = 0) { packManager.fetch(any()) }
+    }
+
+    @Test
+    fun `an unreadable record refuses an HTTP install before it reports progress`() {
+        installedBy("com.example.sideloader")
+        val record = File(filesDir, "home/.vscodroid/toolchains.json").apply { writeText("[{\"name\":") }
+
+        manager().install("toolchain_java")
+
+        assertTrue(failed.await(10, TimeUnit.SECONDS), "the refusal was never reported")
+        assertEquals(listOf(AssetPackStatus.FAILED), statuses(), "the download was started: $events")
+        assertEquals(listOf(ToolchainFailure.INTERNAL), synchronized(reasons) { reasons.toList() })
+        assertEquals("[{\"name\":", record.readText(), "the unreadable record was replaced")
+    }
+
+    @Test
+    fun `an unknown toolchain reports FAILED instead of returning silently`() {
+        installedBy("com.android.vending")
+
+        manager().install("toolchain_haskell")
+
+        assertEquals(listOf(AssetPackStatus.FAILED), statuses())
+        verify(exactly = 0) { packManager.fetch(any()) }
+    }
+
+    // ── what the HTTP pre-flight asks for ────────────────────────────────
+
+    /**
+     * A reinstall of the build on disk is charged for one tree plus the largest
+     * file it will replace, not for two trees.
+     *
+     * The payload is not downloaded yet, so the tree it overwrites comes from the
+     * record, and the figure is a reservation rather than a promise: the copy is
+     * measured again from the real files before it starts. Two files rather than
+     * one, because a single file is its own largest and the term cancels the
+     * credit: 30 MB and 10 MB credit 40 MB and ask for room to write the 30.
+     */
+    @Test
+    fun `an HTTP reinstall is charged one tree plus the largest file it replaces`() {
+        installedBy("com.example.sideloader")
+        File(filesDir, "home/.vscodroid/toolchains.json").writeText(
+            """[{"name":"java","displayName":"$javaName","installRoot":"usr/opt/java"}]"""
+        )
+        sparseFile("usr/opt/java/lib/modules", 30_000_000L)
+        sparseFile("usr/opt/java/bin/java", 10_000_000L)
+
+        manager().install("toolchain_java")
+
+        assertTrue(failed.await(10, TimeUnit.SECONDS), "the HTTP task never reported an outcome")
+        val credited = toolchainInstallBytes(javaUnpacked, javaDownload, InstalledTree(40_000_000L, 30_000_000L))
+        assertTrue(
+            credited < toolchainInstallBytes(javaUnpacked, javaDownload),
+            "the recorded tree earned no credit, so a reinstall is charged as a first install",
+        )
+        verify { Logger.e(any(), refusalNaming(credited), any()) }
+    }
+
+    /**
+     * And a device with nothing recorded is charged for both copies, which is the
+     * figure that was always right for a first install.
+     *
+     * The tree is planted anyway, so a credit taken without asking the record, or
+     * one that defaulted its root to `filesDir`, changes this number rather than
+     * leaving it alone.
+     */
+    @Test
+    fun `a device with no record is charged for both copies`() {
+        installedBy("com.example.sideloader")
+        sparseFile("usr/opt/java/lib/modules", 40_000_000L)
+
+        manager().install("toolchain_java")
+
+        assertTrue(failed.await(10, TimeUnit.SECONDS), "the HTTP task never reported an outcome")
+        verify { Logger.e(any(), refusalNaming(toolchainInstallBytes(javaUnpacked, javaDownload)), any()) }
+    }
+
+    /**
+     * A record written by another build of the same toolchain credits nothing.
+     *
+     * Java 17 and 21 share the pack name `java` and not the install root, so the
+     * Java 17 tree on disk is beside the one the download will write, not under it.
+     * Credited anyway it took 155 MB off a reservation the copy then needs in full.
+     * A record that names no build at all is treated the same way.
+     */
+    @Test
+    fun `a record from another build of the toolchain credits nothing`() {
+        installedBy("com.example.sideloader")
+        File(filesDir, "home/.vscodroid/toolchains.json").writeText(
+            """[{"name":"java","displayName":"Java 17","installRoot":"usr/opt/java"}]"""
+        )
+        sparseFile("usr/opt/java/lib/modules", 40_000_000L)
+
+        manager().install("toolchain_java")
+
+        assertTrue(failed.await(10, TimeUnit.SECONDS), "the HTTP task never reported an outcome")
+        verify { Logger.e(any(), refusalNaming(toolchainInstallBytes(javaUnpacked, javaDownload)), any()) }
+    }
+
+    /**
+     * A record naming a different toolchain credits nothing, because the bytes it
+     * names are not the ones this copy will write over.
+     */
+    @Test
+    fun `a record naming another toolchain credits nothing`() {
+        installedBy("com.example.sideloader")
+        File(filesDir, "home/.vscodroid/toolchains.json").writeText(
+            """[{"name":"ruby","installRoot":"usr/lib/ruby"}]"""
+        )
+        sparseFile("usr/lib/ruby/gems", 30_000_000L)
+
+        manager().install("toolchain_java")
+
+        assertTrue(failed.await(10, TimeUnit.SECONDS), "the HTTP task never reported an outcome")
+        verify { Logger.e(any(), refusalNaming(toolchainInstallBytes(javaUnpacked, javaDownload)), any()) }
+    }
+
+    // ── where both routes converge ───────────────────────────────────────
+
+    @Test
+    fun `a pack with no manifest reports FAILED rather than stalling the queue`() {
+        val emptyPack = File(filesDir, "pack-empty").apply { mkdirs() }
+
+        installFromDirectory(manager(), "toolchain_java", emptyPack)
+
+        assertEquals(listOf(AssetPackStatus.FAILED), statuses())
+    }
+
+    @Test
+    fun `a manifest with no name reports FAILED rather than stalling the queue`() {
+        val pack = File(filesDir, "pack-nameless").apply { mkdirs() }
+        File(pack, "toolchain_java.json").writeText("""{"installRoot":"usr/opt/java"}""")
+
+        installFromDirectory(manager(), "toolchain_java", pack)
+
+        assertEquals(listOf(AssetPackStatus.FAILED), statuses())
+    }
+
+    @Test
+    fun `a Ruby manifest without its payload cannot complete installation`() {
+        val pack = File(filesDir, "pack-ruby").apply { mkdirs() }
+        // No binaries named, so the missing usr/ directory is the only thing that can refuse it.
+        File(pack, "toolchain_ruby.json").writeText(
+            """{"name":"ruby","installRoot":"usr/lib/ruby"}"""
+        )
+        val m = manager()
+
+        installFromDirectory(m, "toolchain_ruby", pack)
+
+        assertEquals(listOf(AssetPackStatus.FAILED), statuses())
+        assertEquals(listOf(ToolchainFailure.CORRUPT), reasons.toList())
+        assertFalse("ruby" in m.getInstalledToolchains())
+    }
+
+    @Test
+    fun `a payload missing its required binary cannot complete installation`() {
+        val pack = File(filesDir, "pack-ruby").apply { mkdirs() }
+        File(pack, "toolchain_ruby.json").writeText(
+            """{"name":"ruby","installRoot":"usr/lib/ruby","binaries":["usr/bin/ruby"]}"""
+        )
+        File(pack, "usr/lib/ruby").mkdirs()
+        File(pack, "usr/lib/ruby/version.rb").writeText("payload")
+        val m = manager()
+
+        installFromDirectory(m, "toolchain_ruby", pack)
+
+        assertEquals(listOf(AssetPackStatus.FAILED), statuses())
+        assertEquals(listOf(ToolchainFailure.CORRUPT), reasons.toList())
+        assertFalse("ruby" in m.getInstalledToolchains())
+    }
+
+    @Test
+    fun `a valid manifest is recorded and reported COMPLETED`() {
+        // The positive control for the three refusals above: without it they would
+        // all still pass if installFromDirectory reported FAILED unconditionally.
+        val pack = packThatCopiesCleanly()
+
+        installFromDirectory(manager(), "toolchain_java", pack)
+
+        assertEquals(listOf(AssetPackStatus.COMPLETED), statuses())
+        val state = File(filesDir, "home/.vscodroid/toolchains.json").readText()
+        assertTrue(state.contains("\"java\""), "the install was reported but not recorded: $state")
+        // The marker an install writes before it copies is dropped by the exit
+        // that reaches a definite end: here, the record has just been written and
+        // says everything the marker stood in for. Left behind, it tells the next
+        // launch's reclaim that a finished install is a partial one; the record
+        // check saves the files, so this is the assertion that catches the leak
+        // rather than the damage.
+        assertFalse(marker().exists(), "a finished install left its marker behind")
+    }
+
+    // ── a copy that cannot finish ────────────────────────────────────────
+
+    /**
+     * A pack whose tree cannot be copied whole, however much room there is.
+     *
+     * The obstruction is a regular file where the copy has to create a
+     * directory, which fails with a `FileNotFoundException` -- an `IOException`,
+     * the same type `copyDirectoryTree` throws for a directory it cannot list
+     * and the same one a full disk produces. Arranged this way because the
+     * alternatives are not deterministic: filling a temporary filesystem is not
+     * available here, and a permission trick answers differently depending on
+     * who runs the suite.
+     *
+     * Both files sit under the manifest's `installRoot`, which is what the
+     * reclaim below is asserted against.
+     */
+    private fun packWithBlockedCopy(): File {
+        File(filesDir, "usr/opt/java").mkdirs()
+        // Where a directory has to go.
+        File(filesDir, "usr/opt/java/blocked").writeText("in the way")
+        val pack = File(filesDir, "pack-java").apply { mkdirs() }
+        File(pack, "toolchain_java.json").writeText("""{"name":"java","installRoot":"usr/opt/java"}""")
+        File(pack, "usr/opt/java/blocked").mkdirs()
+        File(pack, "usr/opt/java/blocked/inner").writeText("payload")
+        File(pack, "usr/opt/java/ok").writeText("payload")
+        return pack
+    }
+
+    /**
+     * A disk that fills up during the copy is a storage problem on both delivery
+     * paths, and used to be reported as neither.
+     *
+     * The exception unwound out of `installFromDirectory` into whichever catch
+     * the caller had: `catch (e: IOException)` in the HTTP download, which
+     * reports NETWORK -- "Download failed. Check your connection and try again."
+     * for a transfer that had already succeeded -- and `catch (e: Exception)` on
+     * the Play path, which reports INTERNAL and asks the user to read a log.
+     * Neither remedy is the one that works.
+     */
+    @Test
+    fun `a copy that cannot finish is reported as a storage problem`() {
+        installFromDirectory(manager(), "toolchain_java", packWithBlockedCopy())
+
+        assertEquals(listOf(AssetPackStatus.FAILED), statuses(), "expected one failure, got $events")
+        assertEquals(
+            listOf(ToolchainFailure.STORAGE), synchronized(reasons) { reasons.toList() },
+            "a copy that ran out of room told the user to check their connection",
+        )
+        assertFalse(
+            File(filesDir, "home/.vscodroid/toolchains.json").exists(),
+            "a copy that failed partway was recorded as an install",
+        )
+        assertFalse(marker().exists(), "a failed install left its marker behind")
+    }
+
+    /**
+     * What a failed copy already wrote is taken back.
+     *
+     * The install record is written last, so a copy that throws leaves up to the
+     * whole unpacked tree -- about 180 MB for Java 21 -- under no manifest at
+     * all: `getInstalledToolchains` does not name it, the Toolchains screen
+     * offers no Remove, the uninstall has no record to work from, and the repair
+     * pass only visits records that exist. Clearing app data was the only way
+     * back, and on the failure this is about, a full disk, those are exactly the
+     * bytes the retry needs.
+     */
+    @Test
+    fun `a copy that cannot finish takes back what it wrote`() {
+        installFromDirectory(manager(), "toolchain_java", packWithBlockedCopy())
+
+        assertFalse(
+            File(filesDir, "usr/opt/java").exists(),
+            "the partial tree is still there, and nothing names it: no card offers to " +
+                "remove it and no uninstall can find it",
+        )
+    }
+
+    /**
+     * The other direction, and the reason the reclaim asks the record first: a
+     * reinstall over a working copy must not delete the working copy when it
+     * fails. Those files belong to the install that succeeded.
+     */
+    @Test
+    fun `a failed reinstall leaves the installed tree it was overwriting`() {
+        File(filesDir, "home/.vscodroid/toolchains.json").writeText(
+            """[{"name":"java","installRoot":"usr/opt/java"}]"""
+        )
+
+        installFromDirectory(manager(), "toolchain_java", packWithBlockedCopy())
+
+        assertTrue(
+            File(filesDir, "usr/opt/java").exists(),
+            "the failed reinstall deleted the tree of the install that is still recorded",
+        )
+    }
+
+    /**
+     * An install whose record does not survive is not an install, and saying
+     * COMPLETED over it is the part that makes the loss silent.
+     *
+     * `toolchains.json` is four lines written after ~180 MB has already been
+     * copied, so it is exactly the write a device that has just filled up fails.
+     * What follows from losing it: `getInstalledToolchains()` does not name the
+     * toolchain, `toolchain-env.sh` is regenerated from a record that predates it
+     * so none of its commands exist in a terminal, and no manifest survives to
+     * tell an uninstall which files, symlinks and libraries those megabytes are
+     * they cannot be removed from the UI at all. Reported as COMPLETED, the
+     * picker shows 100% and Done, the first-run queue moves to the next pack, and
+     * the card reads "Install" again after the next launch with nothing said.
+     *
+     * The failure is injected at the install record's atomic temporary-file open.
+     */
+    @Test
+    fun `an install whose record cannot be written reports FAILED rather than COMPLETED`() {
+        val pack = packThatCopiesCleanly()
+        blockTheRecordWrite()
+
+        installFromDirectory(manager(), "toolchain_java", pack)
+
+        assertEquals(
+            listOf(AssetPackStatus.FAILED), statuses(),
+            "an unrecorded install was reported to the queue and the user as a finished one",
+        )
+        assertFalse(
+            File(filesDir, "home/.vscodroid/toolchains.json").exists(),
+            "the harness did not block the write, so this test proves nothing",
+        )
+        assertFalse(marker().exists(), "an install that could not be recorded left its marker")
+    }
+
+    /** Refuse the real atomic writer's temporary-file open for the install record. */
+    private fun blockTheRecordWrite() {
+        blockAtomicWritesTo(File(filesDir, "home/.vscodroid/toolchains.json"))
+    }
+
+    /** A pack whose copy runs to the end, so the record write is what fails. */
+    private fun packThatCopiesCleanly(): File {
+        val pack = File(filesDir, "pack-java").apply { mkdirs() }
+        File(pack, "toolchain_java.json").writeText("""{"name":"java","installRoot":"usr/opt/java"}""")
+        File(pack, "usr/opt/java/bin").mkdirs()
+        File(pack, "usr/opt/java/bin/java").writeText("payload")
+        return pack
+    }
+
+    /**
+     * The copy is taken back when the record write is what fails, not only when
+     * the copy is.
+     *
+     * The two are the same event a step apart -- a disk that fills up during or at
+     * the end of a copy -- and they left opposite states behind. A copy that threw
+     * reclaimed its tree; a copy that finished and then could not be recorded kept
+     * every byte of it, under no manifest at all: nothing names it, no card offers
+     * to remove it, and the retry the user is told to make has to fit alongside it.
+     */
+    @Test
+    fun `an install whose record cannot be written takes back what it copied`() {
+        blockTheRecordWrite()
+
+        installFromDirectory(manager(), "toolchain_java", packThatCopiesCleanly())
+
+        assertEquals(
+            listOf(AssetPackStatus.FAILED), statuses(),
+            "the install did not fail at the record write, so this proves nothing",
+        )
+        assertEquals(
+            listOf(ToolchainFailure.STORAGE), synchronized(reasons) { reasons.toList() },
+            "an install that ran out of room was not reported as a storage problem",
+        )
+        assertFalse(
+            File(filesDir, "home/.vscodroid/toolchains.json").exists(),
+            "the harness did not block the write, so this test proves nothing",
+        )
+        assertFalse(
+            File(filesDir, "usr/opt/java").exists(),
+            "the copied tree is still there, and nothing names it: no card offers to " +
+                "remove it and no uninstall can find it",
+        )
+    }
+
+    /**
+     * The same direction as the failed reinstall above, at the other exit: a
+     * record write that fails leaves `toolchains.json` holding the previous
+     * record, so the files it names still belong to the install that succeeded.
+     */
+    @Test
+    fun `a failed reinstall keeps the installed tree when the record cannot be written`() {
+        File(filesDir, "home/.vscodroid/toolchains.json").writeText(
+            """[{"name":"java","installRoot":"usr/opt/java"}]"""
+        )
+        // Part of the working copy that the incoming pack does not carry, so its
+        // survival is the working copy's and not the failed copy's own output.
+        File(filesDir, "usr/opt/java/lib").mkdirs()
+        File(filesDir, "usr/opt/java/lib/rt").writeText("the install that succeeded")
+        blockTheRecordWrite()
+
+        installFromDirectory(manager(), "toolchain_java", packThatCopiesCleanly())
+
+        assertEquals(
+            listOf(AssetPackStatus.FAILED), statuses(),
+            "the install did not fail at the record write, so this proves nothing",
+        )
+        assertTrue(
+            File(filesDir, "usr/opt/java/lib/rt").exists(),
+            "the failed reinstall deleted the tree of the install that is still recorded",
+        )
+    }
+}

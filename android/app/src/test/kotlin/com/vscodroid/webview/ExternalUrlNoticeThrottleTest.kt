@@ -1,0 +1,465 @@
+package com.vscodroid.webview
+
+import android.content.ActivityNotFoundException
+import android.content.Context
+import android.content.Intent
+import android.net.Uri
+import android.os.SystemClock
+import android.webkit.WebResourceRequest
+import android.webkit.WebView
+import com.vscodroid.service.mockEditorGateway
+import com.vscodroid.util.Logger
+import io.mockk.Runs
+import io.mockk.every
+import io.mockk.just
+import io.mockk.mockk
+import io.mockk.mockkConstructor
+import io.mockk.mockkObject
+import io.mockk.mockkStatic
+import io.mockk.unmockkAll
+import io.mockk.verify
+import org.junit.jupiter.api.AfterEach
+import org.junit.jupiter.api.Assertions.assertEquals
+import org.junit.jupiter.api.Assertions.assertNull
+import org.junit.jupiter.api.Assertions.assertTrue
+import org.junit.jupiter.api.BeforeEach
+import org.junit.jupiter.api.Test
+import java.io.File
+
+/**
+ * How often a hand-off this app could not complete may put something on screen.
+ *
+ * The notice itself is covered by `ExternalUrlHandoffTest`, which pins that each
+ * of the three exceptions landing in that catch produces one. What is pinned here
+ * is the other side of it: the notice was unconditional, and both of the things
+ * that makes it are cheap for a page to drive.
+ *
+ * A toast holds the screen for about three and a half seconds at `LENGTH_LONG`
+ * and stacks rather than replaces, and `shouldOverrideUrlLoading` receives
+ * subframe navigations as well as top-level ones. A script may navigate an iframe
+ * to a scheme no app on the device answers with no user gesture at all and as
+ * often as it likes, and the content that reaches this client is not this app's:
+ * the bundled simple browser holds an arbitrary remote site, and previews and
+ * notebook output are built from whatever the workspace holds. So a rendered page
+ * could hold a sustained stream of long toasts over an editor the user is working
+ * in, and before the notice existed that path only logged.
+ *
+ * Two rules, both needed, and each of the cases below fails on its own if the
+ * other is the only one present. The gate asks whether the navigation is
+ * attributable to the user or to this app's own page; the throttle asks whether
+ * the message has already been said. The gate alone still lets a page the user
+ * taps once per link speak once per link; the throttle alone still lets a page
+ * spend its first eight silent navigations on eight distinct schemes.
+ *
+ * The launch is gated on the same signal, and two cases hold the boundary: a
+ * script-driven subframe navigation launches nothing, while a link the user
+ * tapped inside a preview still leaves for a browser.
+ */
+class ExternalUrlNoticeThrottleTest {
+
+    private val ALLOWED_PORT = 13337
+
+    private lateinit var context: Context
+    private lateinit var view: WebView
+    private lateinit var client: VSCodroidWebViewClient
+
+    /** Every hand-off failure the client passed to its presenter, in order. */
+    private val announced = mutableListOf<HandoffFailure>()
+
+    /**
+     * The clock the main-frame branch reads before arming a callback window. The
+     * stub `android.jar` throws, and the catch below the launch would turn that
+     * into a failure that never happened.
+     */
+    private val launchedAt = 1_700_222L
+
+    private fun request(
+        scheme: String,
+        address: String,
+        fromMainFrame: Boolean,
+        withGesture: Boolean,
+    ): WebResourceRequest {
+        val uri = mockk<Uri>(relaxed = true)
+        every { uri.scheme } returns scheme
+        // No host on these addresses, so `isLocalhost` answers false without the
+        // port being consulted and every case here reaches the hand-off.
+        every { uri.host } returns null
+        every { uri.toString() } returns address
+        val req = mockk<WebResourceRequest>(relaxed = true)
+        every { req.url } returns uri
+        // Both stated rather than left to the relaxed mock, which answers false
+        // for each and would quietly make every case a silent one.
+        every { req.isForMainFrame } returns fromMainFrame
+        every { req.hasGesture() } returns withGesture
+        return req
+    }
+
+    @BeforeEach
+    fun setUp() {
+        announced.clear()
+        // The one piece of state under test that outlives the case that set it:
+        // the whole suite runs in one JVM and nothing else zeroes it. Every case
+        // here happens to announce before it reaches the cap, so the reading it
+        // leaves behind is harmless today; a case that reached the cap without
+        // announcing would otherwise depend on which cases ran before it.
+        lastHandoffNoticeAt = 0L
+        mockEditorGateway()
+        mockkObject(Logger)
+        every { Logger.i(any(), any()) } just Runs
+        every { Logger.e(any(), any(), any()) } just Runs
+        every { Logger.d(any(), any()) } just Runs
+
+        mockkConstructor(Intent::class)
+        every { anyConstructed<Intent>().addFlags(any()) } returns mockk(relaxed = true)
+
+        mockkStatic(SystemClock::class)
+        every { SystemClock.elapsedRealtime() } returns launchedAt
+
+        context = mockk(relaxed = true)
+        view = mockk(relaxed = true)
+        every { view.context } returns context
+        // The case this whole file is about: nothing on the device answers the
+        // scheme, so the launch throws and the catch runs.
+        every { context.startActivity(any()) } throws ActivityNotFoundException("no handler")
+
+        client = VSCodroidWebViewClient(
+            allowedPort = ALLOWED_PORT,
+            resourceRoots = emptyList(),
+            sensitiveLocations = emptyList(),
+            openFolder = { null },
+            connectionToken = { null },
+            onCrash = {},
+            onPageLoaded = {},
+            onRetryServer = {},
+            onHandoffFailed = { uri, error ->
+                announced += HandoffFailure(uri.scheme ?: "external", error.javaClass.simpleName)
+            },
+        )
+    }
+
+    @AfterEach
+    fun releaseMocks() {
+        unmockkAll()
+    }
+
+    /**
+     * The defect, driven end to end: a source this app does not vouch for, given
+     * no user gesture, may not produce a message per navigation.
+     *
+     * The addresses differ on purpose. A gate that let these through would be
+     * caught by any of them; what the varying address adds is that a throttle
+     * keyed on the URL would not have helped here either, since each navigation
+     * would mint a fresh key while producing the identical sentence.
+     */
+    @Test
+    fun `a script-driven subframe cannot drive a notice per navigation`() {
+        repeat(20) { i ->
+            client.shouldOverrideUrlLoading(
+                view,
+                request("ssh", "ssh://git@example.com/repo$i.git", false, withGesture = false),
+            )
+        }
+
+        assertTrue(
+            announced.isEmpty(),
+            "a page in an iframe drove $announced. Each one is about three and a half " +
+                "seconds of toast over a live editor, and toasts stack rather than replace",
+        )
+    }
+
+    /**
+     * The launch is gated on the same signal as the notice, and this is the case
+     * that says so.
+     *
+     * It used to be ungated, and this case asserted that: the reasoning written
+     * here was that withholding the launch would be a destination filter on frame
+     * identity. It is not one. The launch carries `FLAG_ACTIVITY_NEW_TASK` and
+     * asks for no user activation, so a script reassigning a hidden frame's `src`
+     * on a timer would bring an arbitrary installed app to the front over a live
+     * editor, as often as it liked, with the user having touched nothing. Nothing
+     * about that is a destination decision; it is the same "did the user do this"
+     * question the notice already asked, and the answer has to bind the action and
+     * not only the message about it.
+     *
+     * Returning true is still what stops the WebView navigating to a scheme it
+     * cannot load, so the frame is left as it was rather than showing an error.
+     */
+    @Test
+    fun `a subframe navigation the notice is withheld from launches nothing`() {
+        val handled = client.shouldOverrideUrlLoading(
+            view, request("ssh", "ssh://git@example.com/repo.git", false, withGesture = false)
+        )
+
+        assertTrue(handled, "the WebView was left to navigate to a scheme it cannot load")
+        verify(exactly = 0) { context.startActivity(any()) }
+        assertTrue(announced.isEmpty(), "the silent case announced $announced")
+    }
+
+    /**
+     * The control that keeps the two cases above from passing on a channel that is
+     * simply dead.
+     *
+     * The main frame is the workbench, the one document here this app serves, and
+     * it is where both routes this channel backs up navigate. It keeps its notice
+     * whether or not the gesture bit survived the workbench's opener chain, which
+     * is the case the notice was added for: a sign-in or a clone link that no app
+     * answers, where the WebView does not navigate either and the tap otherwise
+     * did nothing and said nothing.
+     */
+    @Test
+    fun `a main-frame hand-off is still announced`() {
+        client.shouldOverrideUrlLoading(
+            view, request("ssh", "ssh://git@example.com/repo.git", true, withGesture = false)
+        )
+
+        assertEquals(listOf(HandoffFailure("ssh", "ActivityNotFoundException")), announced)
+    }
+
+    /**
+     * The other control, and the one that makes the gate a question about the user
+     * rather than about frames.
+     *
+     * A link the user actually tapped inside a preview is something they did, and
+     * `hasGesture()` is the request's own record of it. Silencing that would take
+     * the notice away from a real tap on a real link, which is the same silence
+     * this channel exists to end.
+     */
+    @Test
+    fun `a link the user tapped in a subframe is still announced`() {
+        client.shouldOverrideUrlLoading(
+            view, request("ssh", "ssh://git@example.com/repo.git", false, withGesture = true)
+        )
+
+        assertEquals(listOf(HandoffFailure("ssh", "ActivityNotFoundException")), announced)
+    }
+
+    /**
+     * The gate is not the whole answer, which is why the throttle exists too.
+     *
+     * A page may hold one gesture per link, and every one of them is attributable.
+     * Ten taps on ten different `ssh:` addresses are one fact and one sentence,
+     * because the message names the scheme and never the address.
+     */
+    @Test
+    fun `many attributable failures of one kind are one message`() {
+        val said = mutableSetOf<HandoffFailure>()
+        val shown = mutableListOf<HandoffFailure>()
+
+        repeat(10) { i ->
+            client.shouldOverrideUrlLoading(
+                view,
+                request("ssh", "ssh://git@example.com/repo-$i.git", false, withGesture = true),
+            )
+        }
+        announced.forEach { failure ->
+            handoffFailureToAnnounce(failure, said)?.let { shown += it }
+        }
+
+        assertEquals(10, announced.size, "the gate let fewer through than this case needs")
+        assertEquals(
+            listOf(HandoffFailure("ssh", "ActivityNotFoundException")), shown,
+            "one scheme failing one way is one sentence, however many addresses carry it",
+        )
+    }
+
+    /** One page failing the same way twice is one message. */
+    @Test
+    fun `the same failure twice is announced once`() {
+        val said = mutableSetOf<HandoffFailure>()
+        val failure = HandoffFailure("ssh", "ActivityNotFoundException")
+
+        assertEquals(failure, handoffFailureToAnnounce(failure, said))
+        assertNull(
+            handoffFailureToAnnounce(failure, said),
+            "a second link on the same scheme adds nothing the user can act on",
+        )
+    }
+
+    /**
+     * The half that makes the rule above a filter rather than a mute.
+     *
+     * Keyed on the scheme and the failure type together, which is exactly what the
+     * two message forms print: a different scheme needs a different app installed,
+     * and the same scheme failing a different way is quoted by type for a bug
+     * report rather than as something to install.
+     */
+    @Test
+    fun `a different scheme or a different failure type is still announced`() {
+        val said = mutableSetOf<HandoffFailure>()
+        handoffFailureToAnnounce(HandoffFailure("ssh", "ActivityNotFoundException"), said)
+
+        assertEquals(
+            HandoffFailure("git", "ActivityNotFoundException"),
+            handoffFailureToAnnounce(HandoffFailure("git", "ActivityNotFoundException"), said),
+            "a second scheme is a fact the user has not been told",
+        )
+        assertEquals(
+            HandoffFailure("ssh", "SecurityException"),
+            handoffFailureToAnnounce(HandoffFailure("ssh", "SecurityException"), said),
+            "the same scheme failing a different way needs a different answer from the reader",
+        )
+    }
+
+    /**
+     * Neither the record nor the number of toasts can grow without bound.
+     *
+     * The schemes are chosen by whatever page is open, so that page picks the size
+     * of the set and the number of messages alike. Clearing the set at the cap
+     * answered only the first: every fresh scheme was a fact never told before and
+     * got its own toast, and the clear also handed back the ones already announced.
+     *
+     * Driven with far more distinct schemes than the cap, because at or just past
+     * it the two rules agree and the case would pass either way.
+     */
+    @Test
+    fun `the number of messages is bounded, not only the record`() {
+        val said = mutableSetOf<HandoffFailure>()
+        val shown = mutableListOf<HandoffFailure>()
+        val first = HandoffFailure("scheme0", "ActivityNotFoundException")
+
+        for (i in 0 until MAX_HANDOFF_FAILURES_ANNOUNCED * 4) {
+            handoffFailureToAnnounce(
+                HandoffFailure("scheme$i", "ActivityNotFoundException"), said,
+            )?.let { shown += it }
+        }
+
+        assertEquals(
+            MAX_HANDOFF_FAILURES_ANNOUNCED, shown.size,
+            "a page inventing schemes got a toast for each one, and every toast holds " +
+                "the bottom of the editor for about three and a half seconds",
+        )
+        assertEquals(
+            first, shown.first(),
+            "the messages that got through are the first ones, which is what makes the " +
+                "count above a cap rather than a mute that started somewhere else",
+        )
+        assertNull(
+            handoffFailureToAnnounce(first, said),
+            "a failure already announced was announced a second time, so the record was " +
+                "forgotten rather than closed",
+        )
+        assertTrue(
+            said.size <= MAX_HANDOFF_FAILURES_ANNOUNCED,
+            "the record grew past the cap on schemes a page chooses: ${said.size}",
+        )
+    }
+
+    /**
+     * The clock the default reading comes off, which is the one the production
+     * caller takes.
+     *
+     * It has to be monotonic. `System.currentTimeMillis()` steps backwards on an
+     * NTP correction or when the user sets the device time, and a backward step
+     * larger than the interval makes `now - lastHandoffNoticeAt` negative, which
+     * silences the channel until the clock catches up. The reading the call
+     * leaves behind is what makes the choice observable: with the wall clock it
+     * is epoch milliseconds, which is nowhere near the stubbed reading.
+     */
+    @Test
+    fun `the default reading is taken off the monotonic clock`() {
+        handoffFailureToAnnounce(HandoffFailure("ssh", "ActivityNotFoundException"), mutableSetOf())
+
+        assertEquals(
+            launchedAt, lastHandoffNoticeAt,
+            "the interval is measured against a clock that can step backwards",
+        )
+    }
+
+    /**
+     * Past the cap the rate is bounded and not the total, the same as the
+     * certificate record.
+     *
+     * It used to be a hard stop: eight distinct scheme-and-exception pairs in one
+     * Activity lifetime and nothing was ever said again. The case this channel
+     * exists for is a sign-in or an `ssh:` clone link that no installed app
+     * answers, and that is exactly the kind of fault a user walks into late in a
+     * session, by which time the tap does nothing and says nothing again.
+     *
+     * The clock is passed rather than read, so the case measures the rule and not
+     * the machine it runs on. The fills before it are what set the reading the
+     * interval is measured from.
+     */
+    @Test
+    fun `past the cap one more failure is announced per interval`() {
+        val said = mutableSetOf<HandoffFailure>()
+        val start = 5_000_000L
+
+        for (i in 0 until MAX_HANDOFF_FAILURES_ANNOUNCED) {
+            handoffFailureToAnnounce(
+                HandoffFailure("scheme$i", "ActivityNotFoundException"), said, now = start,
+            )
+        }
+        val late = HandoffFailure("ssh", "ActivityNotFoundException")
+
+        assertNull(
+            handoffFailureToAnnounce(late, said, now = start + NOTICE_INTERVAL_MS - 1),
+            "a burst that does not stop must still be throttled inside the interval",
+        )
+        assertEquals(
+            late,
+            handoffFailureToAnnounce(late, said, now = start + NOTICE_INTERVAL_MS),
+            "a scheme no app answers, met after a quiet stretch, was never explained: the " +
+                "tap did nothing and said nothing, which is the defect this channel exists " +
+                "to end",
+        )
+        assertTrue(
+            said.size <= MAX_HANDOFF_FAILURES_ANNOUNCED,
+            "the record grew past the cap on schemes a page chooses: ${said.size}",
+        )
+    }
+
+    /**
+     * The presenter is the only owner of the record, so an unwired presenter is a
+     * throttle that throttles nothing while every case above stays green.
+     *
+     * Read from the source rather than driven through the Activity, which needs a
+     * device. ⚠️ Its ceiling, the same one `WriteBackNoticeWiringTest` records:
+     * this catches the call being deleted, not the branch being made unreachable.
+     * Comments come out before the search, so neither the call switched off while
+     * debugging nor the prose over the record it consults can stand in for it. The
+     * property above holds exactly that prose, one bracket away from satisfying a
+     * search of the raw text.
+     */
+    @Test
+    fun `MainActivity puts a hand-off failure through the throttle`() {
+        val activity = File("src/main/kotlin/com/vscodroid/MainActivity.kt")
+        assertTrue(activity.isFile, "MainActivity.kt is not where this test expects it")
+
+        assertTrue(
+            withoutComments(activity.readText()).contains("handoffFailureToAnnounce("),
+            "nothing in MainActivity consults the record of what has already been said, so " +
+                "every hand-off failure reaches the screen as its own toast",
+        )
+    }
+
+    /**
+     * Both comment forms, since either one switches a call off. A line comment is
+     * cut from wherever it opens; a block is cut only where it opens a line, which
+     * is how one is written around code and how every doc comment in that file
+     * begins. A wildcard mime type and an injected CSS comment carry the same two
+     * characters inside a string literal and switch nothing off.
+     */
+    private fun withoutComments(text: String): String {
+        var inBlock = false
+        return text.lines().joinToString("\n") { raw ->
+            var line = raw
+            if (inBlock) {
+                val close = line.indexOf("*/")
+                if (close < 0) return@joinToString ""
+                inBlock = false
+                line = line.substring(close + 2)
+            }
+            while (line.trimStart().startsWith("/*")) {
+                val open = line.indexOf("/*")
+                val close = line.indexOf("*/", open + 2)
+                if (close < 0) {
+                    inBlock = true
+                    return@joinToString line.substring(0, open)
+                }
+                line = line.substring(0, open) + line.substring(close + 2)
+            }
+            val marker = line.indexOf("//")
+            if (marker >= 0) line.substring(0, marker) else line
+        }
+    }
+}

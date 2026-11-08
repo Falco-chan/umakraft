@@ -1,0 +1,85 @@
+Ask the marketplace for the alpine build on Android.
+
+Extensions that ship native code are published per target platform, and VS Code
+picks one from isAlpineLinux() plus the arch. On Android that resolves to
+linux-arm64, which is the glibc build -- and a glibc binary cannot start in an
+app process. glibc's __tls_init_tp calls set_robust_list and rseq during startup,
+Android's app seccomp filter rejects both, and the process dies with SIGSYS
+before main(). The rseq tunable does not help, because set_robust_list is still
+called and has no tunable.
+
+The musl build makes neither call and runs. Measured with the Claude Code CLI on
+an API 36 emulator: the linux-arm64 binary dies with SIGSYS, the alpine-arm64 one
+prints its version -- loaded by musl's ld.so out of the extension directory,
+since SELinux also refuses execve() of anything under filesDir for targetSdk >=
+29 while still granting the map and execute a loader needs.
+
+isAlpineLinux() cannot work this out for itself: it reads /etc/os-release, and
+Android neither ships that file nor allows creating it, so it answers false.
+
+The side effect is global: this decides the target platform for every extension,
+not just this one. Checked against Open VSX before landing, because the fear is
+reasonable -- a musl .node dlopen'd into our Bionic Node would be strictly worse
+than a glibc one, which the compatibility shim can load when its imports are
+ones the build found in the addons it scanned.
+
+Of 18 extensions probed, only four publish per-platform builds at all:
+Anthropic.claude-code, charliermarsh.ruff, rust-lang.rust-analyzer and
+redhat.java. The last two also publish a genuine universal artifact, and
+isTargetPlatformCompatible() in extensionManagement.ts returns true for UNIVERSAL
+whatever the product platform is, so they are untouched. ruff does publish an
+alpine build, and both of its variants contain zero .node files -- its payload is
+a standalone Rust executable run as a subprocess, the same shape as Claude Code.
+So no extension in that sample hands a musl .node to our loader.
+
+For that standalone-executable shape alpine is not merely harmless but better: a
+glibc executable can never start here at all, while a musl one runs through the
+loader.
+
+Two residual risks worth naming rather than pretending away. An extension
+publishing per-platform builds *including* alpine whose payload is a dlopen'd
+.node would regress -- none was found, and it would be an odd thing to publish,
+since an alpine variant of a Node addon targets Alpine containers. And an
+extension publishing per-platform builds with neither an alpine variant nor a
+universal fallback becomes uninstallable rather than merely broken; the symptom
+is the marketplace reporting no version available for this platform.
+
+The debug line is not decoration: the choice is otherwise invisible, and it is
+also the only text in this hunk that survives minification, so it is what the
+Verify stage greps for.
+
+diff --git a/src/vs/platform/extensionManagement/common/extensionManagementUtil.ts b/src/vs/platform/extensionManagement/common/extensionManagementUtil.ts
+index 63a27b4..eeb28a1 100644
+--- a/src/vs/platform/extensionManagement/common/extensionManagementUtil.ts
++++ b/src/vs/platform/extensionManagement/common/extensionManagementUtil.ts
+@@ -7,7 +7,7 @@ import { compareIgnoreCase } from '../../../base/common/strings.js';
+ import { IExtensionIdentifier, IGalleryExtension, ILocalExtension, MaliciousExtensionInfo, getTargetPlatform } from './extensionManagement.js';
+ import { ExtensionIdentifier, IExtension, TargetPlatform, UNDEFINED_PUBLISHER } from '../../extensions/common/extensions.js';
+ import { IFileService } from '../../files/common/files.js';
+-import { isLinux, platform } from '../../../base/common/platform.js';
++import { isAndroidPlatform, isLinux, platform } from '../../../base/common/platform.js';
+ import { URI } from '../../../base/common/uri.js';
+ import { getErrorMessage } from '../../../base/common/errors.js';
+ import { ILogService } from '../../log/common/log.js';
+@@ -175,6 +175,21 @@ async function isAlpineLinux(fileService: IFileService, logService: ILogService)
+ 	if (!isLinux) {
+ 		return false;
+ 	}
++	// Android is neither glibc nor musl, but of the two Linux builds the
++	// marketplace serves, only the musl one can start here: glibc's startup
++	// calls set_robust_list and rseq, and Android's app seccomp filter rejects
++	// both, killing the process with SIGSYS before main(). Asking for alpine is
++	// what gets an extension a binary that runs -- measured with the Claude Code
++	// CLI on an API 36 emulator, where the linux-arm64 build dies and the
++	// alpine-arm64 one reports its version.
++	//
++	// The check below cannot reach that conclusion on its own: it reads
++	// /etc/os-release, which Android does not ship and does not let anyone
++	// create, so it would answer false and hand us the glibc build.
++	if (isAndroidPlatform) {
++		logService.debug('Android: requesting the alpine target platform.');
++		return true;
++	}
+ 	let content: string | undefined;
+ 	try {
+ 		const fileContent = await fileService.readFile(URI.file('/etc/os-release'));

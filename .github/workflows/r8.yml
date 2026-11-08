@@ -1,0 +1,215 @@
+name: Shrinker
+
+# Three gates exist on the release build type and nowhere else: R8, the resource
+# shrinker (both enabled in app/build.gradle.kts buildTypes.release) and
+# lintVital. assembleRelease and bundleRelease are reached from release.yml alone,
+# on a v* tag, so every way any of them can fail -- a dependency arriving without
+# its consumer rules, an AGP bump tightening full mode, a -dontwarn that stops
+# covering what it covered -- first appeared with the tag already pushed and the
+# keystore already decoded.
+#
+# Deliberately not a step in lint.yml: that would pay for a release compile on
+# every pull request, and most pull requests cannot affect these.
+#
+# ⚠️ Do NOT add this job to branch protection. A pull_request trigger with a
+# paths filter creates no check run at all on a PR that matches none of them --
+# not a skipped one -- so a required check would sit forever at "Expected",
+# waiting for status to be reported, and block every unrelated PR.
+#
+# The two paths lists are deliberately not the same. Both name what CONFIGURES
+# the shrinkers; the push list also names the code they run over, because a tag
+# is cut from main and everything that reaches one passes through a push to main
+# first. So a change that only adds Kotlin gets a minified build within minutes
+# of landing rather than at the next cron, which is where the "up to a week from
+# its first minified build" this comment used to describe came from.
+#
+# What that trades: a pull request adding only Kotlin still does not trigger this,
+# so the first minified build of such a change is at merge rather than at review
+# time. Widening the pull_request list too would run a release compile on every
+# push of every branch under review, and the split exists to avoid that. On main
+# the same compile is one run per push, superseded by the concurrency group
+# below, and has taken 2 to 4 minutes including queue time on the runs so far.
+#
+# What it catches is these gates FAILING, not their being WRONG. A reflectively
+# reached member that no keep rule covers is removed silently, and this job is
+# green for it; only running a minified build on a device finds that, and no CI
+# here can -- see android/app/src/androidTest/README.md.
+
+on:
+  schedule:
+    # Monday 03:00 UTC. Late enough that a dependency published over the weekend
+    # is caught before anyone tags on it.
+    - cron: "0 3 * * 1"
+  workflow_dispatch:
+  # Most commits land straight on main rather than through a pull request, so a
+  # pull_request trigger alone leaves the configuration files below reaching a
+  # minified build only on the next cron, or first at tag time with the keystore
+  # already decoded. The configuration half of the list is spelled out under both
+  # triggers because GitHub Actions does not resolve YAML anchors in a workflow
+  # file; the source paths below it are on this trigger only.
+  push:
+    branches: [main]
+    paths:
+      - "android/app/build.gradle.kts"
+      - "android/build.gradle.kts"
+      - "android/app/proguard-rules.pro"
+      - "android/gradle/libs.versions.toml"
+      - "android/gradle.properties"
+      - "android/gradle/wrapper/gradle-wrapper.properties"
+      - ".github/workflows/r8.yml"
+      # On main alone, the code the shrinkers run over as well. R8 reads the
+      # Kotlin, the resource shrinker and lintVital read res/ and the manifest;
+      # assets/ is read by none of the three, and the tree stubbed out below is
+      # what this job builds against anyway, so listing it would buy runner
+      # minutes and nothing else.
+      - "android/app/src/main/kotlin/**"
+      - "android/app/src/main/res/**"
+      - "android/app/src/main/AndroidManifest.xml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "android/app/build.gradle.kts"
+      - "android/build.gradle.kts"
+      - "android/app/proguard-rules.pro"
+      - "android/gradle/libs.versions.toml"
+      - "android/gradle.properties"
+      # The Gradle distribution is part of the configuration, not a detail below
+      # it: AGP declares a minimum Gradle and refuses to apply on an older one,
+      # so a wrapper bump and an AGP bump are one change that can arrive as two
+      # files. Without this line a pull request moving only the wrapper skipped
+      # the one job that compiles a release build, and the pairing was checked
+      # for the first time at tag time.
+      - "android/gradle/wrapper/gradle-wrapper.properties"
+      - ".github/workflows/r8.yml"
+
+concurrency:
+  group: r8-${{ github.event_name }}-${{ github.ref }}
+  # A branch supersedes its own earlier run, on a pull request and on main alike:
+  # only the newest configuration on that ref is worth a verdict, and without this
+  # a run of pushes to main queues a release compile per commit. The event is in
+  # the group so that superseding stays inside one trigger -- a manual run would
+  # otherwise cancel the weekly one mid-build, and that week would record a
+  # cancellation instead of a verdict.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' || github.event_name == 'push' }}
+
+# Reading the checkout and writing an artifact is all this needs. Like every
+# other workflow here, this declares its scope rather than inheriting the
+# repository default.
+permissions:
+  contents: read
+
+jobs:
+  minify:
+    name: R8
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Nothing here pushes, so the checkout token would only sit in the
+          # workspace for the length of the job, readable by everything it runs.
+          # The rest of the workflows in this directory already say this.
+          persist-credentials: false
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@77dd5b2ce225ea11469928ac317850245a74ae78 # v6.2.0
+        with:
+          java-version: "17"
+          distribution: "temurin"
+
+      # No api-level here, and that is deliberate rather than an omission.
+      # android-actions/setup-android has never declared one: its inputs are
+      # cmdline-tools-version, accept-android-sdk-licenses,
+      # log-accepted-android-sdk-licenses and packages. Passing api-level: 36
+      # produced "Unexpected input(s) 'api-level'" on every run and set nothing,
+      # for as long as it was there. The platform this build needs is fetched by
+      # Gradle from compileSdk, which is why removing it changes no behaviour.
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@be39fa834029ff78f1a44aa3bb0819b8fc2bd8fd # v4.0.4
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@8da46b539cd8fe6ab27ca75128919a18d757604c # v6.4.1
+        with:
+          # Pinned to a non-commercial value, not left to the default.
+          #
+          # gradle/actions v6 added cache-provider and defaults it to 'enhanced',
+          # which the action's own description calls "the full-featured commercial
+          # caching service (gradle-actions-caching)". This project drops
+          # dependencies over their licences and publishes a source offer, so a
+          # dependency bump does not get to move it onto a commercial service.
+          # Naming the value also means a later default change cannot move it.
+          #
+          # `external` rather than `basic`: this action saves its cache even when
+          # the job failed (its post step runs unless cancelled), and the basic
+          # provider keeps the first entry written under a key, with no restore
+          # keys and no overwrite. A job that failed before Gradle had downloaded
+          # anything saved an empty entry (444 bytes, 2026-11-08), and every later
+          # job with the same Gradle files restored it and downloaded everything
+          # again. The Gradle home is cached by the actions/cache step below,
+          # which saves only after a successful job.
+          cache-provider: external
+
+      - name: Cache the Gradle user home
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          # Follows the Gradle scripts, the version catalogue and the wrapper. A
+          # change to any of them restores the newest earlier entry by prefix and
+          # saves a new one, so a build file edit no longer starts from nothing.
+          key: gradle-home-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('android/**/*.gradle.kts', 'android/gradle/**') }}
+          restore-keys: |
+            gradle-home-${{ runner.os }}-${{ runner.arch }}-
+
+      # The shrinker needs compiled classes and processed resources, not the
+      # 874 MB asset tree. Measured with --dry-run, which computes the graph
+      # without touching disk: 34 tasks, no mergeReleaseAssets, and therefore
+      # never checkPatchFingerprints, which is wired to merge*Assets alone
+      # (app/build.gradle.kts, tasks.matching around checkPatchFingerprints).
+      #
+      # These stubs are carried over from lint.yml unchanged. Nothing in the
+      # graph asks for them; what has not been measured is whether Gradle's
+      # CONFIGURATION phase needs the directories to exist, which is what
+      # lint.yml's own comment claims. Six lines is a cheaper answer than
+      # finding out on a runner.
+      - name: Create minimal asset stubs
+        run: |
+          mkdir -p android/app/src/main/jniLibs/arm64-v8a
+          mkdir -p android/app/src/main/assets/vscode-reh/out
+          mkdir -p android/app/src/main/assets/usr
+          mkdir -p android/app/src/main/assets/extensions
+          printf '\x7fELF' > android/app/src/main/jniLibs/arm64-v8a/libnode.so
+          dd if=/dev/zero bs=1 count=60 >> android/app/src/main/jniLibs/arm64-v8a/libnode.so 2>/dev/null
+
+      # Not assembleRelease: that pulls validateSigningRelease, which needs the
+      # keystore release.yml decodes from a secret, and then packages the assets
+      # stubbed out above. Neither has anything to do with whether these succeed.
+      #
+      # optimizeReleaseResources rather than minifyReleaseWithR8, measured:
+      # minifyReleaseWithR8 is inside its graph, so naming it covers R8 as well as
+      # the resource shrinking that isShrinkResources turns on -- a second
+      # release-only gate that minifyReleaseWithR8 alone would have left running
+      # for the first time at tag time. lintVital is the third; it is a separate
+      # entry point and needs neither the keystore nor the assets either.
+      #
+      # 34 and 22 tasks respectively, neither containing mergeReleaseAssets,
+      # checkPatchFingerprints or validateSigningRelease.
+      - name: Run the release-only gates
+        working-directory: android
+        run: ./gradlew :app:optimizeReleaseResources :app:lintVitalRelease
+
+      # R8's own record of what it kept and removed. Worth having on the failing
+      # run, since the mapping is what turns a release-build stack trace back into
+      # something readable.
+      - name: Upload R8 output
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: r8-mapping
+          path: |
+            android/app/build/outputs/mapping/release/
+          retention-days: 14
+          if-no-files-found: ignore

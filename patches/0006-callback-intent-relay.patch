@@ -1,0 +1,125 @@
+Relay the OAuth callback into the app, and take Microsoft's name off the page.
+
+callback.html hands the result back by writing to localStorage, which the
+workbench then reads. That never happens here: the callback lands in the system
+browser while the workbench runs in a WebView, and the two are separate storage
+origins, so every sign-in flow hangs waiting for a value that was written
+somewhere else.
+
+intent:// rather than a custom scheme, because Chrome refuses to navigate to one
+from script without a user gesture while intent:// is always permitted and
+resolves through the manifest intent-filter. Synchronously rather than from a
+timeout, because the activation that permits the navigation is gone by the time
+one would fire. The localStorage write is left in place so the flow still works
+if the page is ever opened in the WebView itself.
+
+The naming matters more here than anywhere else in the tree, which is why it is
+in this patch rather than in 0011: this is the one page of the product that is
+rendered by the user's own browser rather than inside the app, at the end of every
+extension sign-in, with a title in the browser's tab bar.
+
+The third piece of Microsoft branding on this page is not here. Its `.branding`
+rule carries the VS Code logo as a 150 KB base64 PNG on one line, and a diff that
+removes a line has to quote it. The Callback page stage of
+scripts/build-vscode-oss.sh strips it instead, and verify-server-tree.py asserts
+on both sides of the pivot that the packaged page carries no embedded image and
+no Microsoft product name.
+
+URI components come from URLSearchParams, which already decodes each value.
+Keep literal percent escapes intact when returning to an extension.
+
+diff --git a/src/vs/code/browser/workbench/callback.html b/src/vs/code/browser/workbench/callback.html
+--- a/src/vs/code/browser/workbench/callback.html
++++ b/src/vs/code/browser/workbench/callback.html
+@@ -7,20 +7,16 @@
+ 		<!-- Disable pinch zooming -->
+ 		<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, minimum-scale=1.0, user-scalable=no">
+ 
+-		<title>Visual Studio Code</title>
++		<title>VSCodroid</title>
+ 
+ 		<!-- Scripts -->
+ 		<script>
+ 
+-			function decode(value) {
+-				return value === null ? null : decodeURIComponent(value);
+-			}
+-
+ 			const url = new URL(window.location.href);
+ 			const params = url.searchParams;
+-			const id = decode(params.get('vscode-reqid'));
+-			const scheme = decode(params.get('vscode-scheme'));
+-			const authority = decode(params.get('vscode-authority'));
++			const id = params.get('vscode-reqid');
++			const scheme = params.get('vscode-scheme');
++			const authority = params.get('vscode-authority');
+ 
+ 			if (!id) {
+ 				throw new Error('Missing id');
+@@ -30,9 +26,9 @@
+ 				throw new Error('Missing authority');
+ 			}
+ 
+-			const path = decode(params.get('vscode-path'));
+-			const query = decode(params.get('vscode-query'));
+-			const fragment = decode(params.get('vscode-fragment'));
++			const path = params.get('vscode-path');
++			const query = params.get('vscode-query');
++			const fragment = params.get('vscode-fragment');
+ 
+ 			params.delete('vscode-reqid');
+ 			params.delete('vscode-scheme');
+@@ -62,6 +58,24 @@
+ 			}
+ 
+-			localStorage.setItem(`vscode-web.url-callbacks[${id}]`, JSON.stringify(uri));
++			if (window.top === window.self) {
++				localStorage.setItem(`vscode-web.url-callbacks[${id}]`, JSON.stringify(uri));
++
++				// Relay the callback into the Android app.
++				//
++				// The localStorage write above is how the workbench normally collects this,
++				// and it never reaches us: the callback lands in the system browser while the
++				// workbench runs in a WebView, and those are separate storage origins.
++				//
++				// intent:// rather than a custom scheme, because Chrome blocks navigation to
++				// one from script without a user gesture while intent:// is always allowed and
++				// resolves through the manifest intent-filter. Synchronous rather than
++				// deferred, because the activation permitting the navigation is gone by the
++				// time a timeout would fire.
++				try {
++					const payload = encodeURIComponent(JSON.stringify({ id: id, uri: uri }));
++					window.location.href = 'intent://callback?data=' + payload + '#Intent;scheme=vscodroid;end';
++				} catch (e) { }
++			}
+ 		</script>
+ 
+ 		<!-- Styling -->
+@@ -112,7 +126,7 @@
+ 	</head>
+ 	<body>
+ 		<span class="branding">
+-			Visual Studio Code
++			VSCodroid
+ 		</span>
+ 		<div class="message-container">
+ 			<div class="message">
+diff --git a/src/vs/server/node/webClientServer.ts b/src/vs/server/node/webClientServer.ts
+--- a/src/vs/server/node/webClientServer.ts
++++ b/src/vs/server/node/webClientServer.ts
+@@ -532,11 +532,13 @@ export class WebClientServer {
+ 			`script-src 'self' ${this._getScriptCspHashes(data).join(' ')};`,
+ 			'style-src \'self\' \'unsafe-inline\';',
+-			'font-src \'self\' blob:;'
++			'font-src \'self\' blob:;',
++			`frame-ancestors 'none';`
+ 		].join(' ');
+ 
+ 		res.writeHead(200, {
+ 			'Content-Type': 'text/html',
+-			'Content-Security-Policy': cspDirectives
++			'Content-Security-Policy': cspDirectives,
++			'X-Frame-Options': 'DENY'
+ 		});
+ 		return void res.end(data);
+ 	}

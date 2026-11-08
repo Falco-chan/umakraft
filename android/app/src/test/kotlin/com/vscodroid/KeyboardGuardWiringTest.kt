@@ -1,0 +1,358 @@
+package com.vscodroid
+
+import org.junit.jupiter.api.Assertions.assertFalse
+import org.junit.jupiter.api.Assertions.assertTrue
+import org.junit.jupiter.api.Assumptions.assumeTrue
+import org.junit.jupiter.api.Test
+import java.io.File
+
+/**
+ * That the script keeping the keyboard down is aimed at something that exists,
+ * and is installed on every page it has to cover.
+ *
+ * This is the one piece of this app whose failure is silent in both directions.
+ * Aimed at nothing, it does nothing and the keyboard covers half the screen
+ * while the user is reading a file: exactly what shipped in a first version of
+ * it, which looked for `textarea.inputarea` in a workbench that uses the
+ * EditContext API and matched no element at all. Aimed too widely, or installed
+ * where a page does not get it, and the editor is one you cannot type into.
+ *
+ * Mostly source-level, and that is the limit worth stating. Two cases read the
+ * packaged `workbench.js` wherever the server tree is present, the selector
+ * and the read-only marker, and those catch the workbench renaming either in a
+ * VS Code bump; where the tree is absent they are skipped, and what catches a
+ * rename then is the device row in `docs/DEVICE_TEST_CHECKLIST.md` (KB-21),
+ * which is why that row exists.
+ */
+class KeyboardGuardWiringTest {
+
+    private companion object {
+        const val MAIN_ACTIVITY = "src/main/kotlin/com/vscodroid/MainActivity.kt"
+        const val WORKBENCH = "src/main/assets/vscode-reh/out/vs/code/browser/workbench/workbench.js"
+    }
+
+    /**
+     * The activity's source with its comments blanked.
+     *
+     * Comments blanked because this file explains the guard at length, and every
+     * name the cases below look for appears in that prose. Read raw, a selector
+     * deleted from the script still matches its own KDoc and the test passes on
+     * a guard that matches nothing, which is the exact failure it exists for.
+     */
+    private fun mainActivity(): String =
+        SourceScan.withoutComments(SourceScan.read(MAIN_ACTIVITY))
+
+    @Test
+    fun `the guard is installed from the path every page load takes`() {
+        val source = mainActivity()
+
+        assertTrue(
+            source.contains("private fun injectKeyboardGuard()"),
+            "injectKeyboardGuard is gone, so nothing keeps the keyboard down when a file is " +
+                "opened or the Explorer is tapped.",
+        )
+        // The call sits with the other per-page injections in `injectBridgeToken`,
+        // whose one call site is inside the `onPageFinished` lambda, under the
+        // `isWorkbenchUrl` test. That is the path which runs again after a folder
+        // switch, which the workbench performs by navigating its own WebView
+        // without telling this side.
+        //
+        // Read out of that body rather than off the whole file, because being
+        // next to `injectTouchTargetCSS()` is not the property and never was:
+        // move both calls into `initBridge`, which runs once per WebView, and
+        // they are still adjacent while the guard is gone from every page after
+        // the first. That is the regression itself, and an adjacency check
+        // passes it.
+        val injected = SourceScan.body(source, "private fun injectBridgeToken()")
+        for (call in listOf("injectTouchTargetCSS()", "injectKeyboardGuard()")) {
+            assertTrue(
+                injected.contains(call),
+                "`$call` is no longer called from injectBridgeToken, the one path every " +
+                    "page load takes. Wherever it went, if that place runs once per WebView " +
+                    "rather than once per page, the workbench's first self-navigation drops " +
+                    "it: the keyboard then covers half the screen while a file is being read, " +
+                    "or the editor is one nothing can be typed into, and neither says why.",
+            )
+        }
+    }
+
+    /**
+     * That a scroll is still told apart from a tap.
+     *
+     * Dragging inside the editor is how a phone scrolls a file, and it goes down
+     * on the same text a tap does. A guard that answers at pointerdown raises
+     * the keyboard over every scroll, which is the complaint it exists to fix
+     * arriving by another route; it was measured doing exactly that before the
+     * pointerup branch was written. The three names below are that branch.
+     */
+    @Test
+    fun `a long press is not a tap`() {
+        val guard = SourceScan.body(mainActivity(), "private fun injectKeyboardGuard(")
+        val up = guard.substring(guard.indexOf("addEventListener('pointerup'").also {
+            assertTrue(it >= 0, "the guard no longer decides on pointerup")
+        })
+        val check = Regex("""held\s*>=\s*LONG_PRESS_MS\s*\)\s*return""").find(up)
+        assertTrue(
+            check != null && check.range.first < up.indexOf("letTheKeyboardUp()"),
+            "the guard no longer measures how long the finger was down, so a long press is " +
+                "read as a tap again: the keyboard comes up, the window resizes, and the " +
+                "workbench closes the menu the press had just opened. Measured on an API 36 " +
+                "emulator as pointerup at t+985ms, the editor's gesture at t+995ms, the " +
+                "resize at t+1621ms, and no menu.",
+        )
+        assertTrue(
+            up.contains("e.timeStamp - pendingTap.at"),
+            "the duration is no longer read from the events themselves. Both timestamps have " +
+                "to come from the same clock; a wall-clock read here would compare two " +
+                "different origins.",
+        )
+    }
+
+    /**
+     * That the guard never touches `inputmode` on an editor that is composing.
+     *
+     * An on-screen keyboard keeps the word being typed as a composition, and
+     * Chromium answers a changed `inputmode` on the focused element by restarting
+     * input, which writes the composed word back in again, reversed and several
+     * times over. Measured on an API 33 emulator with Gboard: type `xyz`, tap the
+     * Search icon, and the file reads `xyzzyxzyxzyx`. The editor composes through
+     * EditContext, whose composition events fire on the element's `editContext`
+     * and never on the document, so that is where the guard has to listen.
+     */
+    @Test
+    fun `a composing editor keeps its word`() {
+        val guard = SourceScan.body(mainActivity(), "private fun injectKeyboardGuard(")
+        for (name in listOf("editContext", "'compositionstart'", "'compositionend'")) {
+            assertTrue(
+                guard.contains(name),
+                "the guard no longer names `$name`, so it cannot tell a composing editor " +
+                    "apart and flips inputmode under a word being typed, which duplicates it.",
+            )
+        }
+        val apply = SourceScan.body(guard, "function apply(element)")
+        val skip = apply.indexOf("composing")
+        assertTrue(
+            skip >= 0 && skip < apply.indexOf("inputmode"),
+            "apply() changes inputmode before asking whether the element is composing: a word " +
+                "typed on the on-screen keyboard is written in again when the user taps a " +
+                "toolbar.",
+        )
+    }
+
+    /**
+     * That the set of composing editors follows the page, in both directions.
+     *
+     * A host left in the set after its composition is over is one the guard
+     * never lets the keyboard up for again, because apply() skips it. Chromium
+     * ends an EditContext composition on an empty commit without dispatching
+     * compositionend (`EditContext::CommitText` sends it only for non-empty
+     * text), so compositionend cannot be the only way out. Losing focus is the
+     * reliable one: Blink finishes the composition of the element it takes focus
+     * from, and of the page when the page loses focus.
+     *
+     * The other direction is the user typing. A tap outside text that leaves
+     * focus in a composing editor clears `aimedAtText` while the keyboard stays
+     * up, and the next time the workbench refocuses that editor the guard takes
+     * the keyboard away in the middle of typing. A new composition in the focused
+     * editor, with the keyboard not held down, is the user aiming at text.
+     */
+    @Test
+    fun `the composing state ends with focus and a new word is aiming at text`() {
+        val guard = SourceScan.body(mainActivity(), "private fun injectKeyboardGuard(")
+
+        val focusout = guard.indexOf("addEventListener('focusout'")
+        assertTrue(
+            focusout >= 0 &&
+                guard.substring(focusout, guard.indexOf(", true)", focusout)).contains("composing.delete("),
+            "the guard no longer drops an editor from the composing set when it loses focus, " +
+                "so an editor whose composition ended without compositionend is skipped by " +
+                "apply() for good, and tapping its text never raises the keyboard again.",
+        )
+
+        val started = SourceScan.body(guard, "function composeStarted(element)")
+        for (name in listOf("composing.add(element)", "document.activeElement", "'none'", "aimedAtText = true")) {
+            assertTrue(
+                started.contains(name),
+                "composeStarted no longer contains `$name`: a new word typed into the focused " +
+                    "editor has to both mark it composing and count as aiming at text, and only " +
+                    "while the keyboard is not being held down.",
+            )
+        }
+        val listeners = Regex("""addEventListener\('compositionstart'""").findAll(guard).count()
+        val routed = Regex("""addEventListener\('compositionstart'[^;]*composeStarted\(""").findAll(guard).count()
+        assertTrue(
+            listeners > 0 && listeners == routed,
+            "$routed of $listeners compositionstart listeners go through composeStarted, so a " +
+                "composition seen by the others does not count as the user typing.",
+        )
+    }
+
+    /**
+     * That putting the keyboard away puts the hold back, and only that, and not at once.
+     *
+     * Once a tap on text has let the keyboard up, the editing host is left
+     * without `inputmode`, and Chromium raises the keyboard for any touch on a
+     * focused editable element: a user who hid it with Back had it back with the
+     * next scroll of the file. `scripts/test-keyboard-guard.js` runs the guard's
+     * half; this holds the call from the inset listener's report, which that
+     * script cannot see. Made on the keyboard coming up as well, the same call
+     * would put `inputmode="none"` on the host the user had just tapped into.
+     *
+     * And made at once, it is what takes the keyboard down at a turn of the phone
+     * on a device with no hardware keyboard: the report of hidden that a turn
+     * brings reached the hook directly, and the hold it wrote kept the keyboard
+     * away. The call goes through [com.vscodroid.keyboard.KeyboardDismissal], which
+     * `KeyboardDismissalTest` runs; this holds that the report of hidden and the
+     * change of configuration are wired to it.
+     */
+    @Test
+    fun `the keyboard going away restores the hold`() {
+        val source = mainActivity()
+        val guard = SourceScan.body(source, "private fun injectKeyboardGuard(")
+        assertTrue(
+            guard.contains("window.__vscodroidKeyboardDismissed = function"),
+            "the guard no longer defines __vscodroidKeyboardDismissed, so a keyboard put away " +
+                "with Back comes back on the next scroll of the file.",
+        )
+        val wiring = SourceScan.body(source, "private fun setupExtraKeyRow(")
+        assertTrue(
+            Regex("""if \(!visible\) keyboardDismissal\.hidden\(\)""").containsMatchIn(wiring),
+            "setupExtraKeyRow no longer hands the report of hidden, and only that, to " +
+                "keyboardDismissal. Without it a keyboard put away with Back comes back on the " +
+                "next scroll; made when the keyboard comes up, the call holds down the keyboard " +
+                "the user just raised.",
+        )
+        assertFalse(
+            wiring.contains("__vscodroidKeyboardDismissed"),
+            "setupExtraKeyRow calls __vscodroidKeyboardDismissed itself again. A turn of the " +
+                "phone reports the keyboard hidden before it comes back, and a hold written at " +
+                "that report takes it down for good on a device with no hardware keyboard.",
+        )
+        // The call is the dismissal's callback; this holds the string being sent, so
+        // dropping it from evaluateJavascript cannot leave the case green.
+        assertTrue(
+            Regex(
+                """private val keyboardDismissal = KeyboardDismissal\([\s\S]*?onDismissed = \{[\s\S]*?""" +
+                    """evaluateJavascript\(\s*"[^"]*__vscodroidKeyboardDismissed\(\)""",
+            ).containsMatchIn(source),
+            "the callback of keyboardDismissal no longer sends __vscodroidKeyboardDismissed with " +
+                "evaluateJavascript, so the hold never comes back.",
+        )
+        assertTrue(
+            Regex("""override fun onConfigurationChanged\(newConfig: Configuration\)[^}]*keyboardDismissal\.turned\(\)""")
+                .containsMatchIn(source),
+            "onConfigurationChanged no longer tells keyboardDismissal about the turn, so the " +
+                "hold is written for the hide a turn of the phone brings and keeps the keyboard " +
+                "away on a device with no hardware keyboard.",
+        )
+        assertTrue(
+            guard.contains("window.__vscodroidFinishComposition = finishComposition"),
+            "the guard no longer exposes __vscodroidFinishComposition on window",
+        )
+        val configBody = SourceScan.withoutComments(
+            SourceScan.body(source, "override fun onConfigurationChanged("),
+        )
+        assertTrue(
+            configBody.contains("finishKeyboardCompositionOnTurn()"),
+            "onConfigurationChanged no longer invokes composition recovery",
+        )
+        val turnedIdx = configBody.indexOf("keyboardDismissal.turned()")
+        val finishIdx = configBody.indexOf("finishKeyboardCompositionOnTurn()")
+        val noKeysIdx = configBody.indexOf("Configuration.KEYBOARD_NOKEYS")
+        assertTrue(
+            turnedIdx in 0 until finishIdx && finishIdx < noKeysIdx,
+            "keyboardDismissal.turned() must precede composition recovery, before the KEYBOARD_NOKEYS branch",
+        )
+    }
+
+    @Test
+    fun `a scroll is not a tap`() {
+        val source = mainActivity()
+
+        for (name in listOf("pointerup", "pointercancel", "TAP_SLOP")) {
+            assertTrue(
+                source.contains(name),
+                "the guard no longer mentions `$name`, so the decision has moved back to " +
+                    "pointerdown and dragging to scroll a file raises the keyboard again.",
+            )
+        }
+    }
+
+    @Test
+    fun `the guard aims at the element this workbench actually focuses`() {
+        val source = mainActivity()
+
+        assertTrue(
+            source.contains("native-edit-context"),
+            "the guard no longer names `native-edit-context`. That is the element the shipped " +
+                "workbench focuses for the caret, so a guard without it matches nothing and " +
+                "silently does nothing at all.",
+        )
+
+        // The other direction: that the name still describes the workbench in
+        // the tree.
+        assertTrue(
+            packagedWorkbench().contains("native-edit-context"),
+            "the packaged workbench no longer mentions `native-edit-context`, so the " +
+                "selector in MainActivity now matches nothing. Open the editor over the " +
+                "DevTools protocol, read `document.activeElement` with the caret in a " +
+                "file, and point the guard at what it answers.",
+        )
+    }
+
+    /**
+     * That the packaged editor still marks a read-only editor the way the guard
+     * reads it.
+     *
+     * The guard never lets the keyboard up for an EditContext host carrying
+     * `aria-autocomplete="none"`, which Monaco's ScreenReaderSupport writes from
+     * the readOnly option when the host is built and again on every option
+     * change. A bump that writes it from anything else could make every editor
+     * one the soft keyboard never comes up for; one that stops rewriting it
+     * leaves a file made writable in a session without a keyboard.
+     */
+    @Test
+    fun `the workbench still marks a read-only editor`() {
+        val workbench = packagedWorkbench()
+        val readOnly = Regex("""\((\d+),"readOnly",""").findAll(workbench).map { it.groupValues[1] }.toList()
+        assertTrue(
+            readOnly.size == 1,
+            "the packaged workbench declares the readOnly editor option ${readOnly.size} times " +
+                "rather than once, so the check below cannot tell which option the marker follows.",
+        )
+        assertTrue(
+            Regex("""_updateDomAttributes\(\)\{[^}]*"aria-autocomplete",\w+\.get\(${readOnly[0]}\)\?"none":"both"\)""")
+                .containsMatchIn(workbench),
+            "the packaged workbench no longer writes aria-autocomplete from the readOnly option " +
+                "in _updateDomAttributes, which writable() in injectKeyboardGuard reads. Find what " +
+                "marks a read-only EditContext host now and gate on that.",
+        )
+        assertTrue(
+            workbench.contains("_screenReaderSupport.onConfigurationChanged(") &&
+                Regex("""onConfigurationChanged\(\w+\)\{this\._instantiateScreenReaderContent\(\)[^}]*this\._updateDomAttributes\(\)""")
+                    .containsMatchIn(workbench),
+            "the packaged workbench no longer rewrites the EditContext host's aria-autocomplete " +
+                "on an option change, so an editor made writable in a session keeps \"none\" and " +
+                "the guard never lets the keyboard up for it.",
+        )
+    }
+
+    /**
+     * The packaged workbench, or a skip when the tree is absent.
+     *
+     * Skipped rather than failed, because the tree is a gitignored artifact and
+     * a fresh clone has none. Stated as an assumption rather than an `if`, so a
+     * run that cannot make the check says so: the unit-test job in build.yml
+     * stubs `assets/vscode-reh`, and a silent skip there reads as a green check
+     * of something nothing ran.
+     */
+    private fun packagedWorkbench(): String {
+        val workbench = File(WORKBENCH)
+        assumeTrue(
+            workbench.isFile,
+            "no packaged workbench at ${workbench.path}; run scripts/fetch-vscode-oss.sh and " +
+                "scripts/package-assets.sh to check the guard against the shipped bundle",
+        )
+        return workbench.readText()
+    }
+}

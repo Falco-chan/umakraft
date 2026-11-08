@@ -1,0 +1,418 @@
+# Testing Strategy
+
+**Project**: VSCodroid
+**Version**: 1.0-draft
+**Date**: 2026-02-10
+
+---
+
+## 1. Testing Philosophy
+
+VSCodroid has unique testing challenges: it's a hybrid app (Kotlin + WebView + Node.js) that cross-compiles native binaries. Testing must cover all layers and their integration points.
+
+**Principles**:
+- Test the integration boundaries (Kotlin ↔ WebView ↔ Node.js); that's where bugs hide
+- Automate what can run on CI; manual test what requires real devices
+- Prioritize real device testing over emulator (ARM64 binaries don't run on x86 emulators)
+- Test on the lowest-spec supported device (4GB RAM, Android 11)
+
+---
+
+## 2. Test Pyramid
+
+```mermaid
+flowchart TD
+  E2E["Manual / E2E Tests<br/>Real devices, UX testing<br/>14 scenarios"] --> INT["Instrumented Tests<br/>WebView + Node.js + Kotlin<br/>run by hand on a device"]
+  INT --> UNIT["Unit Tests<br/>Kotlin on the JVM, sized by the run's own XML<br/>node:assert scripts for the bundled JavaScript"]
+```
+
+---
+
+## 3. Test Types
+
+### 3.1 Unit Tests
+
+**Kotlin (JUnit 5 + MockK, JVM only)**
+
+| Component | What is covered | Example classes |
+|-----------|-------------|---------|
+| ProcessManager / NodeService | Server lifecycle, readiness, restart budget, port adoption | `ProcessManagerTest`, `NodeServiceTest`, `ServerReadinessDecisionTest`, `ServerReadinessCallSiteTest`, `AdoptionNoteWireTest` |
+| Environment | Env variable construction, PATH and shell paths, SAF mirror paths | `EnvironmentTest`, `TerminalShellPathTest`, `EnvironmentSafTest` |
+| PortFinder | Port allocation and reuse across restarts | `PortFinderTest` |
+| ExtraKeyRow / KeyInjector | Key mapping, modifier state, trackpad gestures | `KeyMappingTest`, `ExtraKeyToggleStateTest`, `TrackpadGestureTest` |
+| AndroidBridge | Registered method surface, session tokens, log redaction | `BridgeApiSpecParityTest`, `SecurityManagerTest`, `LogRelayRedactionTest` |
+| ToolchainManager / ToolchainRegistry | Catalog, download and install state, digests, retirement sweep | `ToolchainRegistryTest`, `ToolchainInstallTest`, `ToolchainDigestTest`, `RetiredToolchainTest` |
+| FirstRunSetup | Asset extraction, symlinks, `settings.json` contents, storage preflight | `SettingsPathsTest`, `StoragePreflightTest`, `SymlinkPredicateTest` |
+| SafSyncEngine | Mirror reconciliation, write-back filtering, rename pairing | `SafSyncEngineTest`, `SafWriteBackFilterTest`, `SafRenamePairingTest` |
+| VSCodroidWebViewClient | CDN interception, `vscode-remote` resource serving, downloads | `ResourceInterceptionWiringTest`, `WebviewResourceRootsTest`, `WebviewOriginTrustTest`, `DownloadCoordinatorTest` |
+
+Use a fresh run to determine the suite result and size. Both
+figures, tests and classes, come from the XML a run writes under
+`app/build/test-results/testDebugUnitTest/`, one file per class. This
+paragraph used to carry the pair as well, and the pyramid above carried a
+second copy of it, so the suite grew past both: a number written where it is
+not measured has nothing holding it, and saying it comes from the XML never
+said how to get it out. Read it:
+
+```bash
+cd android && ./gradlew testDebugUnitTest
+ls app/build/test-results/testDebugUnitTest/*.xml | wc -l                 # classes
+grep -ho 'tests="[0-9]*"' app/build/test-results/testDebugUnitTest/*.xml \
+  | cut -d'"' -f2 | paste -sd+ - | bc                                     # tests
+```
+
+A filtered run leaves the XML of earlier runs beside the new files, so the
+file count then answers a different question; delete the directory first if
+the last run was filtered. The instrumented layer in the pyramid is the same
+kind of claim and is read the same way, from the source rather than from
+here: `grep -rn "@Test" android/app/src/androidTest --include="*.kt" | wc -l`,
+which counts annotations and so equals the number of executed tests only
+while nothing there is parameterised or `@Ignore`d. The one written record of
+that figure, `android/app/src/androidTest/README.md`, is held to the same grep
+by `scripts/check-instrumented-inventory.py`, which lint runs.
+
+A test that needs a filesystem builds its tree under a JUnit `@TempDir` rather
+than touching the checkout. The complete storage suite requires a filesystem
+provider with `SecureDirectoryStream`, as available on the Linux CI JVM. A macOS
+JVM without that capability cannot validate those descriptor-rooted operations.
+Run permission-denial controls as an ordinary user, since root can bypass them.
+
+**Run**: `./gradlew testDebugUnitTest` from `android/`. CI runs it in the
+`Unit Tests` job of `build.yml`, on every pull request and on every push to
+`main`.
+
+**JavaScript (hand-written `node:assert` scripts)**
+
+No test framework. Each script is plain Node, builds its own fixtures, in a
+temporary directory where it needs files, and is executed directly by `node`.
+
+| Component | What is covered | Script |
+|-----------|-------------|---------|
+| Server bootstrap | The `product.json` rewrite `server.js` performs on every start, including a SIGKILL landing inside the write; a missing entry point failing the start; the DNS proxy preload and its lifetime; a stop taking the editor server with it; the sign-in callback pin; and the scripts it adds to the workbench page, the one that starts each load on its theme run against a model of the workbench's theme service | `scripts/test-server-bootstrap.js` |
+| Platform override | What `process.platform` reports in the server, every terminal command and every user script, and what `os.platform()` reports to the Jupyter extension alone | `scripts/test-platform-fix.js` |
+| Process monitor | Process classification and the phantom count, against a fixture `/proc` tree | `scripts/test-process-monitor.js` |
+| Process monitor extension | The status bar entry and the notification it renders | `scripts/test-process-monitor-extension.js` |
+| DNS proxy | The Basic-auth token on the loopback proxy every musl DNS lookup goes through | `scripts/test-dns-proxy.js` |
+| Bridge relay | The BroadcastChannel relay injected into the workbench | `scripts/test-bridge-relay.js` |
+| UI scale | That the workbench page alone is drawn at the size chosen from its first layout, every other key of its viewport element kept; that only sizes leaving the page 320 CSS px wide are offered or applied; that a size the WebView does not apply goes back to 100% once the page has drawn; and that the command sets, keeps and reports it through the relay | `scripts/test-ui-scale.js` |
+| Plain-text pages | That a top-level plain-text page, such as the server's "Forbidden.", and the WebView's own error page for a load that failed are given the background of their own colour scheme rather than the WebView's, which is dark under a dark theme, and that no other page or frame is touched | `scripts/test-plain-text-page.js` |
+| Download capture | The script that makes saving a file out of the Explorer possible at all | `scripts/test-download-capture.js` |
+| Arrow edge guard | That a Left or Right at the start or end of a text box, in a number box, or with Alt below WebView 149 is cancelled, also where the box stops the key's propagation, and one that can still move the caret or that a handler already used is not; and that no listener of the guard's is left on a box once the key is over. Also, in the same interceptor, that a Ctrl or Alt latched on the editor's EditContext host turns the next character, composed or committed, and a Backspace sent as a key press, into the chord, and gives the editor its EditContext back when the latch is spent or cleared, restarting input after the chord while the host keeps focus, or once focus has left, so that Quick Open gets what is typed after Ctrl then `p` | `scripts/test-arrow-edge-guard.js` |
+| Modifier release | That each modifier a key row chord sent as a DOM event carried comes up after it, so the workbench holds no modifier and no toolbar stays on its Alt action, and that nothing reads as a lone Alt press, which focuses the menu bar; and that no release from the row, by script or by a real press, accepts the recently used editors picker Ctrl+Tab opens, while a hardware keyboard's still does, and each Shift of a keyboard holding both comes up; and that a letter a composing keyboard adds in a text box with Ctrl latched becomes the chord once the composition is over, with the box as it was before the letter and never losing the focus, and in the terminal after the word composed before it, also when the chord takes the focus out of the terminal; and that in the terminal a letter a keyboard that commits types with Ctrl latched leaves the word typed before it at the prompt when its chord takes the focus | `scripts/test-modifier-release.js` |
+| Soft keyboard Enter | That a code-less Enter is given the `code` Enter unless Ctrl or Alt is latched, and spends a Shift latched alone without carrying it; that a composing Enter is still stopped and replaced outside the editor; and that a real PageUp, PageDown, Ctrl+Home, Ctrl+End or Right composing in the quick input has `isComposing` cleared, and no other key, target or synthetic event does | `scripts/test-composing-enter.js` |
+| Reload curtain | That a page told to leave has a curtain in its background colour on the root in the same dispatch, and none for a leave the workbench vetoes, whichever listener runs first, for a navigation that never commits, for a restored page or for a page with no colour | `scripts/test-leave-curtain.js` |
+| Status bar scrolling | That on a narrow touch screen the status bar's right-hand entries stay on one row that a finger scrolls by its own distance, stopping at both ends and continuing from where the last swipe left it, and that a touch elsewhere, a second finger or a lifted finger does not move it | `scripts/test-status-bar-scroll.js` |
+| Keyboard guard | That a caret key, the editor's own tap or long press, or `window.__vscodroidFinishComposition()` on a turn of the screen, while the focused EditContext host composes a word, blurs and refocuses the host once and without writing `inputmode`: before the editor's handler, except that with a suggestion list open, Tab accepting a suggestion and a tap on a row do it after the list's handler, and the keys that move the list's highlight not at all; and that nothing else does; that a turn of the screen asks for the native refocus only while the person is aimed at text, so a drag outside text leaves the keyboard up. Also that the keyboard put away holds down again, leaving a composing host and text boxes alone, that a read-only EditContext host never lets it up, and that a tap outside text with the keyboard up and an editing host still focused asks the keyboard down, by the guard's own test or the workbench's gesture tap, while a drag, a long press, a tap that moves focus into a text box, a tap on a button that opens a menu and a touch in a context menu, or on one a tap has just closed, do not, and that no touch outside text holds the focused host while the keyboard is up; that a keyboard reported down while nothing that takes text has focus clears nothing a tap or typing counted, so a file Quick Open or New File opens through such a gap is not held; that a second request first puts the previous host's policy back; that the terminal's helper textarea is held down and let up as the editor's host is; and that typing in a text box with the keyboard up counts as aiming at text, untrusted events, typing with the keyboard down and typing outside its text selector excepted; and that a host blurred and focused again in one task keeps a keyboard that is up, a hold put on at a focus to take it down, a read-only host and a focus in a later task excepted | `scripts/test-keyboard-guard.js` |
+| Caret drag | That a finger (not a stylus) down on the text within reach of the one caret, with nothing selected, whose first move is sideways, is taken from the editor and moves the caret by the editor's own tap, a finger below it keeping its distance; that a first move up or down, a touch far from the caret or on something over the text, a selection and several carets are left to the editor; that a second finger is kept from it and the drag goes on; that the lift of a taken touch is kept from the editor, and one that was never taken is not; that the pointer events follow and end a drag whose touch events stop; that the keyboard guard is told of a taken drag; and that the text scrolls near the editor's edge, faster the nearer and by the time a frame took, with the wheel sent to the editor root and not bubbling, resting when the text stops moving | `scripts/test-caret-drag.js` |
+| Auth callback provider | That the callback provider patch 0019 produces, applied to a copy of the upstream file, registers each request identity it mints with the bridge, bounds early issuance until the bridge is ready, reports a failed flush and leaves the browser's own behaviour alone; and that the app's bootstrap and delivery scripts, read from `MainActivity.kt`, hand a return only to the document that minted it | `scripts/test-auth-callback-provider.js` |
+| Serve on Network | The port scan and its reachable/local split | `scripts/test-serve-network.js` |
+| Welcome | That the walkthrough and side bar markers are written only after the command they record actually ran | `scripts/test-welcome.js` |
+| xdg-open | The `openExternal` message `xdg-open.js` sends over the editor's CLI socket, and that anything but an `http` or `https` address is refused rather than sent | `scripts/test-xdg-open.js` |
+| Page script syntax | That every JavaScript raw string in the Android shell (`MainActivity.kt`, `VSCodroidWebView.kt`, `KeyInjector.kt`) compiles cleanly as a classic script under `vm.Script` after Kotlin template substitution | `scripts/test-page-scripts.js` |
+| Static file serving | That `patches/0043-serve-only-regular-files.patch` applied to `webClientServer.ts` validates the opened file, preserves ETag and 304 cache behavior, and refuses special files even when a path is replaced during opening | `scripts/test-server-serve-file.js` |
+| SAF mirror workspace claims | That `patches/0035-claim-device-folder-copies-before-use.patch`, `patches/0038-publish-workspace-resource-roots.patch`, and `patches/0042-tolerate-non-list-workspace-folders.patch` claim and publish SAF mirror workspace roots, keep opening a saved workspace when a device-folder copy is missing, and tolerate non-array `folders` values in `.code-workspace` files | `scripts/test-saf-mirror-usage.js` |
+
+**Run**: one `node` invocation per script listed in the `Check the bundled
+JavaScript runtime` step of `lint.yml`, and again in `release.yml`, on Node 24,
+the major the APK ships (`check-build-steps.py` holds the pins there). `lint.yml`
+also runs the `--self-test` entry points of `check-workflow-steps.py`,
+`verify-android-elf.py`, `verify-server-tree.py`, `check-patch-fingerprints.py`,
+`check-editcontext-sync.py`, `patch-venv-home.py` and `gen-glibc-forwarders.py`,
+which hand each gate the input it exists to refuse, since no file in the tree
+can.
+
+**What is enforced**: the suites themselves. A single failing test fails the job.
+No workflow reads a coverage figure, no threshold exists, and none is planned.
+That half of the position has not moved and is the half that matters: a number
+a build fails on is a number tests get written to move.
+
+What does exist is a report, on request and nowhere else:
+
+```bash
+./gradlew :app:createDebugUnitTestCoverageReport -PvscodroidCoverage
+```
+
+The switch is `enableUnitTestCoverage` on the debug build type, which is the
+Android plugin's own JaCoCo wiring rather than an added plugin, and it is behind
+a property because instrumenting every class the tests load makes for a slower
+and subtly different run. Without the property the task does not exist, so the
+suite CI gates on is the uninstrumented one.
+
+Read the output for which lines of a file are untested, never as a score. The
+recorded run in this checkout is 5,123 of 8,178 lines, 62.6 percent, and that
+denominator is JaCoCo's: it counts the classes the suite actually loads, so a
+class no JVM test can construct is absent from both halves rather than sitting
+in the miss column. The figure therefore moves with which classes the tests
+touch as much as with how well they touch them, which is why nothing gates on
+it. The question "is this file tested at all" is answered elsewhere and answers
+clean: every file under `android/app/src/main/kotlin` is named by at least one
+test source.
+
+### 3.2 Instrumented Tests
+
+109 tests across twenty classes, in `android/app/src/androidTest/`. They
+need an `arm64-v8a` device or emulator, because the app ships that ABI alone.
+Counted from the sources (`grep -cE '^\s*@Test'` over the directory), because no
+run covers the whole set and none of it is scheduled. Nothing holds this figure
+to the suite; `android/app/src/androidTest/README.md` states the total that
+`scripts/check-instrumented-inventory.py` does check.
+
+| Test | Description | Setup |
+|------|-------------|-------|
+| **BoundedStoragePressureTest** | The allocation policy behind the disk-pressure tests, with no real disk filled: shared or large volumes are refused before any write, unchanged capacity cannot exceed the byte cap, the deadline stops allocation, and bounded simulated pressure can succeed | arm64 device or emulator |
+| **WebViewVisualArrowInstrumentedTest** | Native and guarded caret movement compared through the production WebView and key injector on right-to-left input and textarea fields. Skipped unless a fresh `visualCheckpointToken` is supplied and every checkpoint is viewed | arm64 device or emulator |
+| **KeyRowDensityInstrumentedTest** | Simulates a density change on the real key row, checks its new dimensions and inset cost, and retains the selected page and latched Ctrl | arm64 device or emulator |
+| **ServerHealthTest** | The server becomes reachable, answers its `GET /version` readiness probe with 200, and survives activity recreation | arm64 device, app launched once so the assets are extracted |
+| **SplashActivityTest** | First-run extraction, and that a later launch skips it | arm64 device |
+| **ExtractionOnDeviceTest** | Bundled-extension extraction against the real `AssetManager`, including the abort and retry driven by a genuine out-of-space condition | arm64 device |
+| **MainActivityTest** | WebView and ExtraKeyRow initial state, and the About dialog's trademark disclaimer | arm64 device |
+| **ToolchainInsetsTest** | With edge-to-edge enforced, the Toolchains screen stays clear of the status and navigation bars | arm64 device |
+| **FileObserverTreeSemanticsTest** | The platform behaviour SAF write-back rests on: a watch covers a directory and not a tree, and an event reports the bare entry name | arm64 device |
+| **SafWatchWiringTest** | That those semantics are wired up: a save two directories down is queued for write-back, a persistent `.tmp` file is queued while an internal staging file ending in `.vscodroid-partial` is not, and a skipped directory is never watched | arm64 device |
+| **KeyRowAccessibilityInstrumentedTest** | The extra key row's screen-reader surface: content descriptions, the state a latched modifier and the alternates layer announce, that a key and an alternate each call themselves a button, that every key clears 48dp at each width the row is paged for (320, 360, 411 and 448dp), and the trackpad's one action per arrow | arm64 device |
+| **TextEntryInstrumentedTest** | That `virtualKeyboardEvents` types what the row asks it to, against the device's real `KeyCharacterMap`: every typeable key and alternate resolves to presses that produce it, `{` is pressed with Shift held, and every press carries the virtual-keyboard device id and a current timestamp; and that each navigation key is one press, down then up, with its key code, its scan code and a latched Shift, followed by the Shift's release | arm64 device |
+| **ExtraKeyButtonTouchInstrumentedTest** | `MotionEvent`s on one key of the row: a finger that rests past the long-press timeout and then swipes away presses nothing, a long hold presses once on release, two quick taps are two presses, a key with alternates still opens them on a hold, a modifier held past the timeout latches before the finger lifts, and a slow swipe from a modifier leaves it as it was; a second finger's swipe leaves a modifier held under the first latched, and a held finger sliding after the row stood down does not latch it again; and a resize that repacks the row under a held modifier or a trackpad drag leaves the row and the page agreeing | arm64 device |
+| **GestureTrackpadTouchInstrumentedTest** | Multi-pointer `MotionEvent`s on the trackpad: a second finger taking over does not jump the caret, and an untracked finger lifting does not end the drag | arm64 device |
+| **ExecTrampolineOnDeviceTest** | The kernel policy no JVM test can ask about: a payload under `filesDir` cannot be executed directly, the trampoline runs the same payload by bare name, an unknown name fails with a reason, an environment row in the table reaches the program, and a variable the caller already has is not overwritten. The direct-execve control is asserted first, so a device that never denied anything fails loudly rather than passing for the wrong reason | arm64 device |
+| **ExecPreloadOnDeviceTest** | The same question asked of the exec interceptor: a shell with `libtermux-exec.so` preloaded starts a payload under `filesDir` that the app may not execve, by its absolute path and by a relative one, a `#!/bin/sh` script finds the system shell, a system binary keeps the preload for what it starts, a symlink onto a system binary is started as itself, a linker started by hand names its payload in `TERMUX_EXEC__PROC_SELF_EXE`, an exec with no argv[0] is refused as it is without the preload, and a preload naming a missing file kills the shell itself. The library is copied out of the APK's assets at mode 0600, so the suite needs no first-run state. Same direct-execve control, and the same precondition: the instrumentation process must carry no LD_PRELOAD of its own | arm64 device |
+| **EditorShutdownOnDeviceTest** | From the app's SELinux domain, with an isolated copy of the packaged server and the real native bootstrap: Stop ends an editor server that outlived its bootstrap. Checks the run identity in the process environment and the recorded socket, a repeated Stop, a fresh run identity per start and cooperative shutdown | arm64 device |
+| **PipGuidanceOnDeviceTest** | The generated interactive pip helpers and the noninteractive `BASH_ENV`, run through the APK's `libbash.so` with a substituted Python: build failures keep stderr and exit status and get the toolchain advice once per shell, missing packages get none, successful calls stay quiet, and an older helper is upgraded without repeated appends | arm64 device |
+| **ProfileExtensionPreservationOnDeviceTest** | Bundled-extension extraction and manifest reconciliation with the real APK assets in isolated storage: a named profile keeps an older copy of an extension the user installed while the default profile advances, a profile's entry for one of the app's own extensions follows the update, and unreferenced copies are removed | arm64 device |
+| **SafDataPreservationInstrumentedTest** | A file-backed DocumentsProvider in a separate process: watched saves and creations come back byte for byte on reopening; a stable delivered save follows an external deletion across two reopens, while an undelivered edit with unchanged length and timestamp survives; a failed upload-journal write refuses the save and keeps both copies; a local edit that overlaps a blocked provider read survives the download; directory deletes keep provider-only or changed children; cleanup retains unrecorded workspace bytes and reclaims a vouched mirror, with temporary grants only and no persisted-revocation proof | arm64 device, the debug build |
+
+**Framework**: AndroidJUnit4 + Espresso + UI Automator (JUnit 4, on device)
+
+**Run**: by hand, `ANDROID_SERIAL=<serial> ./gradlew connectedDebugAndroidTest`
+from `android/`, after touching MainActivity, SplashActivity, NodeService,
+ProcessManager or FirstRunSetup, and before tagging a release. Read the XML under
+`app/build/outputs/androidTest-results/connected/` rather than the exit code: a
+run that dies before reaching the tests writes no results and exits the same way
+a genuine failure does.
+
+CI compiles them and stops there, in the `Unit Tests` job of `build.yml`
+(`assembleDebugAndroidTest`). That catches them drifting out of the app's API and
+is not a substitute for running them. No runner GitHub offers can run them:
+`ubuntu-latest` has `/dev/kvm` but accelerates only x86_64 images,
+`ubuntu-24.04-arm` reports no `/dev/kvm` and no virtualisation flag, and
+`macos-15` is itself a virtual machine with no nested virtualisation, so QEMU
+fails with `HV_UNSUPPORTED` before the emulator reaches adb.
+`android/app/src/androidTest/README.md` carries the measurements.
+
+What a device has to prove and these cannot reach (terminal I/O, extension
+install, file CRUD, crash recovery) belongs to `scripts/device-test.sh` and
+`docs/DEVICE_TEST_CHECKLIST.md`. A terminal there is a `bash` process on a real
+PTY through node-pty, one process per terminal tab.
+
+### 3.3 End-to-End Tests
+
+Manual test scenarios that verify the full user experience:
+
+| # | Scenario | Steps | Expected Result |
+|---|----------|-------|-----------------|
+| E2E-01 | **First launch** | Install → Open app | Splash screen → Binary extraction → Welcome tab → VS Code ready |
+| E2E-02 | **Edit and save file** | Open file → Edit → Ctrl+S | File saved, no data loss |
+| E2E-03 | **Terminal operations** | Open terminal → `node --version` → `git --version` | Correct versions displayed |
+| E2E-04 | **Install extension** | Extensions panel → Search "Material Icon" → Install | Icon theme applies to File Explorer |
+| E2E-05 | **Extra Key Row** | Open editor → Type with soft keyboard → Use Ctrl+S, Ctrl+P | Keys work correctly |
+| E2E-06 | **Git operations** | Terminal → `git init` → create file → `git add` → `git commit` | Git operations succeed |
+| E2E-07 | **Background/foreground** | Open editor → Home button → Wait 5 min → Return | Session preserved, server still running |
+| E2E-08 | **Rotation** | Edit code → Rotate to landscape → Rotate back | No data loss, layout adapts |
+| E2E-09 | **Copy/paste** | Copy text in Chrome → Paste in VSCodroid editor | Text pastes correctly |
+| E2E-10 | **Large file** | Open 10,000-line file → Scroll → Search → Edit | No crash, responsive scrolling |
+| E2E-11 | **Phantom process count** | Open editor + 3 terminals + 1 extension with LSP → check `adb shell ps` | The idle count plus one per terminal and one for the language server, well under the 14 at which the monitor calls it a problem |
+| E2E-12 | **Python terminal** | Open terminal → `python3 --version` → `pip install requests` | Correct version, pip works |
+| E2E-13 | **Low-memory handling** | Simulate low-memory via `adb shell am send-trim-memory` | App reduces memory, no crash |
+| E2E-14 | **Package manager** | Terminal → `vscodroid pkg search curl` → `vscodroid pkg install curl` | Package installs successfully (planned Tier 3 package manager) |
+
+**Run**: Before each milestone release, on physical devices
+
+### 3.4 Performance Tests
+
+| Test | Metric | Target | Tool |
+|------|--------|--------|------|
+| Cold start time | Time from app launch to editor ready | < 5 sec | Android Profiler |
+| Warm start time | Time from background to foreground | < 2 sec | Android Profiler |
+| Keystroke latency | Input to screen update | < 50 ms | Custom instrumentation |
+| Memory usage (idle) | RAM after opening empty editor | < 300 MB | `adb shell dumpsys meminfo` |
+| Memory usage (active) | RAM during active coding + terminal | < 700 MB | `adb shell dumpsys meminfo` |
+| File open time | Time to open and render file | < 1 sec (1MB file) | Custom instrumentation |
+| Extension install time | Download + extract + activate | < 30 sec | Stopwatch |
+| Phantom process count | Total child processes during use | At or below `IDLE_BASELINE` idle, under 14 in use (`ERROR_BUDGET`) | `adb shell ps` |
+| Battery drain (active) | Battery consumption during coding session | < 15% per hour | `adb shell dumpsys batterystats` |
+| Battery drain (idle) | Battery consumption with app in foreground, no input | < 5% per hour | `adb shell dumpsys batterystats` |
+
+**Run**: Every milestone, on reference devices
+
+### 3.5 Compatibility Tests
+
+| Dimension | Test Targets |
+|-----------|-------------|
+| **Android versions** | 11 (API 30, the minimum), 13 (API 33), 14 (API 34), 15 (API 35), 16 (API 36) |
+| **Devices** | Pixel 7/8 (reference), Samsung Galaxy S23/S24, Xiaomi (budget), Samsung Tab S9 (tablet) |
+| **RAM** | 4 GB (minimum), 8 GB (typical), 12+ GB (high-end) |
+| **Screen sizes** | Phone 6" (1080p), Phone 6.7" (1440p), Tablet 11" (2560p) |
+| **Input methods** | GBoard, Samsung Keyboard, SwiftKey, Hardware keyboard |
+| **WebView versions** | Chrome 125 (minimum), Chrome 131+ |
+
+**Run**: Before each major release, on the physical devices in § 4.3
+
+### 3.6 Accessibility Tests
+
+| Test | Criteria | Method |
+|------|----------|--------|
+| TalkBack navigation | Native UI elements (Extra Key Row, dialogs, first-run) navigable with TalkBack | Manual with TalkBack enabled |
+| Content descriptions | All native buttons and controls have meaningful content descriptions | Accessibility Scanner app |
+| Touch target size | All interactive native elements ≥ 48dp × 48dp | Layout Inspector |
+| Font scaling | Native UI (not WebView) respects system font size setting | Change system font scale to 1.3x |
+| Color contrast | Native UI elements meet WCAG AA contrast ratio (4.5:1) | Accessibility Scanner app |
+
+> **Note**: WebView accessibility (VS Code UI) is managed by VS Code itself and the Chromium WebView engine. Native accessibility testing focuses on the Android shell: Extra Key Row, splash screen, dialogs, notifications, and Toolchain Manager UI.
+
+**Manual is not the same as unguarded** for the extra key row. The rows above are the
+whole-app sweep; `KeyRowAccessibilityInstrumentedTest` (§3.2) already pins that one
+surface, including the content descriptions, what a latched modifier and the alternates
+layer announce, and the 48dp touch targets. It takes the route a screen reader takes,
+reading the `AccessibilityNodeInfo` off a view held in a real window and performing the
+actions it advertises by id, rather than tapping coordinates: an injected tap arrives
+below the layer being tested, so its silence would prove nothing.
+
+**Run**: Before each major release, on reference device with TalkBack
+
+### 3.7 Security Tests
+
+See [Security Design § Testing Checklist](./06-SECURITY.md#7-security-testing-checklist).
+
+### 3.8 Backup & Restore Tests
+
+`data_extraction_rules.xml` is written as an **allowlist with no exclusions**: it names
+`home/.vscodroid/data/Machine` and nothing else, so everything unnamed is already out. That makes
+the exclusion rows below a check on the shape of the rule as much as on the payload, and the row
+that matters most is **Rule shape**. Android 11 applies `backup_rules.xml`, which holds the same
+single include, so the payload rows are asked on an Android 11 device too.
+
+| Test | Criteria | Method |
+|------|----------|--------|
+| Settings backup | `home/.vscodroid/data/Machine` is included in the backup payload. **Not** `~/.vscodroid/User/`, which this row named until 2026-08-20 and which the rules have never listed; `Environment.getMachineSettingsPath` explains why the machine path is the live one | `adb backup`/device transfer test |
+| Settings restore | Restored app keeps its machine-scoped settings. `createDefaultSettings()` writes only when the file is absent, so a restored copy is kept rather than overwritten | Uninstall → restore backup → verify settings |
+| Sensitive exclusion: SSH keys | `~/.ssh/` is absent from the payload. The key is generated without a passphrase, so this is the exclusion with real consequences | Inspect backup payload, verify absent |
+| Sensitive exclusion: connection token | `home/.vscodroid/data/token` is absent. It sits one directory from the included path, which is the near miss the allowlist exists to survive | Inspect backup payload, verify absent |
+| Workspace exclusion | `filesDir/projects` (the workspace on a new install), the `external` domain (which holds `Android/data/<pkg>/files/projects` on an install that kept it) and `filesDir/saf-mirrors` are all absent | Inspect backup payload, verify absent |
+| Preferences exclusion | The `sharedpref` domain is absent. Restoring `setup_version` onto a device with an empty `filesDir` would make the app skip extraction and start a server that is not there | Inspect backup payload, verify absent |
+| Rule shape | `backup_rules.xml` still matches the `<cloud-backup>` section of `data_extraction_rules.xml`. Android 11 reads the first file and every later release the second, so a difference is a different backup on each | `BackupRulesParityTest`; or diff the two files |
+| Post-update backup compatibility | Backup/restore still works after app update | Backup on version N, restore on N+1 |
+
+**Run**: Before M4 exit and before each production release.
+
+---
+
+## 4. Test Environment
+
+### 4.1 CI Environment
+
+```mermaid
+flowchart TD
+  PR["Pull request, and every push to main"] --> CODEOSS["build.yml: codeoss job (arm64 runner)"]
+  CODEOSS --> C1["codeoss-build.yml: build the Code - OSS server for this revision from MIT source, or restore it from the cache when no input changed"]
+  CODEOSS --> BUILD["build.yml: Build job (ubuntu-latest)"]
+  BUILD --> B1["Check the server tree that job built (fetch-vscode-oss.sh) and unpack it"]
+  BUILD --> B2["Fetch Node from Termux nodejs-lts, plus Termux tools, npm, Python, extensions, musl loader"]
+  BUILD --> B3["Build native addons (pty.node, watcher.node, vscode-sqlite3.node, zeromq.node) and the glibc shim"]
+  BUILD --> B4["assembleDebug"]
+
+  PR --> TEST["build.yml: Unit Tests job (ubuntu-latest)"]
+  TEST --> T1["./gradlew testDebugUnitTest"]
+  TEST --> T2["./gradlew assembleDebugAndroidTest (compiled, never run)"]
+
+  PR --> LINT["lint.yml: Lint job"]
+  LINT --> L1["./gradlew lint, plus the committed baseline check"]
+  LINT --> L2["Bundled JavaScript checks listed in the workflow"]
+  LINT --> L3["python3 scripts/check-*.py repository gates"]
+  LINT --> L4["git apply --stat on every patch, and device-test.sh --self-check"]
+
+  MAN["build-vscode-oss.yml (manual, arm64 runner)"] --> M1["Build Code - OSS from MIT source, never from the cache, apply patches/ and branding/, publish the server release"]
+```
+
+### 4.2 Local Development
+
+```mermaid
+flowchart TD
+  DEV["Developer machine"] --> D1["Android Studio (IDE)"]
+  DEV --> D2["ADB-connected ARM64 device (required for full testing)"]
+  DEV --> D3["Local Node.js (runs the scripts/test-*.js self-checks)"]
+  DEV --> D4["Docker (optional, for building Code - OSS locally)"]
+```
+
+### 4.3 Reference Devices
+
+| Device | Purpose |
+|--------|---------|
+| Pixel 8 (8GB RAM, Android 16) | Primary development/testing device |
+| Samsung Galaxy S23 (8GB RAM, Android 15) | Second manufacturer compatibility |
+| Budget phone (4GB RAM, Android 11) | Minimum spec testing |
+| Samsung Galaxy Tab S9 (8GB RAM) | Tablet/large screen testing |
+
+---
+
+## 5. Test Data
+
+### 5.1 Test Fixtures
+
+Nothing is checked in as a fixture project. Each layer builds what it needs and
+throws it away:
+
+| Fixture | Purpose | Lifetime |
+|---------|---------|------|
+| JUnit `@TempDir` | Every JVM test that needs a filesystem. No count is given: nothing gates one, and the figure that stood here was stale within a release. `grep -rc "@TempDir" android/app/src/test/kotlin` answers it | Removed when the test method ends |
+| `mkdtempSync` under the system temp directory | The `scripts/test-*.js` self-checks, including the fake `/proc` tree the process monitor is pointed at | Removed when the script ends |
+| The app's projects folder on the device | Where a manual pass creates files, opens folders and runs terminals | Kept between passes unless app data is cleared |
+
+### 5.2 Test Extensions
+
+| Extension | Purpose |
+|-----------|---------|
+| Material Icon Theme | Theme extension (UI change verification) |
+| ESLint | Language extension (diagnostics verification) |
+| Python | Language extension (LSP verification) |
+| Prettier | Formatter extension (action verification) |
+
+---
+
+## 6. Bug Triage
+
+### 6.1 Severity Levels
+
+| Level | Definition | Response Time | Fix Time |
+|-------|-----------|---------------|----------|
+| **S1 Critical** | App crash, data loss, security vulnerability | Immediate | 24 hours |
+| **S2 Major** | Core feature broken (editor, terminal, extensions) | 24 hours | 1 week |
+| **S3 Minor** | Non-core feature broken, cosmetic issue | 1 week | Next release |
+| **S4 Trivial** | Enhancement request, rare edge case | Backlog | When possible |
+
+### 6.2 Bug Report Template
+
+```markdown
+**Severity**: S1/S2/S3/S4
+**Device**: [model, Android version, RAM]
+**Steps to Reproduce**:
+1. ...
+2. ...
+3. ...
+**Expected**: ...
+**Actual**: ...
+**Logs**: [Logcat output, screenshot, screen recording]
+```
+
+---
+
+## 7. Milestone Test Gates
+
+Each milestone must pass its test gate before proceeding:
+
+| Milestone | Required Tests | Pass Criteria |
+|-----------|---------------|---------------|
+| M0 (POC) | Manual E2E-01, E2E-03 (node + git only) | Node.js runs, WebView loads |
+| M1 (Core) | Unit tests, Instrumented (Node, WebView, Extensions, Terminal), E2E 1-6 | All pass on Pixel 8, phantom processes with nothing open at or below `IDLE_BASELINE` in `process-monitor.js` |
+| M2 (Mobile) | + E2E 7-10, Compatibility (2 devices) | All pass on 2 devices |
+| M3 (Dev Env) | + E2E-12, E2E-14, Python/Git tests, Toolchain install, RAM check after Python+toolchains | All pass on 2 devices |
+| M4 (Polish) | Full suite incl. E2E-11/E2E-13, Performance tests, Compatibility (4 devices), Backup & Restore tests, phantom process count gate (idle at or below `IDLE_BASELINE`) | All targets met |
+| M5 (Release) | Full suite, Security tests (see 06-SECURITY §7), 48-hour beta soak | Zero S1/S2 bugs, security checklist pass |

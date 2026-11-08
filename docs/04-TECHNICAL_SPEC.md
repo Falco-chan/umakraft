@@ -1,0 +1,1767 @@
+# Technical Specification
+
+**Project**: VSCodroid
+**Version**: 1.0-draft
+**Date**: 2026-02-10
+
+> **The code is the only authority.** The server is built from the MIT Code - OSS source by
+> `.github/workflows/build-vscode-oss.yml`, which applies the unified diffs in `patches/` and the
+> branding in `branding/` before the gulp build; release and local builds fetch the published
+> result with `scripts/fetch-vscode-oss.sh`. Where this document summarises a mechanism, the
+> mechanism itself lives in `scripts/build-vscode-oss.sh`, `patches/`, and the Kotlin under
+> `android/app/src/main/kotlin/com/vscodroid/`. `CONTRIBUTING.md` is the prose kept current
+> alongside it.
+
+---
+
+## 1. Build System
+
+### 1.1 Overall Build Pipeline
+
+```mermaid
+flowchart TD
+  S1["Stage 1: Assemble binaries<br/>Node, Python, git, bash, tmux, make, ssh from Termux packages<br/>node-pty and @parcel/watcher cross-compiled with the NDK"] --> S2["Stage 2: Build Code - OSS<br/>MIT microsoft/vscode source + patches/ + branding/<br/>output: vscode-reh-web-linux-arm64 (server and web client in one tree)"]
+  S2 --> S3["Stage 3: Android APK/AAB<br/>Gradle assembleRelease<br/>Kotlin + WebView + assets + jniLibs<br/>output: app-release.aab"]
+  ENV["Environment: arm64 Linux runner for stage 2 (the gulp build needs the target arch)<br/>Android NDK r27 for the native addons and shims: aarch64-linux-android30<br/>App minSdk: API 30"] -. applies to .-> S1
+  ENV -. applies to .-> S2
+  ENV -. applies to .-> S3
+```
+
+### 1.2 Node.js Runtime
+
+**Source**: Termux's `nodejs-lts` package. Nothing here compiles Node.
+
+The version is not a preference. `remote/.npmrc` `target` at the pinned VS Code tag names the Node
+the server ships and the one its native modules are built against, so the package has to be that
+line; bumping either means checking the other.
+
+**`scripts/download-node.sh`**:
+
+```bash
+# 1. Fetch and verify the Termux package index (scripts/verify-termux-index.sh):
+#    a pinned key signs InRelease, which carries the digest of the package index,
+#    which carries the digest of each .deb.
+# 2. Download nodejs-lts and extract bin/node.
+# 3. Install it as jniLibs/arm64-v8a/libnode.so (the .so trick), mode 0755.
+# 4. patch-default-shell.py repoints the built-in default shell, which Termux
+#    compiles as /data/data/com.termux/files/usr/bin/sh, at /system/bin/sh.
+# 5. verify-android-elf.py checks 16 KB LOAD alignment and refuses any DT_NEEDED
+#    that neither Bionic provides nor this app bundles.
+```
+
+**Not statically linked**: it needs `libcares`, `libicu*`, `libc++_shared`, `libsqlite3`,
+`libcrypto`, `libssl` and `libz`. `scripts/download-termux-tools.sh` places those in
+`assets/usr/lib`, and `Environment.kt` puts that directory on `LD_LIBRARY_PATH`. `libicudata` is
+32 MB on its own and is not optional; the other ICU libraries do nothing without it.
+
+**16KB page alignment** (Android 16): Termux's build is already aligned, and
+`verify-android-elf.py` checks it on everything a download script places: all of
+`jniLibs/arm64-v8a` (swept as a directory by the `verifyBundledBinaries` Gradle task),
+`assets/usr/lib`, the Python stdlib including `lib-dynload`, and the toolchain packs.
+The packaged `.node` addons are covered twice. `scripts/build-native-addons.sh` runs
+`verify-android-elf.py` on each addon it builds (node-pty, `@parcel/watcher`,
+`@vscode/sqlite3` and zeromq). At packaging time the `verifyPackagedAlignment` Gradle task
+runs `verify-android-elf.py --tree` over all of `assets/`, which checks LOAD alignment and
+PT_INTERP for every aarch64 ELF there. That includes the addons no script here builds,
+such as `kerberos.node`, `watchdog.node` and the Copilot prebuilds, and it checks the four
+built ones again whether or not the build script ran. `DT_NEEDED` is
+deliberately not asked of that tree: `gen-glibc-forwarders.py --scan` asks it in the
+`verifyNativeAddons` Gradle task, and `verify-server-tree.py` checks architecture.
+
+### 1.3 Python Runtime
+
+**Source**: Termux's `python` and `python-pip` packages, installed by `scripts/download-python.sh`.
+
+**Key points**:
+
+- The version is read from the Termux index at build time and never hardcoded: the script derives
+  `PYTHON_MAJOR_MINOR` from the package it resolved and writes every path from it.
+- The interpreter is installed as `jniLibs/arm64-v8a/libpython.so`.
+- Stdlib and pip land in `assets/usr/lib/python<major>.<minor>/`, and an older stdlib directory
+  is removed rather than left beside the new one.
+- Its own dependencies (`libffi`, `libbz2`, `liblzma`, `libsqlite`, `libcrypt`, `gdbm`, `zstd`,
+  `libandroid-posix-semaphore`) go to `assets/usr/lib/`.
+- `patch-python-platform.py` and `patch-default-shell.py` correct what the stdlib assumes about
+  the platform and about where a shell lives.
+
+### 1.4 Native Node Addons
+
+`scripts/build-native-addons.sh` is where cross-compilation actually happens. It builds the addons
+the server cannot run without, and zeromq for the Jupyter extension, against Bionic, with the NDK:
+
+```bash
+# node-pty        -> node_modules/node-pty/build/Release/pty.node
+# @parcel/watcher -> node_modules/@parcel/watcher/build/Release/watcher.node
+# @vscode/sqlite3 -> node_modules/@vscode/sqlite3/build/Release/vscode-sqlite3.node
+# zeromq          -> assets/usr/lib/node-addons/zeromq/build/Release/zeromq.node (libzmq static)
+#
+# Linked with -Wl,-z,max-page-size=16384 -Wl,-z,common-page-size=16384
+# and with -static-libstdc++ -Wl,-Bsymbolic (ADDON_LINK_FLAGS)
+# OUTPUT_ROOT defaults to android/app/src/main/assets/vscode-reh
+```
+
+The first three land inside the packaged `vscode-reh` tree, **not** in `jniLibs/`; `@vscode/spdlog` is replaced by a JavaScript implementation rather than recompiled. That works because SELinux
+denies `execve` under the app's data directory but not `dlopen`, so an addon is loadable from
+`filesDir` even though a binary there cannot be exec'd directly (a preloaded shell starts one
+through the system linker instead; the server and the extension host have no such route). Each of
+those three is checked against
+the `package.json` the server was built with, since an addon compiled for a different Node ABI
+loads and then fails at the first call.
+
+Every addon carries its own libc++, and the process it loads into already holds another in
+`libnode.so` and `libc++_shared.so`. `-Bsymbolic` keeps the dynamic loader from binding the
+addon's libc++ symbols to that copy, and `verify()` in the script fails the build if any
+relocation still names a `std::__ndk1` symbol. Without it `@parcel/watcher`'s `std::regex` objects
+were destroyed by `libnode.so`'s code and `free()` aborted the file watcher process on every
+unsubscribe that carried a glob, as the default `files.watcherExclude` patterns do.
+
+`zeromq` is for the Jupyter extension users install from Open VSX, not for the server. That
+extension carries zeromq 6.0.0-beta.16 with glibc and musl prebuilds only, so without an Android
+build it cannot reach a kernel directly and falls back to a Jupyter server this environment cannot
+install or start. The addon sits outside the server tree, where an extension update cannot remove
+it, and `ZEROMQ_PREBUILD` (section 2.3) points the extension's loader at it. It is matched to the
+zeromq version that extension bundles rather than to any `package.json` in this build, so a Jupyter
+release that moves to another zeromq needs the pin in the script moved with it.
+
+### 1.5 Code - OSS Build (server and web client)
+
+The server is built from the MIT `microsoft/vscode` source, once per VS Code version, by
+`scripts/build-vscode-oss.sh`. `.github/workflows/build-vscode-oss.yml` runs it on an arm64 runner
+and publishes the result as a `server-<version>` release; release builds and local builds then fetch
+that artifact with `scripts/fetch-vscode-oss.sh` instead of building it again, while the debug build in CI
+builds its own tree for the revision through `.github/workflows/codeoss-build.yml`.
+
+```bash
+# 1. Fetch the pinned source. VSCODE_VERSION holds the tag and VSCODE_COMMIT the
+#    commit it resolved to when it was pinned. The build refuses a tree whose
+#    package.json version disagrees with the pin, because the pin is what makes
+#    the patches apply.
+
+# 2. Apply the Android adaptations, as unified diffs against readable source.
+for patch in patches/*.patch; do
+    git -C "$SRC" apply --verbose "$patch"
+done
+
+# 3. Install dependencies; the whole stage gets up to three attempts.
+npm ci
+
+# 4. Callback page: strip the logo callback.html embeds as a base64 image.
+
+# 5. Branding: restore this stage's own targets, then overlay
+#    branding/product.json onto the source product.json and replace the
+#    artwork at seven destinations: the titlebar mark and six letterpress
+#    files, two of them under src/vs/sessions/contrib/chat/browser/media/,
+#    which nothing in the packaged tree renders today and which are replaced
+#    anyway because they are upstream's mark and they travel in the APK.
+#    callback.html is deliberately outside the restore list: patch 0006 and
+#    the callback-page stage both own that file, and checking it out here
+#    would undo the intent:// relay and put the stripped logo back.
+
+# 6. Build.
+npm run gulp core-ci
+npm run gulp compile-copilot-extension-build
+npm run gulp "vscode-reh-web-linux-arm64-min-ci"
+
+# 7. Finish the packaged tree ($OUT, vscode-reh-web-linux-arm64). Prune removes
+#    the GNU/Linux node binary, the unreferenced embedder bundle, the agent
+#    host's @github/copilot-sdk-* runtime, @microsoft/mxc-sdk's bin/ helpers,
+#    @vscode/sandbox-runtime's x86-64 apply-seccomp and every
+#    sourceMappingURL comment naming main.vscode-cdn.net, and copies in
+#    LICENSE.txt and ThirdPartyNotices.txt. Mobile CSS appends touch-sized menu
+#    rules to workbench.css. patch-js-debug-env.py hands js-debug's helper
+#    processes PATH and LD_LIBRARY_PATH. The patch manifest,
+#    vscodroid-patches.json, is written last.
+
+# 8. Check, then pack into $TARBALL (vscode-reh-web-linux-arm64-$VSCODE_VERSION.tar.gz).
+#    It holds the tree's contents with no leading directory, so the fetcher
+#    extracts straight into the name the app expects.
+python3 scripts/verify-server-tree.py       "$OUT"
+python3 scripts/check-patch-fingerprints.py "$OUT" patches
+tar --sort=name --format=gnu --mtime="@$(git -C "$SRC" log -1 --format=%ct)" \
+    --owner=0 --group=0 --numeric-owner -C "$OUT" -czf "$TARBALL" .
+```
+
+The `reh-web` target carries both halves, so one tree is the server and the web client it serves;
+`scripts/package-assets.sh` copies it to `assets/vscode-reh/` and there is no separate `vscode-web`
+to copy. `verify-server-tree.py` rejects any tree whose `LICENSE.txt` is not the MIT one, or that
+carries `node_modules/vsda`, which only Microsoft's own build has. It also asserts what the
+branding is supposed to have removed: `callback.html` carrying neither a Microsoft product name
+nor an embedded image, and `out/nls.messages.js` carrying none of eight shipped phrases that
+name VS Code. Those nine are skipped, not failed, on a tree with no `vscodroid-patches.json`,
+which is reported as a tree predating the patches rather than as nine regressions.
+
+**Note on ripgrep delivery**: VS Code search requires ripgrep. `scripts/fetch-vscode-oss.sh` takes
+the ARM64 `rg` out of `node_modules/@vscode/ripgrep-universal/bin/linux-arm64/` in the fetched tree,
+runs `verify-android-elf.py` over it, and installs it as `libripgrep.so` in `jniLibs/arm64-v8a/`. It
+cannot stay where it was: nothing under `filesDir` is executable. `FirstRunSetup` symlinks the path
+VS Code looks for back at the `.so` on every launch.
+
+### 1.6 Git
+
+**Source**: Termux's `git` package, with `libcurl`, `openssl`, `pcre2`, `zlib`, `libssh2` and the
+rest of its dependency set, fetched by `scripts/download-termux-tools.sh`.
+
+**Output artifacts**:
+
+- `libgit.so` and `libgit-remote-curl.so` in `jniLibs/arm64-v8a/`
+- `usr/lib/git-core/*` helper binaries, reached through `GIT_EXEC_PATH`; the ones that must be
+  executable become symlinks to `libgit.so` at first run
+- `usr/share/git-core/templates`, reached through `GIT_TEMPLATE_DIR`
+
+Shebangs and built-in shell paths are rewritten to `/system/bin/sh`, because the path Termux
+compiles in sits inside another application's data directory that this app can neither read nor
+create.
+
+### 1.7 Bash
+
+**Source**: Termux's `bash` package, with `readline` and `ncurses`.
+
+**Output artifacts**:
+
+- `libbash.so` in `jniLibs/arm64-v8a/`
+- `usr/bin/bash`, a symlink to it that `FirstRunSetup.setupToolSymlinks()` rebuilds on every launch,
+  because a reinstall moves `nativeLibraryDir` and dangles every absolute link
+
+The terminal profile names the symlink, never the `.so`: VS Code decides whether it can inject
+shell integration by switching on the executable's basename, and `libbash.so` matches no case.
+
+### 1.8 tmux
+
+**Source**: Termux's `tmux` package, with `libevent` and the `ncurses` terminfo data.
+
+**Output artifacts**:
+
+- `libtmux.so` in `jniLibs/arm64-v8a/`
+- `usr/share/terminfo/*`, reached through `TERMINFO`
+
+tmux is a standalone tool for whoever wants it. VS Code's terminals do not go through it: the
+default profile is bash, and each terminal spawns bash directly through node-pty on a real PTY.
+`TMUX_TMPDIR` has to be set, because the Termux build otherwise hunts for its socket inside Termux's
+own prefix and every session dies with "no suitable socket path".
+
+### 1.9 make
+
+**Source**: Termux's `make` package.
+
+**Output artifacts**:
+
+- `libmake.so` in `jniLibs/arm64-v8a/`
+
+### 1.10 Gradle Build Configuration
+
+```kotlin
+// app/build.gradle.kts
+android {
+    namespace = "com.vscodroid"
+    compileSdk = 37             // compile-time only; what the platform applies is targetSdk
+
+    defaultConfig {
+        applicationId = "com.vscodroid"
+        minSdk = 30
+        targetSdk = 36
+        versionCode = 18            // moves every release; read build.gradle.kts, never this block
+        versionName = "1.7.0"      // both are persisted by markSetupComplete() and either one
+                                   // changing re-runs the whole of first-run extraction
+
+        ndk {
+            abiFilters += "arm64-v8a"
+        }
+    }
+
+    packaging {
+        jniLibs {
+            useLegacyPackaging = true  // CRITICAL: preserves .so in APK
+        }
+    }
+
+    buildTypes {
+        release {
+            isMinifyEnabled = true
+            isShrinkResources = true
+            proguardFiles(
+                getDefaultProguardFile("proguard-android-optimize.txt"),
+                "proguard-rules.pro"
+            )
+        }
+    }
+}
+```
+
+---
+
+## 2. Android Application Architecture
+
+### 2.1 Component Structure
+
+```mermaid
+flowchart TD
+  ROOT["com.vscodroid/"] --> APP["app/"]
+  APP --> A1["VSCodroidApp.kt (Application class)"]
+  APP --> A2["MainActivity.kt (Main activity with WebView)"]
+  APP --> A3["SplashActivity.kt (First-run setup)"]
+  APP --> A4["ToolchainActivity.kt (Toolchain picker and manage screen)"]
+  APP --> SVC["service/"]
+  SVC --> SVC1["NodeService.kt (Foreground Service for Node.js)"]
+  SVC --> SVC2["ProcessManager.kt (Node.js process lifecycle)"]
+  APP --> WEB["webview/"]
+  WEB --> WEB1["VSCodroidWebView.kt (WebView configuration)"]
+  WEB --> WEB2["VSCodroidWebViewClient.kt (request interception, URL loading, errors)"]
+  WEB --> WEB3["VSCodroidWebChromeClient.kt (console, file picker, permissions)"]
+  WEB --> WEB4["DownloadCoordinator.kt, DownloadNaming.kt (downloads out of the WebView)"]
+  APP --> BR["bridge/"]
+  BR --> BR1["AndroidBridge.kt (@JavascriptInterface methods)"]
+  BR --> BR2["ClipboardBridge.kt (Clipboard read/write)"]
+  BR --> BR3["SecurityManager.kt (session token for bridge calls)"]
+  APP --> KEY["keyboard/"]
+  KEY --> KEY1["ExtraKeyRow.kt (Custom View for extra keys)"]
+  KEY --> KEY2["ExtraKeyButton.kt (Individual key button)"]
+  KEY --> KEY3["KeyInjector.kt (real key presses for characters and navigation keys, JS KeyboardEvents for other commands and chords)"]
+  KEY --> KEY4["TextEntry.kt (isTextEntry, NAVIGATION_KEYS: which of the three routes a press takes)"]
+  APP --> SETUP["setup/"]
+  SETUP --> SET1["FirstRunSetup.kt (Binary extraction, initialization)"]
+  SETUP --> SET2["ToolchainManager.kt (On-demand toolchain install)"]
+  SETUP --> SET3["ToolchainRegistry.kt (what the picker offers)"]
+  SETUP --> SET4["ToolchainCardState.kt, ToolchainPickerAdapter.kt (picker UI state)"]
+  APP --> STORE["storage/"]
+  STORE --> ST1["SafStorageManager.kt (SAF folder grants and mirrors)"]
+  STORE --> ST2["SafSyncEngine.kt (reconcile mirror with content URI)"]
+  APP --> UTIL["util/"]
+  UTIL --> U1["Environment.kt (PATH, HOME, env setup)"]
+  UTIL --> U2["PortFinder.kt (find available localhost port)"]
+  UTIL --> U3["Logger.kt (logging utilities, redaction)"]
+  UTIL --> U4["CrashReporter.kt, EditorLocale.kt, Notices.kt, StorageManager.kt, ViewInsets.kt, WebViewVersion.kt"]
+
+  ROOT --> RES["res/"]
+  RES --> LAYOUT["layout/"]
+  LAYOUT --> L1["activity_main.xml (WebView + ExtraKeyRow)"]
+  LAYOUT --> L2["activity_splash.xml (First-run progress)"]
+  LAYOUT --> L3["activity_toolchain.xml, item_toolchain_card.xml, layout_toolchain_picker.xml, layout_toolchain_progress.xml"]
+  RES --> VALUES["values/"]
+  VALUES --> V1["strings.xml"]
+  RES --> VALUESL["values-lang/ (thirteen: cs de es fr it ja ko pl pt-rBR ru tr zh-rCN zh-rTW)"]
+  VALUESL --> V2["strings.xml (the app's own screens, translated)"]
+  RES --> XML["xml/"]
+  XML --> X1["locales_config.xml (what android:localeConfig publishes to Android's per-app language picker)"]
+  RES --> DRAW["drawable/"]
+  DRAW --> D1["ic_launcher.xml (VSCodroid icon)"]
+
+  ROOT --> ASSET["assets/"]
+  ASSET --> AS1["vscode-reh/ (Code - OSS server, and the web client it serves)"]
+  ASSET --> AS2["usr/ (Termux binaries, shared libs, terminfo, git-core)"]
+  ASSET --> AS3["usr/lib/python3.x/ (Python standard library and pip)"]
+  ASSET --> AS4["extensions/ (Pre-bundled extensions)"]
+  ASSET --> AS5["server.js (Server bootstrap script)"]
+  ASSET --> AS6["nls/ (one translated message bundle per language, served straight from the APK, never unpacked)"]
+```
+
+### 2.2 Activity Lifecycle
+
+```mermaid
+flowchart TD
+  A["Application.onCreate()<br/>WebView.setDataDirectorySuffix('vscodroid')<br/>Initialize logging"] --> B["SplashActivity (LAUNCHER, runs on every start)<br/>Per-launch repairs: symlinks, git core, npm wrappers, SAF reclaim<br/>Extraction only when versionName or versionCode changed<br/>Start MainActivity"]
+  B --> C["MainActivity.onCreate()<br/>setContentView (WebView + ExtraKeyRow)<br/>Configure WebView<br/>Start/bind NodeService<br/>Wait server ready -> loadVSCode(): register AndroidBridge,<br/>load http://127.0.0.1:PORT/?folder=... with the connection token"]
+  C --> D["NodeService.onCreate()<br/>Start Foreground Service (specialUse)<br/>Build environment variables<br/>Launch Node.js with ProcessBuilder<br/>Poll GET /version, accept only 200<br/>Notify MainActivity: server ready"]
+  D --> E["MainActivity (running)<br/>Give ExtraKeyRow its root view and the user's hide choice (the row decides when it shows, 5.3)<br/>Render VS Code in WebView<br/>Monitor Node.js health<br/>Handle rotation/back button/onTrimMemory"]
+  E --> F["MainActivity.onDestroy()<br/>Stop the SAF file watcher, unbind the service<br/>Destroy the WebView. The service is not stopped here<br/>Rotation does not reach this: configChanges keeps the activity"]
+```
+
+### 2.3 Environment Variables
+
+```kotlin
+// Illustrative shape only. Environment.buildProcessEnvironment sets the keys below plus whatever
+// getToolchainEnvironment() contributes; the list names every key but abbreviates the values.
+val env = mapOf(
+    "HOME"                    to "${filesDir}/home",
+    "TMPDIR"                  to "${cacheDir}/tmp",
+    "TMUX_TMPDIR"             to "${cacheDir}/tmp",   // Termux tmux hunts inside Termux's prefix otherwise
+    "PATH"                    to "${nativeLibDir}:${filesDir}/usr/libexec/tcbin:${filesDir}/usr/bin:<toolchains>:/system/bin",
+    "LD_LIBRARY_PATH"         to "${nativeLibDir}:${filesDir}/usr/lib",
+    "TERMUX_APP__DATA_DIR"    to "<applicationInfo.dataDir>",  // these three are read only by the exec
+    "TERMUX_APP__LEGACY_DATA_DIR" to "/data/data/<package>",   // interceptor a terminal preloads (end of
+    "TERMUX__PREFIX"          to "${filesDir}/usr",            // this section), and inert until then
+    "NODE_PATH"               to "${filesDir}/server/vscode-reh/node_modules",
+    "NODE_OPTIONS"            to "--require=${filesDir}/server/platform-fix.js",
+    "SHELL"                   to "${filesDir}/usr/bin/bash",
+    "BASH_ENV"                to "${filesDir}/home/.vscodroid/bash-env.sh",  // see below
+    "VSCODROID_EXEC_TABLE"    to "${filesDir}/home/.vscodroid/toolchain-exec.tsv",  // see below
+    "TERM"                    to "xterm-256color",
+    "TERMINFO"                to "${filesDir}/usr/share/terminfo",
+    "LANG"                    to "en_US.UTF-8",
+    "PREFIX"                  to "${filesDir}/usr",
+    "PYTHONHOME"              to "${filesDir}/usr",
+    "PYTHONPYCACHEPREFIX"     to "${cacheDir}/pycache",
+    "GIT_EXEC_PATH"           to "${filesDir}/usr/lib/git-core",
+    "GIT_TEMPLATE_DIR"        to "${filesDir}/usr/share/git-core/templates",
+    "GIT_SSH_COMMAND"         to "${nativeLibDir}/libssh.so -F ${filesDir}/home/.ssh/config",
+    "GIT_SSL_CAPATH"          to "${filesDir}/usr/etc/tls",            // no raw Android roots bypass the bundle
+    "GIT_SSL_CAINFO"          to "${filesDir}/usr/etc/tls/cert.pem",
+    "SSL_CERT_FILE"           to "${filesDir}/usr/etc/tls/cert.pem",
+    "CURL_CA_BUNDLE"          to "${filesDir}/usr/etc/tls/cert.pem",   // set when the bundle exists, including empty
+    "REQUESTS_CA_BUNDLE"      to "${filesDir}/usr/etc/tls/cert.pem",   // read by requests (and by pip alongside
+                                                                       // SSL_CERT_FILE and pip's vendored certifi).
+                                                                       // Set only when the bundle exists: requests
+                                                                       // treats a path it cannot open as fatal
+    "SSL_CERT_DIR"            to "${filesDir}/usr/etc/tls",            // an empty bundle preserves an empty trust store
+    "OPENSSL_CONF"            to "${filesDir}/usr/etc/tls/openssl.cnf",  // libcrypto's built-in path is Termux's,
+                                                                         // and EACCES there is fatal to Node
+    "NPM_CONFIG_PREFIX"       to "${filesDir}/usr",
+    "NPM_CONFIG_CACHE"        to "${cacheDir}/npm-cache",
+    "PIP_CACHE_DIR"           to "${cacheDir}/pip",
+    "PROJECTS_DIR"            to "<projects dir>",
+    "USE_BUILTIN_RIPGREP"     to "0",                 // falsy sends the Claude CLI to rg on PATH
+    "ZEROMQ_PREBUILD"         to "${filesDir}/usr/lib/node-addons/zeromq",  // the Jupyter extension's
+                                                                       // zeromq loader reads it; every child of
+                                                                       // the server inherits it, terminals too,
+                                                                       // so a project's zeromq 5.x or 6.0.x
+                                                                       // loads this build instead of its own
+    "VSCODROID_PORT"          to port.toString(),
+    "VSCODROID_VERSION"       to BuildConfig.VERSION_NAME,
+    "VSCODROID_PACKAGE"       to context.packageName,  // server.js pins the sign-in intent to it
+)
+```
+
+**`COLORTERM` and `EDITOR` are not in this map**, and neither are `VISUAL`, `GIT_EDITOR` or
+`PAGER`. This block listed the first two until 2026-08-20 and they have never been in the map. A
+terminal's shell still gets `COLORTERM=truecolor`, from VS Code rather than from here: the
+environment it builds for every terminal not launched with `strictEnv` adds that,
+`TERM_PROGRAM=vscode` and `TERM_PROGRAM_VERSION`. Nothing adds `EDITOR`, and no editor binary is
+bundled either, so `git commit` with no `-m` has nothing to open.
+
+The `PATH` above is the server's. A terminal's has VS Code's `bin/remote-cli` in front of it, put
+there by the server's `buildUserEnvironment`, and once bash sources `toolchain-env.sh` each
+installed toolchain's `pathDirs` are appended again behind everything else.
+
+**`BASH_ENV` is the load-bearing entry.** `npm`, `npx`, `claude` and every toolchain binary are bash
+*functions*, not files, because SELinux refuses `execve` under `filesDir`. Those functions live in
+`.bashrc`, which only an interactive bash reads, so `BASH_ENV` names a second file carrying the same
+definitions for `bash -c`, `bash script.sh` and `bash -lc`. What it does not reach is a bare
+`execve` (`child_process.spawn("ruby", ...)` with no shell) and `sh -c`, since Android's `sh` is mksh
+and has never heard of the variable. `child_process.exec()` and make's default recipe shell are both
+`/bin/sh`. See `FirstRunSetup.createBashEnvFile`, whose KDoc states the boundary in full.
+
+**`VSCODROID_EXEC_TABLE` answers exactly the cases `BASH_ENV` cannot.** It names a tab-separated
+table mapping a toolchain command to the absolute path of the binary or script that implements it,
+plus one row per manifest environment variable (`\t<variable>\t<value>`, an empty command field)
+that the trampoline applies with `setenv` for any variable the caller does not already have, so a
+toolchain installed while the server runs reaches tasks and `make` without a restart. Both are
+written by `ToolchainManager.regenerateExecTableLocked` beside the env file. The reader is
+`libexec-trampoline.so`, a small C program in `nativeLibraryDir` that
+`scripts/build-exec-trampoline.sh` compiles: `usr/libexec/tcbin` holds one symlink per command
+pointing at it, that directory sits ahead of `usr/bin` on `PATH`, and the trampoline hands the
+payload to `/system/bin/linker64` the same way the bash functions do. So a bare `execve`, an mksh
+`sh -c`, a `make` recipe and a `"type": "process"` task all reach a toolchain command now. What it
+still does not reach is an absolute-path invocation such as `$JAVA_HOME/bin/java`, a toolchain
+forking its own helper by absolute path (the JDK's `lib/jspawnhelper`), and direct execution of a
+shebang script under `filesDir`, whose own inode is refused before its interpreter is consulted.
+All three hold outside a preloaded shell only: under the exec interceptor described below they run,
+and the table is what the extension host's own spawns, which carry no preload, still go through.
+
+The table is no longer only about toolchains. One row is the app's own: `xdg-open`, the literal
+command every Node browser helper spawns, mapped through `libnode.so` onto `assets/xdg-open.js`.
+That is why the generator now writes a table and a `tcbin` on a device with no toolchain installed,
+where it used to delete both.
+
+The generator also scans `usr/bin` for regular files whose `#!` line names Python, which is what
+`pip install` writes for a package that ships a command, and gives each one an interpreter row onto
+the `usr/bin/python3` link rather than the `libpython.so` behind it, so `sys.executable` is a path an
+app update does not move. Without it `pip install black` produced a `black` on PATH that answered
+`bad interpreter: Permission denied` outside a preloaded shell, since reaching the interpreter
+through a shebang means `execve` on the script's own inode. Symlinks in that directory are skipped:
+those are the bundled tools, already pointing at ELFs that run. The same scan covers `$GEM_HOME/bin`
+from the Ruby manifest for Ruby-shebang files, which is where `gem install` writes a gem's commands.
+Those rows stay because a process the extension host starts has no preload and still needs them.
+The rows are written by the launch pass and again whenever the editor returns to the foreground, so
+a command installed while the app is in front is reachable after switching away and back.
+
+**The exec interceptor is the general route, and it is scoped to the terminal.** Every terminal,
+shell task and process task the pty host creates gets `LD_PRELOAD` naming
+`usr/lib/libtermux-exec.so` under `filesDir`, through `terminal.integrated.env.linux` in the machine
+settings file this app owns (`Environment.getExecPreloadPath`, written by
+`FirstRunSetup.writeDefaultSettings` and inserted into an existing file on launch, in both cases
+only once the library is on disk, so a build whose assets lack it writes no line). The library is
+termux-exec, built from source by `scripts/build-termux-exec.sh` with the repository's patch, and it
+rewrites each `exec*` of a file under the data directory into `/system/bin/linker64 <path>`, which
+is what the Termux build on Google Play does. Three things about the wiring are load-bearing, all
+measured on API 33 and 36 emulators, 2026-09-22/23. The value must be a real file under `filesDir`,
+never a bare name and never a path into `nativeLibraryDir`: Bionic treats a missing or dangling
+`LD_PRELOAD` entry as a missing `DT_NEEDED` and aborts every exec with `CANNOT LINK EXECUTABLE`, so
+a path that a reinstall moves would kill every new terminal until the next repair. The setting is
+`terminal.integrated.env.linux` and not the profile's `env`, because the profile env misses the
+first session after an edit made while the app was stopped and never reaches a `"type": "process"`
+task, while `env.linux` reaches terminals, shell tasks and process tasks and applies live. What it
+cannot reach is the pty host's own `execve` of a process task's command, which carries no preload
+because `LD_PRELOAD` is absent from the server environment by design: that command has to be
+exec-able as it is today (a bundled tool, a toolchain name through `tcbin`, or a system program),
+and only the task's children gain the interceptor; an absolute path under `filesDir` as the
+command fails with `execvp(3) failed.: Permission denied` with and without the setting. And the
+three variables the library reads (`TERMUX_APP__DATA_DIR`, `TERMUX_APP__LEGACY_DATA_DIR`, both
+spellings needed because `getcwd` reports `/data/data`, and `TERMUX__PREFIX`) sit in the server
+environment (`Environment.buildProcessEnvironment`), where they are inert until the preload
+appears; `LD_PRELOAD` itself is deliberately not there, because anything the extension host spawns
+without a pty is outside the measured scope. `"LD_PRELOAD": null` in the same setting is the off
+switch, and the launch-time insert leaves a present key alone whatever its value, with one
+exception: this app's own path under another Android user's data directory, which a settings
+backup restored into another user carries, is re-pointed (`ensureTerminalPreload`). The git
+extension's helpers are unchanged by the preload. `GIT_ASKPASS`, `SSH_ASKPASS` and `GIT_EDITOR`
+name scripts in `extensions/git/dist`, and each of those names is a link onto
+`libexec-trampoline.so`, which runs the shipped script, kept beside it as `<name>.script`, with
+`/system/bin/sh` (`ToolchainManager.addGitHelperRows`). The link resolves outside the data
+directory, so the interceptor lets that exec through as it is rather than starting it through the
+linker (P2 in `scripts/termux-exec.patch`), and a credential prompt from `git` in a terminal
+reaches the workbench's sign-in and input boxes with or without the preload. Read from the code,
+not measured with the preload. The C/C++ toolchain (section 7.5) is the one pack that cannot work
+without it.
+
+---
+
+## 3. Server Bootstrap
+
+### 3.1 Server Entry Script (server.js)
+
+The bootstrap script that Node.js executes:
+
+```
+server.js responsibilities:
+1. Parse command-line arguments (port, host, extensions-dir, etc.)
+2. Set up VS Code product.json overrides
+3. Preload dns-proxy.js into the editor server it forks, and pass platform-fix.js in its execArgv so the extension host, whose environment has no NODE_OPTIONS, loads it too
+4. Launch vscode-reh server entry point
+5. Configure Extension Host as worker_thread
+6. Spawn a shell per terminal through node-pty, on a real PTY
+7. Listen on localhost:PORT
+8. Serve vscode-web static files
+9. Handle WebSocket connections for RPC
+```
+
+Step 3 is a `--require=<path>` on the child's `execArgv`, not a listener in this
+process, and the difference is load-bearing. This bootstrap is SIGKILLed as a
+matter of routine while the child survives holding the port, which is the case
+`ProcessManager` adopts on the next launch; a proxy bound here died with it and
+left that survivor pointing at a closed port for its whole session, with no way
+to change the environment of a running process. The module is `require`d here
+first so that a file that cannot parse costs musl clients their DNS rather than
+costing the app its editor server, and it is passed as one token, because
+`process-monitor.js` names a process by its first non-option argument.
+
+The bootstrap also adds three scripts to the workbench page template,
+`vscode-reh/out/vs/code/browser/workbench/workbench.html`, through `extendWorkbenchPage`, because
+the page cannot take them from `product.json`: the trusted link domains, the extension
+recommendations, and the theme a page load starts on. The last one first reads the settings file of
+the window it opens, the folder's `.vscode/settings.json` or the workspace file, with a synchronous
+GET of `/vscode-remote-resource`, because the page has to be coloured before its first paint and the
+workbench reads its configuration element once. The text goes to the workbench as
+`initialWorkspaceSettings`, which patch 0027 adds: a remote folder's configuration used to hold the
+folder's own settings only as the copy its last load cached, so a folder opened for the first time
+ran on the user's settings, the theme among them, until its file had been read through the remote
+file system, 8.5 to 20.6 s into the load on an API 36 emulator. The theme the file names decides the
+start. A folder that names one starts on its own record in `localStorage`
+(`vscodroid-folder-themes`, the twenty folders or workspaces most recently shown, each with the base
+theme and colours it showed and, for a theme of the folder's own, the name its settings gave it)
+when that record was taken under the same name, and otherwise on that theme's look among the server
+tree's own themes, which the bootstrap reads from the tree's theme files when it writes the script.
+Any other window starts on the record of the window that most recently followed the user's theme;
+before the script has recorded any window, on the splash the workbench saves (`monaco-parts-splash`);
+and once it has recorded only windows with a theme of their own, on the dark default this app
+configures.
+Before the first paint the script colours the page background from that look, and it hands the same
+look to the workbench as `initialColorTheme`, which the workbench uses only when it cannot use the
+theme it stored; never on a load after the device switched between light and dark, when
+`window.autoDetectColorScheme` makes the workbench's own pick the right one, and not for a theme of
+the folder's own it has no look for. After that it keeps the background on the editor colour of the
+theme the workbench shows, and the record with it, because the background also fills the space the
+soft keyboard gives back until the workbench lays itself out again, and it posts each colour it paints
+to the app, which gives it to the window behind the view as well (§4.1). The workbench keeps its
+stored theme, one per profile, only while the configured `workbench.colorTheme` equals the theme's
+id, so it drops that theme in a folder whose own settings name another and in any folder entered from
+one, and the default the welcome extension sets must be an id the server tree contributes, not an
+older name upstream migrates; `verify-server-tree.py` checks it.
+
+What still starts on another theme: a folder naming a theme an installed extension contributes, on
+its first load and its first after twenty other folders were shown, which the script has no look for,
+so it takes the user's colour and, where the workbench cannot use its stored theme, the web default,
+the light one with the registry's default colours, until the extensions register; a window following
+the user's theme while every window recorded has a theme of its own, once after the update when the
+first window it opens has one and after twenty such windows in a row, which starts on the dark
+default whatever the user's theme, so under a light one it is dark until the workbench paints and,
+where the workbench cannot use its stored theme, until the extensions register; the first window
+after the update when it follows the user's theme and the window shown last before the update had
+a theme of its own, which starts on that theme, from the workbench's splash, until the extensions
+register, and is rare because `MainActivity` reopens the folder last open; with
+`window.autoDetectColorScheme` on, a folder naming a theme of its own on its first load, which starts
+on that theme where the workbench shows the one it picks for the device's mode; a window whose
+settings file cannot be read, which starts as one following the user's theme would and is not
+recorded; and a window after the user's theme was changed by an edit of the user's settings while a
+folder with a theme of its own was open, whose record of the user's theme is then older than the
+theme. Patch 0026 keeps the folder's settings in force between the extensions registering and the
+file being read, which a folder's settings given by the page or by its cached copy both need.
+
+Readiness is `GET /version`, and only a `200` counts. There is no `/healthz`:
+what used to serve one was a fallback server in `assets/server.js` that bound the
+port when `vscode-reh/out/server-main.js` was missing and answered 200 to every
+path, so a broken install passed the readiness probe and showed the user a page
+of build instructions. A missing entry point is now logged and exits 1. `/` is
+not usable as a probe either, because it answers `403` once the server requires a
+connection token.
+
+### 3.2 Server Launch Command
+
+```bash
+$NATIVE_LIB_DIR/libnode.so \
+  --max-old-space-size=$HEAP_MB \
+  $FILES_DIR/server/server.js \
+  --host=127.0.0.1 \
+  --port=$PORT \
+  --extensions-dir=$HOME/.vscodroid/extensions \
+  --user-data-dir=$HOME/.vscodroid \
+  --server-data-dir=$HOME/.vscodroid \
+  --logsPath=$HOME/.vscodroid/data/logs \
+  --log=info
+```
+
+`$HEAP_MB` is not a constant: `ProcessManager.heapCeilingForDevice` derives it from the
+device's total RAM, and it caps each V8 isolate at that number rather than capping the sum
+of them. `$HOME` is `$FILES_DIR/home`. These are `server.js`'s arguments, not the editor
+server's; `05-API_SPEC.md` §3.3 has the four keys it forwards and the flags it adds itself.
+
+---
+
+## 4. WebView Configuration
+
+### 4.1 Settings
+
+```kotlin
+webView.settings.apply {
+    javaScriptEnabled = true
+    domStorageEnabled = true
+    databaseEnabled = true
+    allowFileAccess = false         // the WebView has no business reading files directly
+    allowContentAccess = false      // page content cannot spend the app's SAF grants
+    setSupportZoom(false)           // Prevent accidental zoom
+    builtInZoomControls = false
+    displayZoomControls = false
+    textZoom = 100                  // pinned, so the system font scale does NOT reach the editor
+    mixedContentMode = MIXED_CONTENT_ALWAYS_ALLOW  // LAN dev servers on plain http
+    mediaPlaybackRequiresUserGesture = true         // the platform default, restored
+    cacheMode = LOAD_DEFAULT
+    javaScriptCanOpenWindowsAutomatically = true
+    setSupportMultipleWindows(false)
+}
+```
+
+Two of those are reversals of what this block used to show, and each has a cost worth
+stating. `allowContentAccess = false` closes the one route by which page content could spend the
+app's persisted SAF grants; nothing loses anything, because SAF reaches the page as a POSIX
+path under `filesDir/saf-mirrors` and no `content://` URI is ever loaded. Restoring
+`mediaPlaybackRequiresUserGesture` means no frame the editor renders can start audio or
+video without a tap, and the flag is all or nothing, so a user who turns
+`mediaPreview.video.autoPlay` on gets nothing.
+
+Read `VSCodroidWebView.configure` for the live set. Three notes on what is **not** here:
+
+- **No `userAgentString`.** Nothing in the app assigns one; the WebView reports Chromium's default.
+- **No `setSoftInputMode` call.** The resize behaviour comes from
+  `android:windowSoftInputMode="adjustResize"` on the activity in `AndroidManifest.xml`.
+- **`textZoom = 100` is a pin, not a default.** It is why changing the system font size has no
+  effect on editor text, which is a live accessibility gap rather than a setting anyone tuned.
+
+Outside the settings block, `configure` gives the view the colour the workbench page last
+painted (`lastPageColor`, below), or the window background, `R.color.colorBackground` (#1E1E1E),
+before it ever has. An unset WebView paints white wherever no page has painted yet, which showed
+before the loading placeholder on the first launch after an update.
+The workbench page paints its own background before its first paint, from the theme it expects
+to show (§3.1), so this colour shows only where no page has painted yet and behind a page that
+paints no background of its own. Two kinds of page paint none. The server's refusals, bare
+`text/plain` bodies such as "Forbidden.", set their text in the device's mode, which left it black
+on this colour in light mode. The WebView's own page for a load that failed, "Webpage not
+available", which the workbench gets when it navigates while the editor server restarts, names no
+colour scheme and sets black text in both modes. So `addPlainTextPageScript`, a document-start
+script, gives a top-level document of either kind the `Canvas` background of its own colour
+scheme: white in light mode and Chromium's dark canvas in dark mode for a plain-text page, white
+in both for the error page, which Chromium commits as an HTML document at
+`chrome-error://chromewebdata/`.
+
+The window behind the view shows wherever no view draws: behind the transparent status and
+navigation bars, below the extra key row while the soft keyboard slides away, and, when the
+keyboard goes down as a reload or a folder opened from a box that had it up begins, below the
+last page's frame, which the view holds at its old height until the next page paints. The view's
+own background never shows in that last space (measured on an API 36 emulator with a magenta
+one), so under a light theme it was a dark band of the theme's window colour, #1E1E1E, for up to
+2.1 s. So the page script posts the colour it paints the page with, at the start of each load and
+on each theme change, to the object `addPageColorListener` adds (`vscodroidPageColor`), which
+gives it to the view, and `MainActivity` gives it to the window through `paintWindow`, with dark
+bar icons on a light colour. Only an opaque `#rrggbb` from the top frame on the loopback address is
+taken. The window takes it once the view draws the page that posted it, through a visual state
+callback, and not as the page posts: a page posts as its load starts, while the view goes on
+drawing the last page's frame, and painted at once the bars around that frame showed the new colour
+for 0.55 to 1.7 s at every change between a dark and a light theme. The loading page and the error
+pages are this app's own and post nothing, so each gives the window its own colour before it loads
+and drops a page's colour still waiting for its frame.
+
+`MainActivity` also keeps the colour (`keepStartColor`), and every screen of the next start begins on
+it (`lastPageColor`): the windows of `SplashActivity` and `MainActivity` with their bars, the setup
+screen's text, the view and the "Starting server..." page. Under a light theme a cold start had been
+dark until the workbench painted, 2.3 s on the emulator, and the first launch after an update for
+the whole of setup. The system draws its starting window from a theme before any of the app runs, so
+while the colour is light it is pointed at `Theme.VSCodroid.LightStart` through
+`SplashScreen.setSplashScreenTheme`, which the system keeps for later launches, and back at the
+manifest's theme when it is dark. The system keeps that theme by its name and looks it up on each
+launch, falling back to the manifest's without an error when the name no longer resolves, and the
+app names it again only when the colour changes, so the style must keep its name. A light theme's
+starting window is white whatever that theme's own background is. The choice is the package's, so
+under a light colour a launch into a dark screen, as from the Toolchains shortcut, starts white too,
+and "Clear storage" keeps the choice but drops the colour, so the next start is white before the
+dark setup until the workbench's first dark colour resets it (read in the platform sources, not
+measured). The toolchain picker, the Toolchains screen, the extra key row and the error pages stay
+on the theme's dark colours, which their layouts are drawn for. The first start after updating from
+a release without this has no colour kept yet, and the editor's theme is then known only to the
+storage of the workbench page's origin, which no Android API reads. So `SplashActivity`, before
+setup runs, loads a page on that origin in a view of its own (`readSavedPageColor`), reads the
+colour of the splash the workbench saved there, and keeps it, and the setup screen and every screen
+after it take it. That start's own starting window is drawn before any of the app runs, from the
+manifest's theme, so it is dark. With `window.autoDetectColorScheme` on, a start after the device
+switched between light and dark while the app was closed begins on the colour from before.
+
+The view holds the last page's frame at a reload or a folder switch as well, and that frame is not
+the page the user saw. The workbench shuts itself down from its `beforeunload` listener, in one
+task: terminals are disposed, the `modern-ui` classes come off its container and the styles the
+terminal and the diff decorations added are removed, so the page falls back to its classic skin,
+with upper-case panel titles, and the extension host's contributions are gone. On an API 33
+emulator the view held that for about half a second after Developer: Reload Window and then went
+blank until the new page came. `injectLeaveCurtain` raises a full-window element in the page's
+background colour, the root's, from its own `beforeunload` listener, so the frame after the
+shutdown is the curtain whichever listener runs first; on the shipped build it runs ahead of the
+workbench's, 44 ms before `modern-ui` comes off. A leave the workbench vetoes (`vetoBeforeUnload`
+cancels the event with `preventDefault` and `returnValue`) lowers it in the next task, and
+`pageshow` lowers it for a page restored from the back-forward cache. A page with no background
+colour of its own gets no curtain, since a guessed dark one is a flash under a light theme.
+
+`beforeunload` also fires for a navigation that then never replaces the page. A link to `mailto:` or
+another scheme goes to another app, and a path on the editor's own origin that is not the workbench
+is refused. The workbench itself is untouched by those, since its opener assigns `location.href`
+inside `withExpectedShutdown` with the shutdown handling disabled, so only the curtain is left, and
+over a screen that answers nothing for as long as it stands. `VSCodroidWebViewClient` says so
+through `onNavigationDeclined` whenever `shouldOverrideUrlLoading` takes a main-frame navigation
+(handed away, or refused), `MainActivity.liftLeaveCurtain` dispatches `vscodroid-navigation-declined`
+into the page, and the script lowers on it: on API 33 the curtain stood for 11 ms over a `mailto:`
+link tapped in a Markdown preview with the workbench intact, and 58 ms over a scheme no app answers,
+where it had stood for the whole five seconds, the toast over a blank screen. A timer still lowers
+it after five seconds for anything the client never hears of.
+
+Cut every 50 ms from a recording of Developer: Reload Window, the intact page was followed at once
+by the plain colour on API 33, on API 36 with no hardware keyboard and on API 37, with no frame of
+the dismantled one. So it was for a reload started from outside the page (`Page.reload`, standing
+in for the app's own reload after a long time in the background) on API 36. With a veto the page
+behind the dialog was the intact one on API 33, and nothing was left on the root after "Stay on
+this page". `scripts/test-leave-curtain.js` runs the script against a stub page, and
+`LeaveCurtainWiringTest` holds it, and the three things in the shipped bundle it depends on, to
+the sources.
+
+### 4.2 Crash Recovery
+
+```kotlin
+// VSCodroidWebViewClient, and bootstrapClient() until that client is installed
+override fun onRenderProcessGone(view: WebView, detail: RenderProcessGoneDetail): Boolean {
+    Logger.e(tag, "Render process gone! didCrash=${detail.didCrash()}")
+    onCrash()    // MainActivity.recreateWebView()
+    return true  // false tells the framework to end the application process
+}
+
+// MainActivity.recreateWebView(), abridged
+val looping = crashLoopReached(webViewCrashes, SystemClock.elapsedRealtime())
+val lastUrl = wv.url              // the open folder, read off the dying WebView
+container.removeView(wv)
+wv.destroy()
+val newWebView = WebView(this)
+container.addView(newWebView, 0, LinearLayout.LayoutParams(MATCH_PARENT, 0, 1f))
+webView = newWebView
+bridgeInitialized = false         // so initBridge registers on the new WebView
+setupWebView()                    // bootstrap client and the loading placeholder
+if (looping) {
+    showRendererCrashLoop()       // see below
+    return
+}
+if (serverPort > 0 && nodeService?.isServerReady() == true) {
+    loadVSCode(serverPort, folderFromUrl(lastUrl), fromUrl = lastUrl)
+} else {
+    retryServerStart()            // a server still starting, or one that gave up
+}
+```
+
+**The reload half is bounded; the rebuild half is not.** `crashLoopReached` keeps the crash
+times in a window (`CRASH_LOOP_WINDOW_MS`, 60 s) and allows `CRASH_LOOP_CRASHES`, 3, inside
+it. A fourth still rebuilds the view, because the crashed one is documented as unusable and
+a resume path calls `reload()` on whatever the field holds, but it does not load the editor
+again: it shows a page saying the editor kept closing, whose only control
+(`vscodroid://reload-editor`) loads it and clears the record, so a deliberate attempt gets
+the whole budget back. The control is not the server retry the give-up page carries: the
+server here is healthy, so a second `startForegroundService` would answer `ALREADY_SERVING`
+and leave the page up for ever. Both counting and the record live on the Activity, since
+`recreateWebView` replaces the WebView and its client on every cycle, and a counter held
+there would be reset by the very event it counts.
+
+---
+
+## 5. Extra Key Row
+
+### 5.1 Layout
+
+Swipeable pages of at most eight items. Eight is a ceiling rather than a preference: the row
+divides itself exactly between its children, so sixteen on a 360dp portrait row leaves about
+18.5dp a key, well under the 48dp minimum touch target. Source of truth is
+`KeyPageConfig.kt`.
+
+**How many pages there are depends on the width of the phone.** `KeyPages.defaults` below is
+the layout for a row 411dp wide and up, where page 1's 8.5 shares (the trackpad claims one
+and a half) come to 48.4dp. `KeyPages.forSmallestWidthDp` repacks the same items, in the same
+order, whenever a page's share would put a key under `MIN_TOUCH_TARGET_DP`: five pages at
+411dp, six at 360dp, seven at 320dp, and the quick actions page below follows them as a page
+of its own at every width, so six, seven and eight in all. The argument is
+`smallestScreenWidthDp`, so rotating
+does not repack, but a drop into a narrow split-screen pane does, through
+`ExtraKeyRow.onConfigurationChanged`. The latched modifiers are carried into the new pages'
+adapter before it replaces the old one (`ExtraKeyRow.setupAdapter`): replacing it cancels a
+touch still on a key or the trackpad, that cancel can switch back a modifier a hold had
+switched (as below) or ends the drag, which spends the latches, and the row tells the page
+what it did.
+
+| Page | Contents at 411dp and wider |
+|------|----------|
+| 1 | Tab, Esc, Ctrl, Alt, Shift, the gesture trackpad, `{}`, `()` |
+| 2 | `;` `:` `"` `/` `\|` `` ` `` `&` `_` |
+| 3 | `[` `]` `<` `>` `=` `!` `#` `@` |
+| 4 | F1 to F8 |
+| 5 | F9 to F12, Home, End, PageUp, PageDown |
+| 6 | Quick actions: F1, Ctrl+P, Ctrl+`, Ctrl+B, Ctrl+J, Ctrl+S |
+
+On a 360dp phone page 1 ends at `{}` and `()` opens page 2; on a 320dp phone page 1 is Tab,
+Esc, Ctrl, Alt, Shift and the trackpad, with both bracket keys on page 2. The indicator under the
+row is where a user reads the real count, and it speaks the same thing: "Key page 1 of 6",
+with the latched modifier appended while one is held.
+
+Page 6 is not typed text. Each of its keys is a `KeyItem.Button` with `fixedModifiers`, and a
+tap sends its `value` as an announced DOM keystroke (`KeyInjector.announceKeystroke`, the route
+Tab and the function keys take) with exactly those modifiers: `pressModifiers` ignores whatever
+the row has latched, and `resetModifiersIfNeeded` clears the latches afterwards as for any key.
+The bindings are the 1.139.1 workbench's defaults: F1 (Show All Commands), Ctrl+P (Go to File),
+Ctrl+` (Toggle Terminal), Ctrl+B (Toggle Primary Side Bar), Ctrl+J (Toggle Panel) and Ctrl+S
+(Save). They are announced at the page's body (`toWorkbench`, set by `sendKeyPress` for a key
+with `fixedModifiers`) and not at the focused element, because the terminal passes the
+workbench only the commands on its skip list and turns every other key into shell input: F1,
+Ctrl+P, Ctrl+` and Ctrl+J are on it, Ctrl+B and Ctrl+S are not. The workbench's listener on the
+window resolves a key at the body in its root context, so all six run with a terminal focused,
+and a Ctrl latched on page 1 and a letter still go to the focused element. That is read from the
+1.139.1 workbench's terminal key handler and keybinding service and has not been run on a
+device. Six keys, not eight: six claim six shares of the row and fit one page down to 288dp,
+where eight need 384dp and would pack as seven and one on a 360dp phone. The page is therefore
+packed on its own by `KeyPages.forSmallestWidthDp` and never poured into the run of key pages.
+
+Ctrl, Alt and Shift latch rather than repeat. The bracket and parenthesis keys insert only the
+opening character, because Monaco closes the pair and places the caret inside. Several keys carry
+long-press alternates, which `KeyPageConfig.kt` lists beside them; `)` is on the `()` key's
+list because no other route on the row reaches it, since `shiftedForm` leaves `(` unchanged
+and `)` sits on a digit key no page carries. Only those keys and the three modifiers
+have a long press (`ExtraKeyButton`'s touch listener turns the `GestureDetector`'s on or
+off at each touch), and the row dismisses an open popup when the pager starts a drag. A
+modifier's long press switches the latch while the finger is still down, so what is
+typed during the hold meets it as it would after a tap, and a touch that then ends in a
+cancel switches the latch back: the pager taking the drag, the system cancelling the
+gesture, or a repack removing the key under the finger. Not while another finger is on the
+row, which `ExtraKeyRow.dispatchTouchEvent` counts: the pager drags with the finger that
+went down last and cancels every key under a finger when it takes the drag, so the cancel
+can be that finger's swipe, and Ctrl held with one thumb while the other swipes to F5 has to
+stay latched for Ctrl+F5. Nor once the row has stood down during the touch: the keyboard
+going away hides the row and clears every latch, but going GONE sends the key no cancel, so
+the finger can still slide and the pager take the drag, and its cancel would latch a
+modifier on a row that is gone. The stand-down drops what each hold would put back
+(`KeyPageAdapter.dropPendingRestores`). Every other key presses on release, and only if the
+finger never left the touch slop around where it landed, so a swipe the pager takes presses
+nothing, and so does a long hold that drifted. The detector has no double-tap listener, so
+two quick taps are two presses.
+
+There are **no discrete arrow buttons anywhere on the row.** The gesture trackpad replaced them and
+emits arrow keys as the finger moves (`TrackpadGesture.accumulate`). A drag is the only route for a
+finger, and it was the only route of any kind until the pad gained four accessibility actions, one
+per direction (`ARROW_ACTIONS`, registered in `GestureTrackpad`'s initialiser). Those are what an
+assistive input that cannot drag uses; each sends one arrow and then ends the drag, so a latched
+modifier clears exactly as it does on an ordinary key.
+
+### 5.2 Key Injection
+
+`KeyInjector.injectKey` has three routes, chosen by `isTextEntry` and `NAVIGATION_KEYS`
+(both in `TextEntry.kt`). No snippet is reproduced here: this section carried one for a
+long time, it drifted from the signature, the event pair and the quoting all at once, and
+a stale copy of the code is worse than a pointer to it. `KeyInjector.kt` is the source of
+truth.
+
+**Characters are typed.** A single ASCII character in `0x20..0x7E` pressed with no Ctrl,
+Alt or Meta goes through `typeCharacter`, which asks `KeyCharacterMap.VIRTUAL_KEYBOARD`
+for the presses that produce it and dispatches them at the WebView as real Android
+`KeyEvent`s. The map supplies Shift itself where the character needs it, so no table of
+shifted forms is written by hand. This route exists because a `KeyboardEvent` constructed
+in the page is untrusted: listeners run, no default action is performed, and the
+character is never inserted. That is what made `{`, `;` and `"` do nothing at all.
+
+**Navigation keys are pressed.** The trackpad's Left and Right (a drag or one of the
+`ARROW_ACTIONS`) and the row's `Home`, `End`, `PageUp` and `PageDown` go through the same
+dispatch as real `KeyEvent` pairs, with any latched Ctrl, Alt or Shift as meta state, so
+they move the caret and select in text boxes and reach extension webviews, where an
+announced key did nothing. Each carries the evdev scan code a hardware keyboard sends,
+because Chromium derives `KeyboardEvent.code` from it, and Home and End use
+`KEYCODE_MOVE_HOME`/`KEYCODE_MOVE_END`, not the system Home key. Each latched modifier then
+comes up as a real `ACTION_UP` of its left-hand key, in the same dispatch
+(`modifierReleases`): the row's modifiers are latches, so without it the page saw a
+modifier go down and never come up, and the workbench, which tells its toolbars about a
+modifier only when one goes down or comes up, left the editor's split button on Split
+Editor Down after Alt+Left. Chromium sends that release to whatever has focus, and the
+modifier interceptor stops it at the window (below). A press the WebView refuses falls
+back to the announce route. A real arrow turns WebView spatial navigation on
+until the next touch on the page, so a Left or Right that leaves a collapsed caret at the
+start or end of a text box would move focus out of it. A guard installed with the modifier
+interceptor cancels such a press when none of the box's own handlers used it. It decides
+on the box itself: a capture `keydown` listener on the window adds a listener for that key
+to the event's innermost target, which runs after the box's own listeners and before the key
+bubbles to any container, so a box or container that calls `stopPropagation` on the key in
+the bubble phase, as the Problems, Output, Debug Console and Comments filters and the chat
+model picker's filter do, cannot hide it. A zero timeout removes that listener once the key
+is over, because a box that stops the key before it, as the terminal's textarea does with
+every arrow in its capture listener, never runs it. A number or email box has no selection
+API, so its caret cannot be read and every unmodified Left and Right there is cancelled.
+Before Chromium 149, Blink on Android has no command for Alt+Left or Alt+Right, so the press
+reaches spatial navigation wherever the caret is; below 149, read from the user agent, the
+guard cancels it in any text box and on the editor's EditContext host. From 149 they move
+to the start and end of the line, which Blink counts as handled even where the caret
+already is, and the guard leaves them alone. Spatial navigation ignores an arrow held with
+Ctrl, Shift or Meta and acts on no key but the four arrows, so Home, End, PageUp and
+PageDown need no guard. It reaches the workbench document only, not a text box inside an
+extension webview. `ExtraKeyRow` sets `FOCUS_BLOCK_DESCENDANTS`, because an arrow the page
+leaves unused makes the WebView hand Android focus to the nearest focusable view, and
+ViewPager2's RecyclerView is one.
+
+**Everything else is announced.** A key that names a command rather than a character
+(`Tab`, `Escape`, `F7`), the trackpad's Up and Down, and any character held with Ctrl, Alt
+or Meta, is sent as a `keydown`/`keyup` pair built by `evaluateJavascript` at
+`document.activeElement`, since that is what the workbench resolves its key bindings from,
+followed by a `keyup` for each modifier it carried, at the same element; the modifier
+interceptor's chords from the soft keyboard end the same way. No modifier `keydown` is sent,
+at the latch or later: a latch undone would then read as Alt pressed and released alone,
+which focuses the menu bar. The interceptor stops every keyup of a modifier that had no
+keydown, which is what the row's releases are by either route, at the window's capture
+phase. The workbench reads which modifiers are held from capture listeners there
+(`ModifierKeyEmitter`), so it still hears them. A quick pick opened with quick navigate, as
+Ctrl+Tab's recently used editors are, does not: it accepts on a modifier's keyup in its own
+container. Opened in the Command Palette it keeps the palette's input box, and with it the
+focus, the keyboard and the row, so a Ctrl+Tab from the row is typed inside that container
+and its release would open the highlighted editor at once instead of leaving the list for
+the next Ctrl+Tab. Opened from a file it focuses its list, and the keyboard goes down with
+the row, since Chromium hides the keyboard whenever focus leaves an editable element. A
+keyboard's own release follows the keydown of the same key and goes on: the two are paired
+by `code`, so each of two Shifts held at once comes up.
+Tab stays here because a real one moves focus, and the Explorer's rename and New File boxes
+commit the typed name when they lose it; Escape because under spatial navigation an
+unhandled real Escape blurs the focused element. Up and Down stay because they are the
+quick pick's list keys: a real key pressed while the soft keyboard composes a word carries
+`isComposing`, and the workbench dispatches no keybinding for it, so the Command Palette
+highlight would stop moving. PageUp, PageDown, Ctrl+Home, Ctrl+End and Right, which the
+quick pick binds as well, are pressed for real anyway, because their default is what a text
+box and an extension panel need, and the page lets them reach the quick pick's bindings
+while a word composes (below). With no real vertical arrow sent, spatial navigation never
+gets one either, and Blink's editing on Android has no command for Alt+Up or Alt+Down,
+which would otherwise leave a text box wherever the caret sat. Values going into that
+script are escaped by `KeyMapping.jsQuote`.
+
+A latched Shift is resolved before the split, by `KeyMapping.shiftedForm`, because it
+changes which character is typed rather than whether it is typed. If `typeCharacter`
+cannot produce a press on the layout in force it returns false and the announce route
+runs instead; that preserves the keystroke but still inserts nothing, and it logs a
+warning rather than a debug line so the case is visible in a release build.
+
+A latched Ctrl or Alt reaches what the soft keyboard types through the modifier
+interceptor (`KeyInjector.setupModifierInterceptor`), which cancels a `beforeinput` of one
+character and sends the chord in its place. On the EditContext path the soft keyboard sends
+no such event: Chromium reports what it composes or commits to the EditContext object, and
+the editor's own `textupdate` listener types it first, as Gboard 18.4.1 showed on an API 36
+emulator for a committed letter and Gboard 12.4, which composes every word, on an API 33
+emulator. So while Ctrl or Alt is latched the focused EditContext host is lent an empty
+EditContext of the interceptor's own, after any word still composing is ended. A character
+composed or committed into it reaches the `beforeinput` listener as the event it never got;
+Gboard 12.4 committed rather than composed over the empty EditContext on that emulator.
+Either way the chord is sent first and the editor's EditContext is then given back, and while
+the host keeps focus it is blurred and focused again, which restarts input. Without that the
+keyboard went on from its own copy of the text, which held the chord's letter: on that
+emulator `ab`, Ctrl, `s` (the file saved) and `c` left `ababsc`, and with Gboard 17.7.4 on
+an API 37 emulator the suggestion strip went on offering `s` after Ctrl then `s` at the start
+of a line. Clearing the latch, spending it and focus leaving the host give the EditContext
+back too, focus leaving only once it has left: Blink deactivates the EditContext an element
+has when the focus change is done, so one given back during `focusout` left the empty one
+active, and after Ctrl then `p` what was typed in Quick Open went into it, leaving the box
+empty. A Backspace finds nothing to delete in the empty EditContext, so the keyboard
+sends it as a key press, which is turned into the delete edit the listener makes
+Ctrl+Backspace of. Text committed in one piece while the latch is on, a suggestion chip
+say, has no chord and is lost with the empty EditContext.
+
+The soft keyboard's own Enter is handled in the page by `MainActivity.injectComposingEnter`.
+A composing Enter is replaced with one the workbench recognises, and a non-composing Enter
+that arrives with an empty `code`, as Gboard's action key does in a one-line box, is given
+the `code` `Enter`, because keybindings resolve from `code` and the Command Palette, Quick
+Open and input boxes accept only through one; with Ctrl or Alt latched it is left empty so
+the modifier interceptor can still build the chord from the `beforeinput` that follows. With
+Shift alone latched the latch is spent there, because the interceptor spends a lone Shift in
+that `beforeinput` and an Enter a binding accepts has none. It is not applied, which is the
+interceptor's rule for a lone Shift, and applied it would change the key: on Shift+Enter
+Quick Open does not open the highlighted file but adds it to the last focused chat input,
+and on Gboard 12.4, whose editor Enter is filled too, Enter in a Python file would run the
+line in the terminal.
+
+The same script clears `isComposing` on a real PageUp, PageDown, Ctrl+Home, Ctrl+End or
+Right pressed in the quick input while a word composes. The workbench dispatches no
+keybinding for a composing key, and in the quick input those keys work only through one:
+they page the list, go to its first and last item, and open Quick Open's highlighted item
+without closing it. Every other target keeps `isComposing`, because there the key's default
+does the work. An editor inside the quick input, such as Quick Chat's, keeps it too, like
+any other editor.
+
+A letter typed on the soft keyboard with Ctrl or Alt latched is made a chord by the modifier
+interceptor (`KeyInjector.setupModifierInterceptor`) from the `beforeinput` the letter fires,
+which it cancels. A keyboard that composes, as Gboard 12.4 composes every word, reports a
+letter in a text box as `insertCompositionText`, which cannot be cancelled. So when such an
+update adds one character with a key to the composition in an `input` or `textarea`, the
+terminal's included, the interceptor keeps its `beforeinput` and `input` from the box's own
+listeners and, in the next task, puts back the box's text and selection as they were before
+the character, if nothing changed them in between, which also ends the composition, and makes
+the chord from the character. The word composed before it stays. The terminal sends a
+composition only once it ends, in a zero timeout, reading it back from its textarea, which it
+empties on blur. So in the terminal alone the composition is first ended with a blur and a
+refocus, and the chord waits a task for that send: Quick Open, a chord the terminal hands to
+the workbench, takes the focus at once, and would leave the send an empty textarea. The
+chord of every letter in the terminal waits that task, a committed letter's too. A
+keyboard that commits, as Gboard 18 commits each letter, sends a keydown of key code 229
+first, on which the terminal reads its textarea back in a zero timeout and sends what
+changed; a chord that emptied the textarea before that read had it send a delete, and `ab`,
+Ctrl and `p` left `a` at the prompt. No other box is blurred: the debug view's inline boxes,
+the terminal tab rename box and the Ports view's commit what they hold when they lose the
+focus, the letter included, and close. On the EditContext path no `beforeinput` reaches the
+element, so the editor makes no chord of a soft keyboard letter. The editor's own textarea,
+which reads compositions itself, is left alone, and so is an `input` with no selection API,
+such as an email box, whose selection could not be put back: each keeps a composed letter,
+and the latch is spent.
+
+A key or a touch that moves the editor's caret while the soft keyboard is still composing a
+word ends that composition. Chromium keeps an EditContext composition's range where it was
+when the page moves the selection (crbug 379170477), so a keyboard that recomposes the word
+at the new caret wrote it over the old range, and End, a trackpad drag, accepting a
+suggestion or a tap elsewhere garbled the line. `MainActivity.injectKeyboardGuard` blurs and
+refocuses the composing host in the same task as the caret move, from a window capture
+`keydown` listener for the arrows, Home, End, PageUp, PageDown, Tab, Backspace and Delete,
+and from the editor's own `-monaco-gesturetap` and `-monaco-gesturecontextmenu`. It does so
+before the editor handles the key or the tap, except where an open suggestion list takes a
+key without modifiers, or a tap. Up, Down, PageUp and PageDown that move the list's highlight
+end nothing, and Tab accepting the highlighted suggestion or a tap on a row end the
+composition after the list has acted, because ending a composition makes the editor
+refilter the list and highlight its first row again. With no list open, a quick suggestion
+can still be pending when a cursor key moves the caret, scheduled 10 ms after the last letter
+typed or the end of a composition that typed, patch 0025 scheduling none for one that typed
+nothing, and it opens the list wherever the caret then ends a word. Patch 0023 cancels it when
+a cursor key moves the caret; without it, End on a line ending in an identifier, or a trackpad
+drag down onto one, opened the list there, and Enter then accepted a suggestion instead of
+starting a new line. The word is committed as typed, so on a Japanese keyboard the kana are
+committed unconverted. A caret moved by a command, such as Undo, Find or Go to Line, is not
+covered.
+
+Gboard 12.4 also sends Enter as a key press when the caret is inside an underlined word or at
+its start, as after a tap on the word or Home, and at once recomposes the word after the
+caret at the offsets of its own copy of the text: the old line with a line break at the
+caret. The editor's EditContext buffer used to restart at the new line, so that range fell on
+other characters, and a tap inside `alpha1` in `const alpha1 = 1, alpha2 = 2` followed by
+Enter left `ha1 = 1, aha1a2 = 2` on the new line. At column 1 the buffer did not change at
+all, so the keyboard was never told, and its next Backspace deleted nothing. Patch 0024, on
+Android, keeps the buffer's start after an edit the keyboard made, so the line break it typed
+stays in the buffer and a Backspace it sends for that line break joins the lines. Where text
+follows the caret it starts the buffer instead where the caret sits at the offset the
+keyboard expects, so the recomposition lands on the text after the caret whatever
+indentation the editor added. It does that only there, because the keyboard's copy of the
+text before the caret then lacks the indentation and nothing tells the keyboard: moving the
+start at the end of a line as well, measured, let Gboard recompose a word over other
+characters after Enter at the end of an indented line, and three Backspaces turned `alpha1;`
+into `alphalpha`. With the start kept, the indentation moves the caret off the offset the
+keyboard expects, and it reads the text again. A selection the keyboard sets without changing
+any text, as Gboard does for a space bar swipe and before it commits a suggestion, goes where
+the keyboard asked, on whichever line of the buffer that is, as a cursor key moves the caret,
+and the buffer keeps its start and its end. The keyboard goes on from its own copy of the
+text as if its selection had landed: with the caret moved only along its line, a swipe past
+the start of a line typed after Enter left Gboard 12.4's own caret at the end of the line
+above, and on an API 33 emulator it wrote the word there, `one`, over `alph`. So the caret
+follows the swipe into the line above, as in a text box, and the buffer keeps the lines after
+the caret's, which the keyboard's copy holds, until the next tap, cursor key or command. What
+the keyboard replaces reaches across the line breaks the buffer holds, after the caret as well
+as before it. A Backspace the keyboard sends as a key press, as Gboard 17.7 and 18.4 do, keeps
+the buffer as it is too, from the press to its release, because the keyboard counts the
+character in its own copy: reset as after a command, the buffer dropped the lines a swipe into
+the line above had kept while the caret moved where the keyboard expected, and on an API 37
+emulator the next suggestion Gboard 17.7.4 committed for the line below was written over the
+line above, `gama` becoming `gabra `; with the buffer kept, the same steps replaced only the word
+on the line below.
+Several cursors become one, as they do on the textarea input. Moved as a cursor key moves it,
+the caret also takes an open suggestion list along: the list is refiltered at the new caret
+and closes once the caret leaves the word, where a move made as typing would leave it open for
+Enter to accept a suggestion at the new caret. Every other cursor change, and every edit and
+selection on other platforms, starts the buffer at the caret's line, as upstream does.
+
+A keyboard hears of a selection that moved and of nothing else, because Android passes a
+selection on only when it changed. So a buffer rewritten with the caret at the offset it had
+left the keyboard on the text it had: on an API 36 emulator with Gboard 18.4, after Tab
+accepted `delta` over a `d` typed on a new line, the strip went on offering `do`, which made
+the line `deltao `, and after a tap from the end of `delta` to the end of `alpha` on another
+line its `Delta` replaced `alpha`. The tap route comes from upstream's per-line buffer and the
+Tab route from the start kept after Enter. On Android patch 0024 therefore keeps what the
+keyboard knew before the first rewrite of a task that is not an edit or a selection of the
+keyboard's, and once the code that rewrote the buffer has returned, still in the same task,
+restarts input if the text then differs from it and the selection does not: the editing host
+is blurred and focused again with the editor's focus tracking paused, and the keyboard reads
+the text again. Decided at the end of the task, an accepted suggestion or a paste, which
+rewrites the buffer before the caret moves, restarts nothing. It costs a restart at each tap,
+cursor key or command that leaves the caret at the same offset of another line, column 1
+included, at each command that rewrites the caret's line without moving the caret, such as a
+forward Delete and its undo, and at each edit made after the caret on its line in a later
+task, as linked editing makes while a tag is typed, or a replacement before the caret by text
+as long; an edit before the caret that changes its length moves the caret's offset, which the
+keyboard is told of, and restarts nothing. The keyboard guard keeps a
+keyboard that is up across that blur and focus (below). Text the editor adds inside an edit
+of the keyboard's, such as an auto-closed bracket or quote, restarts nothing, because that
+rewrite counts as the keyboard's own, so the keyboard's copy goes on without it, as before
+(read from the code).
+
+Patch 0025 changes how the editor's suggestions meet a composition. A composition counts as
+typed only when its last caret move was typing, so the word Gboard underlines under a tap,
+by rewriting it with itself, opens no suggestion list when the keyboard is put away, and the
+end of such a composition checks no trigger character either.
+
+A touch on another part of the workbench, an activity bar icon or a status bar item, leaves
+focus in the editor on Android, because the workbench's touch gestures cancel the events that
+would move it, so the blur that ends a suggestion session on a desktop never comes. A list
+stayed open over the view the touch opened, and the next tap there accepted a suggestion into
+the file: with Gboard 12.4 on an API 33 emulator, `hello world` became `hello
+WebTransportDatagramDuplexStream` from a tap meant for a file in the Explorer. The keyboard
+guard puts the keyboard away at such a touch (below), which ends a word still underlined, and
+the end of that composition would arm a quick suggestion (read from the code). On Android patch
+0025 ends the session on a `pointerdown` outside the editor and its overflow widgets, a request
+still out or a quick suggestion still pending included, and the composition the keyboard then
+ends counts as one that typed nothing, so its end arms nothing either. A list left open when
+the keyboard is put away with Back, which no touch precedes, stays until a tap, as before.
+
+The same script decides when the soft keyboard comes up for the editor. It holds it down
+with `inputmode="none"` on the editor's editing host and lets it up only for a tap on text,
+anywhere inside an editor or a terminal or in a text box, decided at `pointerup` so that a
+drag to scroll never raises it; text boxes themselves are not held. The terminal's helper
+textarea is held like the editor's host, so a terminal focused from a tap outside text, its
+tab in the panel say, opens with the keyboard down until it is tapped; left out, as it was,
+the terminal kept the keyboard up over the view an activity bar icon opened, with typing
+going to the shell, and after Back the same icon raised it again. Typing with the keyboard up
+counts as a tap on text, in a text box as in an editor, so a terminal that Enter opens from the
+Command Palette, or a file from Quick Open, keeps the keyboard up when the palette was opened
+from a menu: held there, as after the tap on the menu, the keyboard went down under a terminal
+opened to be typed into. A file not open yet goes through a gap first: Quick Open's Enter takes
+the old editor's host away while the file loads, and Enter in the Explorer's New File box
+leaves focus on the Explorer's list, and Chromium takes the keyboard down there. A keyboard
+reported down while nothing that takes text has focus clears nothing a tap or typing counted,
+so the new editor's focus raises it again, as it did on API 33 and 37 emulators; read as put
+away, it left the file held with the keyboard down on API 33, 36 and 37 emulators. The test is
+what has focus, so Back while an extension's webview, an iframe, has focus is read the same
+way, as is the keyboard Chromium takes down when a terminal that was typed into goes away, and
+an editor focused next without a touch can raise it (read from the code). A host blurred and
+focused again in one task, as patch 0024 and the key row restart input, keeps a keyboard that
+is up: that focus holds nothing, though the touch before it was outside text and left the
+keyboard up, a drag on the activity bar, a long press or a button that opens a menu, because a
+hold written at that focus would take the keyboard down on a phone (below). It takes off a hold
+already on the host, which a keyboard put away and then raised by a touch inside the delay
+below leaves, and the composition finish takes such a hold off too; that hold reached Chromium
+when it was written, so a restart that meets it changes no input mode. A hold the focus handler put
+on with the keyboard up, to take it down, stays until the keyboard is reported down or a tap on
+text lets it up. A tap anywhere inside an editor counts, the margin and the space under the
+last line included, because the editor moves the caret there. When the keyboard goes away, by
+Back, the navigation bar's hide key or anything else, `ExtraKeyRow`'s inset listener reports
+it and `window.__vscodroidKeyboardDismissed` puts the hold back, so the next scroll of the file
+leaves it down; without that the host kept no `inputmode` and Chromium raised the keyboard
+again for any touch on it. A keyboard reported down while nothing
+that takes text has focus is taken as one Chromium took down as focus left text, and the hook
+keeps what a tap or typing counted (above).
+
+With the keyboard up, `inputmode="none"` on the focused host takes it down only where no
+hardware keyboard is attached: Chromium's `ImeAdapterImpl.updateState` hides the keyboard when
+the focused element's input mode turns to none unless the configuration reports a keyboard,
+and every emulator these flows were measured on does (`hw.keyboard=yes`, `qwerty` in its
+configuration). There a tap on an activity bar icon, which leaves focus on the editor's host,
+left the keyboard over the Explorer, and over the Search view with typing still going to the
+file. On a phone the hold took it down instead, over anything but a word still composing, and
+for every touch outside text: a drag, a long press and a button that opens a menu as well
+(read from Chromium's source, not measured on a phone). So while the keyboard is up a touch
+outside text leaves the focused host without the hold, and after a tap outside text that
+leaves an editing host focused the script asks for the keyboard down with
+`navigator.virtualKeyboard.hide()` under a manual `virtualKeyboardPolicy`, which goes back
+to auto when the keyboard is reported down, on the next tap on text, after a second, or when
+another host is asked; the dismissal hook then holds the host. The hook is not called at
+the report. A turn of the phone reports the keyboard hidden with the change of configuration
+and visible again 150 to 650 ms later, and on an API 36 emulator with `hw.keyboard=no`, which
+reports no keyboard as a phone does, the hold the hook writes at the first report took the
+keyboard down at the turn to landscape and kept it down, where with the hook replaced by a
+function that did nothing it stayed up. `KeyboardDismissal` therefore calls the hook half a
+second after the report, and not if the keyboard is visible by then or the configuration
+changed within two seconds. A scroll inside that half second can raise a keyboard put away
+with Back, as it did before the hold existed. A tap is the script's own test,
+12 CSS px and 500 ms, or a tap by the workbench's touch gesture, which the activity bar, the
+status bar and the tabs act on and which is looser, under 700 ms within 30 px on each axis:
+with only the script's test, a touch on the Search icon that slid 20 px, or a press of 620 ms
+on the Explorer icon, opened the view with the keyboard left up and typing going to the file,
+on an API 33 emulator, and with the gesture's tap counted the same touches took it down there
+and on an API 37 emulator. A button that opens a menu, marked `aria-haspopup="true"` as the
+views' and the editor's More Actions, Accounts, Manage and the Application Menu are, is left
+alone, because the keyboard going down resizes the window and the menu closed with it; so is
+a touch whose target has left the page, the block of a menu that a tap outside it has just
+closed. A read-only editor never lets it up: its EditContext host
+carries `aria-autocomplete="none"`, which the editor writes while it is read-only, so with
+File: Toggle Active Editor Read-only in Session a tap only moves the caret;
+`files.readonlyInclude` reaches the same editor option (read from the bundle, not
+measured). That marker is an accessibility attribute rather than an API. The Output panel's
+own `setAriaOptions` call runs before its editor has a model and writes nothing, so the
+Output editor is held too (read from the bundle, not measured). On the textarea edit path
+the marker is written only when the host is created, so that path is not gated and a
+read-only editor behaves there as before.
+
+The light bulb's Code Action list takes focus from the editor as it opens, so Chromium takes the
+keyboard down, and the window growing under the list changes the editor's layout, on which
+`CodeActionController` hides the list: with the keyboard up the list was on screen for about 40 ms
+on an API 33 emulator with Gboard 12.4. On Android patch 0028 keeps the list across a change of
+the editor's height alone; a change of width, as a turn of the phone makes, still closes it. With
+it the list stayed open while the keyboard went down on API 33, API 36 with no hardware keyboard
+and API 37 emulators, a tap on a row ran it, a tap outside it closed it and brought the keyboard
+back, and a turn to landscape closed it (API 33 and 36).
+
+A keyboard that pastes from its own clipboard, as the suggestion strip of Gboard does, commits the
+text in one piece, and `NativeEditContext` typed it: `viewController.type` runs every character
+through the typing handlers, so 4720 characters of code held the page for 1.1 s on an API 33
+emulator with Gboard 12.4, and every line break was indented again on top of the indentation the
+text already carried (five lines of nested braces, four spaces apiece, came out at 8, 16 and 20).
+On Android patch 0029 hands a plain commit of more than 64 characters, or of any text with a
+line break before its end, to `viewController.paste`, which inserts it in one edit and leaves it
+as it is: the same paste took 3 ms and the braces arrived unchanged. One character, an Enter, a
+composition and a word committed together with the Enter after it are untouched, since that is
+typing and Enter has to indent. A DOM paste event, which Ctrl+V and the long-press Paste use,
+never took this path.
+
+### 5.3 Visibility Control
+
+The row decides whether to show in one place, the inset listener installed by
+`ExtraKeyRow.setupWithRootView`, and shows only when all four hold: the soft keyboard
+is visible, the page has height to spare (`suppressedForHeight`), the user has not
+hidden it (`hiddenByUser`, which `MainActivity` persists under `extra_key_row_hidden`
+and flips through **VSCodroid: Toggle Extra Key Row**), and no character has been
+typed on a hardware keyboard since a finger last left the screen
+(`hiddenForHardwareKeyboard`, which is not persisted). Any new reason to hide it
+belongs in that decision rather than in a direct write to `visibility`, because the
+branch that hides it also dismisses the long-press popup and clears a latched
+modifier. No snippet is reproduced here, for the reason 5.2 gives.
+
+`MainActivity.dispatchKeyEvent` hands the key to the view tree first and only then
+looks at it (`HardwareKeyboardTest` pins that nothing takes a key from the page), and
+`HardwareTyping` decides what counts: a key that types a character, from an alphabetic
+keyboard that is not the virtual one. That leaves out the soft keyboard's own keys,
+the row's, a modifier held for a tap, Escape, the arrows and Enter, the volume and
+power keys and a game controller. The first key that counts resizes the page by the
+row's height, which closes a context menu opened by touch, so the keys used to steer
+are not among them. `dispatchTouchEvent` gives the row back when a finger lifts from
+the touchscreen, after the touch was delivered, and ignores a mouse or a touchpad,
+which is how someone at a hardware keyboard places the caret. At the lift and not at
+the first contact, because the row takes its height out of the page and a tap is
+placed on the page as it is when the finger leaves: with the row back at the first
+contact the bottom of the page, the status bar and the terminal, moved up from under
+a finger that was still down. Running **Toggle Extra Key Row** to show it, and
+`onConfigurationChanged` reporting no keyboard (a Bluetooth one asleep or unpaired),
+give it back as well. On an API 33 emulator with a keyboard made through `uinput` and
+the soft keyboard up, the page was 439 CSS px high with the row, 514 after a letter,
+439 after a tap of the screen, 514 after the next letter and still 514 after a mouse
+click.
+
+---
+
+## 6. Patch System
+
+### 6.1 The Patch Set
+
+The Android adaptations are unified diffs against readable Code - OSS source, numbered so that the
+order they apply in is fixed. They live in `patches/`, one file each:
+
+```mermaid
+flowchart TD
+  P["patches/"] --> P1["0001 platform: treat Android as Linux"]
+  P --> P2["0002 user data path: accept Android"]
+  P --> P3["0003 Pty Host as a worker_thread"]
+  P --> P4["0004 Extension Host as a worker_thread"]
+  P --> P5["0005 webview: disable the service worker, relax its CSP"]
+  P --> P6["0006 OAuth callback relayed into the app over intent://"]
+  P --> P8["0008 activity bar overflow sized from live height"]
+  P --> P9["0009 marketplace: request the alpine target on Android"]
+  P --> P10["0010 .moduleignore: keep the Copilot SDK entry"]
+  P --> P11["0011 brand the web walkthrough"]
+  P --> P12["0012 serve /callback before the connection-token check"]
+  P --> P13["0013 shorten the reconnection grace when a client is connected"]
+  P --> P14["0014 menus: dismiss a submenu only on a real scroll"]
+  P --> P15["0015 menubar: stay open when only the keyboard resized"]
+  P --> P16["0016 sidebar: sash travel on narrow viewports"]
+  P --> P17["0017 menus: ignore a pan that started in a submenu"]
+  P --> P18["0018 debug terminal: build the command without /usr/bin/env"]
+  P --> P19["0019 each sign-in identity is registered with the app when the workbench mints it"]
+  P --> P20["0020 chat agent host: not started on Android"]
+  P --> P21["0021 terminal hint: no Copilot CLI line on Android"]
+  P --> P22["0022 EditContext: keep the IME buffer and caret in step"]
+  P --> P23["0023 suggest: drop a pending quick suggest on a caret key"]
+  P --> P24["0024 EditContext: keep the buffer where the keyboard expects it"]
+  P --> P25["0025 suggest: only from compositions that typed; a touch elsewhere ends it"]
+  P --> P26["0026 configuration: keep a folder's cached settings until its file is read"]
+  P --> P27["0027 configuration: start a remote workspace from the settings the page read"]
+  P --> P28["0028 code actions: keep the list open as the keyboard goes"]
+  P --> P29["0029 EditContext: a keyboard's long or multi-line commit is one paste"]
+  P --> P30["0030 activity bar: overflow sized from the height an item is drawn at"]
+  P --> P31["0031 File > Open Folder offers the system folder picker"]
+  P --> P32["0032 settings list and modal editor shrink to a phone-width window"]
+  P --> P33["0033 title bar and status bar put away while the keyboard is up in landscape"]
+  P --> P34["0034 bottom panel taken out of the layout while the keyboard is up in landscape"]
+  P --> P35["0035 claim device-folder copies before filesystem access"]
+  P --> P36["0036 exit when the editor cannot bind its listener"]
+  P --> P37["0037 retain current configuration and extension-host startup state"]
+  P --> P38["0038 publish resource roots from every active workspace member"]
+  P --> P39["0039 authenticate the editor listener with a private run challenge"]
+  P --> P40["0040 wrapped terminal links highlighted within each physical row"]
+  P --> P41["0041 horizontal panels kept within a narrow viewport"]
+  P --> P42["0042 configuration: tolerate non-list folders in a workspace file"]
+  P --> P43["0043 server: serve only regular files from serveFile"]
+```
+
+Five of these are load-bearing in ways their titles understate:
+
+- **0001 and 0002 are the platform pair.** Node on Android reports `process.platform === "android"`
+  and VS Code only ever compares against `"linux"`, so `isLinux`, `isWindows` and `isMacintosh` are
+  false at once and every Linux-shaped decision falls to an untested default. 0002 exists separately
+  because `doGetUserDataPath` switches on `process.platform` directly, where the default arm throws
+  `Platform not supported` and kills the Pty Host during construction.
+- **0003 and 0004 take the two long-lived forks off Android's phantom-process budget.** Threads are
+  not processes. `bootstrap-fork` installs `process.send` over `parentPort` on the worker side, so
+  the module inside still sees the IPC channel it was written against. The Extension Host needs more
+  than the Pty Host does, because it is handed the client's socket over IPC and a worker has no
+  channel that can carry a handle; it takes the route upstream already uses on Windows, where the
+  host connects back over a pipe and the server bridges the two sockets itself.
+  0004 carries a second half for that reason, in `extensionHostProcess.ts` beside the server-side
+  `extensionHostConnection.ts`: upstream ends the host's pipe socket when the client's socket
+  closes and the host treats that as a shutdown, so on this path every dropped WebSocket killed
+  every extension while the workbench still looked healthy, which one to five minutes in the
+  background is enough to produce. The pipe server now keeps listening, the host redials it and
+  redoes the handshake (`beginAcceptReconnection` / `endAcceptReconnection` / `sendResume`), and
+  the accepted socket is paused while no client is attached so nothing is written to nobody.
+- **0009 depends on 0001.** The marketplace target selector tests `isLinux` before it tests Android,
+  so without 0001 the CLI-bearing extensions are served the glibc build, which cannot start in an
+  app process: glibc's `__tls_init_tp` calls `set_robust_list` and `rseq`, Android's app seccomp
+  filter rejects both, and the process dies with SIGSYS before `main()`. The coupling is read out
+  of the packaged bundle rather than inferred from the patch text: in `out/server-main.js` the
+  selector is `if(!qe)return!1;if(N1)return ...`, and the aliases resolve to
+  `qe = platform==="linux"||platform==="android"` and `N1 = platform==="android"`, so the android
+  branch is unreachable unless 0001 widens the first. What has not been done is building a tree
+  without 0001 to watch the CLI die; the row for 0001 in `patches/fingerprints.txt` now fingerprints
+  that widening specifically, so narrowing it fails the check instead.
+
+### 6.2 Patch Application
+
+```bash
+# scripts/build-vscode-oss.sh, "Patches" step
+
+PATCHES="${PATCHES:-$REPO_ROOT/patches}"
+
+# Applied to a clean tree every time, so a rerun cannot fail on an already
+# applied hunk or accumulate half-states. reset comes first: a patch that adds a
+# file leaves it staged, where neither checkout nor clean will touch it, and the
+# next run dies with "already exists in working directory".
+git -C "$SRC" reset -q
+git -C "$SRC" checkout -- src/ build/
+git -C "$SRC" clean -fdq src/ build/
+
+for patch in "$PATCHES"/*.patch; do
+    git -C "$SRC" apply --verbose "$patch"
+    echo "  applied $(basename "$patch")"
+done
+```
+
+`build/` is reset alongside `src/` because patches reach the build tooling too. `git apply` exits
+non-zero the moment context has shifted and `set -e` turns that into a failed build, which is the
+property the whole arrangement exists for. A missing `patches/` directory is fatal as well, unless
+`ALLOW_UNADAPTED=1` says an unadapted tree is wanted on purpose: without them there is no Android
+platform detection, no worker_thread hosts and no Open VSX target platform, and the result is not
+this product. The branding overlay in `branding/product.json` is applied in the following step,
+still before gulp runs.
+
+### 6.3 Proving a Patch Reached the Package
+
+Applying a patch to the source proves nothing about the package: the file may not be in the
+target's graph, or the build may inline an older copy. Every patch therefore leaves a fingerprint
+that survives minification, and `scripts/check-patch-fingerprints.py` searches the packaged tree for
+it against the table in `patches/fingerprints.txt`.
+
+A row answers "did this patch reach the bundle", and by itself it cannot answer "which version
+of it did": editing a patch that already has a row leaves the row matching. That half is
+covered by a manifest rather than by a pattern. `build-vscode-oss.sh` writes
+`vscodroid-patches.json` into the tree it produces, recording the sha256 of each patch's diff,
+and the checker recomputes those hashes from `patches/` and compares before it prints a single
+row. A tarball built from different patch text is refused wherever that check runs, which
+includes the fetch and the Gradle packaging gate. Only the diff is hashed, from the first
+`diff --git` or `---`/`+++` pair down, so a patch's prose header can be rewritten for free;
+a comment inside the added code cannot, and costs a server rebuild. `verify-server-tree.py`
+short-circuits on a tree carrying no manifest at all and reports it as stale.
+
+| Rule | Consequence |
+| ---- | ----------- |
+| The checker walks `patches/`, not the table | A patch added without a row fails, rather than producing a run of "ok" lines |
+| A patch may carry more than one row | 0003 has two, one per bundle: the worker itself lands in `out/server-main.js`, the `process.send` bridge in `out/bootstrap-fork.js`, and a file missing from the target's graph is exactly what a fingerprint is for |
+| A row may require its pattern more than once, by ending the bundle field in ` xN` | 0022's pre-edit-text row needs both copies: only the one after the update range carries the fix, and the text that tells it apart from the first starts with a renamed identifier, so no pattern names that copy alone |
+| A row may declare that no fingerprint is possible, and say how the patch is proven instead | 0010 is the one: it edits `build/.moduleignore`, so its proof is the kept file, which `verify-server-tree.py` requires |
+| Matching tolerates quote style and whitespace | `case"android"` and `case "android"` both count, so a new esbuild version cannot fail a row describing a correct tree |
+| The pattern must appear in what the patch itself adds | A pattern lifted from surrounding code cannot be evidence that the patch arrived |
+
+Example rows, one per shape:
+
+```
+0004 extHost worker|out/server-main.js|worker_thread Extension Host
+0011 walkthrough brand|out/nls.messages.js|Get Started with VSCodroid
+0022 editcontext pre-edit text|out/vs/code/browser/workbench/workbench.js x2|_previousEditContextText.substring(
+0010 moduleignore keep|-|edits build/.moduleignore, so its proof is the file surviving into the tree
+```
+
+Both sides run the check: `build-vscode-oss.sh` over what it built, and `fetch-vscode-oss.sh` over
+what it downloaded. The second caller is the one that matters, because a server tarball predating a
+patch carries the same name, the same version, and a digest that verifies. A digest proves a tarball
+is intact, not that it is the right tarball.
+
+## 7. Toolchain Asset Pack System
+
+### 7.1 Toolchain Configuration
+
+Toolchains are declared in Kotlin, in `ToolchainRegistry.available`, and both the first-run picker
+and the manage screen are built from that list. Three are shipped, Ruby, Java 21 and C/C++:
+
+```kotlin
+ToolchainInfo(
+    packName = "toolchain_ruby",
+    displayName = "Ruby",
+    shortLabel = "Ruby",
+    descriptionRes = R.string.toolchain_ruby_description,   // "Ruby with irb, gem, bundler"
+    estimatedSize = 41_000_000,   // unpacked, what the free-space gate uses; 39.7 MB measured
+    downloadSize = 11_000_000,    // the ZIP, what the picker quotes to the user
+    downloadUrl = "https://github.com/rmyndharis/VSCodroid/releases/latest/download/toolchain_ruby.zip",
+)
+```
+
+The second entry is `toolchain_java`, OpenJDK 21 with `javac`, `jar` and `jshell`. The third is
+`toolchain_cpp`, clang and lld with a minimal sysroot (section 7.5).
+
+The first two are an interpreter and a JVM, and for a long time that was a constraint rather than a
+preference. A toolchain whose compiler forks its own assembler and linker cannot work from a start
+the app makes by hand: Android refuses `execve` on anything under the app's data directory, so those
+forks are refused however the driver command is reached, and a toolchain that installs, runs, and
+cannot compile is worse than one that is absent; one was withdrawn for exactly that. C/C++ is
+possible only because of the terminal's exec interceptor (section 2.3), which rewrites every `exec`
+the shell and its children make, the compiler's own fork of `ld.lld` included, into
+`linker64 <file>`. It is therefore declared `"preloadOnly": true` and it works in a terminal and in
+what a terminal starts, and nowhere else.
+
+### 7.2 Asset Pack Extraction Flow
+
+```mermaid
+flowchart TD
+  A["1. User selects a toolchain<br/>(first-run picker, or the launcher icon's Manage toolchains shortcut)"] --> B{"2. Install source is com.android.vending?"}
+  B -- "Yes" --> C["3a. assetPackManager.fetch(packName)"]
+  B -- "No" --> D["3b. downloadViaHttp(): toolchain_<name>.zip, sha256 checked<br/>pinLatest resolves the URL first: this version's own release if it<br/>publishes the asset, else the tag releases/latest points at, else releases/latest"]
+  C --> E["4. installFromDirectory(): copy into filesDir/usr"]
+  D --> E
+  E --> F["5. chmod +x binaries, create symlinks in usr/bin/"]
+  F --> G["6. Write ~/.vscodroid/toolchain-env.sh, persist toolchains.json"]
+  G --> H["7. removePack() to free the duplicate pack storage"]
+  H --> I["8. Ready to use"]
+```
+
+Because the payload lands in `filesDir`, an installed toolchain survives an app update.
+
+### 7.3 Gradle Asset Pack Configuration
+
+```kotlin
+// settings.gradle.kts
+include(":toolchain_ruby")
+include(":toolchain_java")
+include(":toolchain_cpp")
+
+// app/build.gradle.kts
+assetPacks += listOf(":toolchain_ruby", ":toolchain_java", ":toolchain_cpp")
+```
+
+Each asset pack module:
+
+```kotlin
+// toolchain_ruby/build.gradle.kts
+plugins {
+    id("com.android.asset-pack")
+}
+assetPack {
+    packName.set("toolchain_ruby")
+    dynamicDelivery {
+        deliveryType.set("on-demand")
+    }
+}
+```
+
+**Asset pack contents**: pre-compiled ARM64 binaries and standard libraries for one toolchain,
+copied into `filesDir/usr` at install time. On-demand packs draw on a separate 30 GB Play budget and
+count against neither the base module cap nor the app size shown on the store listing.
+
+**Delivery is not Play-only, and no build bundles a toolchain in the APK.**
+`ToolchainManager.shouldUseHttpFallback()` reads `getInstallSourceInfo().installingPackageName` at
+runtime: `com.android.vending` takes the Play Asset Delivery path, and every other installer
+(sideload, debug build, `adb install`) downloads `toolchain_<name>.zip` from this project's GitHub
+Releases over HTTPS and checks it against the published sha256 manifest. Both paths converge on
+`installFromDirectory()`. One consequence is worth stating plainly: the ZIPs attached to a release
+are a production delivery channel, so a release that omits them breaks toolchain installation for
+every non-Play user.
+
+### 7.4 Language Picker Integration
+
+The picker is offered on every launch until it is answered, gated by `toolchain_picker_shown`,
+which only its Continue and Skip buttons write; a kill or an interrupted first run leaves it to be
+offered again on the next launch. It offers exactly what `ToolchainRegistry.available` lists:
+
+```kotlin
+val toolchains = ToolchainRegistry.available   // toolchain_ruby, toolchain_java, toolchain_cpp
+
+fun onUserConfirmed(selected: List<ToolchainInfo>) {
+    // Queue them; downloads run one at a time, driven by COMPLETED/FAILED
+    // callbacks, and a failure skips to the next rather than aborting the queue.
+}
+```
+
+**Flow**:
+
+1. Every launch, once setup is behind it (`SplashActivity.continueAfterSetup`), check whether
+   the picker has been answered
+2. Show the picker with a card per registry entry, quoting each `downloadSize`
+3. User selects languages and confirms
+4. Fetch each pack in turn, Play Asset Delivery or HTTPS depending on install source
+5. Show download progress per pack
+6. On completion, install into `filesDir/usr` and write `toolchain-env.sh`
+7. `.bashrc` sources that file, so the toolchain is on `PATH` in every new shell
+8. Proceed to the workbench
+
+**Later installs**: the Toolchains screen adds and removes languages through the same
+`ToolchainManager` entry points.
+
+---
+
+### 7.5 The C/C++ Pack
+
+`scripts/download-cpp.sh` builds `toolchain_cpp` from the Termux packages `clang`, `libllvm`, `lld`,
+`llvm`, `libcompiler-rt`, `ndk-sysroot`, `libxml2` and `python`, each checked against the signed
+index like the other packs. The list is the closure minus what the base APK already carries
+(`libc++_shared.so`, libz, libzstd, libffi, libiconv, liblzma), because an asset path both the base
+module and a pack ship is a conflict bundletool refuses. What lands in `filesDir/usr`:
+
+| Path | What | Size |
+|---|---|---|
+| `bin/clang-<major>`, `bin/lld` | the driver and the linker | 6 MB |
+| `bin/clangd` | the language server, linked against the same two libraries; see `launchers` below | 18 MB |
+| `bin/llvm-ar`, `-ranlib`, `-nm`, `-objdump`, `-objcopy`, `-strip`, `-readelf`, `-size` | the binary tools | 3 MB |
+| `bin/aarch64-linux-android-clang`, `-clang++` | two scripts that start `clang` and `clang++`, see below | under 1 KB |
+| `lib/libLLVM.so`, `lib/libclang-cpp.so` | the compiler, shared by every tool above | 197 MB |
+| `lib/libxml2.so.16`, `lib/libpthread.so`, `lib/librt.so`, `lib/libutil.so` | libLLVM's one missing dependency, and three linker scripts | 1 MB |
+| `lib/crt*.o`, `lib/libunwind.a`, `lib/libatomic.a`, two more archives | what a default link names | 0.1 MB |
+| `lib/clang/<major>/include`, `.../lib/linux/libclang_rt.builtins-aarch64-android.a` | clang's own headers and the one runtime archive | 16 MB |
+| `include/` | bionic, kernel and libc++ (`include/c++/v1`) headers | 28 MB |
+| `include/python3.<minor>` | Python's headers, for `pip install` of a C extension | 2.7 MB |
+
+The listing is the Termux layout and has to stay one: clang finds its sysroot at `bin/../..`, its
+resource directory at `bin/../lib/clang` and `ld.lld` beside itself, from where it was started. That
+path is what the interceptor puts in `TERMUX_EXEC__PROC_SELF_EXE`, which libLLVM reads instead of
+`/proc/self/exe`; started by hand through `linker64`, as the bash functions and the trampoline rows
+do, the process believes it is the loader and finds none of it. Hence `"preloadOnly": true`, which
+`regenerateEnvFileLocked` and `regenerateExecTableLocked` honour by writing no function and no
+row for the toolchain's binaries, while `binaries`, `pathDirs` and `env` apply as for any other.
+
+`launchers` is the one thing that gets a row anyway: `{"usr/bin/clangd": ["--resource-dir=$FILESDIR/usr/lib/clang/<major>"]}`.
+A language client starts clangd with no terminal and so no interceptor, and started through the
+trampoline it takes the loader's directory for its own: every compile command it builds carries
+`-resource-dir=/apex/com.android.runtime/lib/clang/<major>`, and `stddef.h` and the rest of clang's
+own headers are not found (measured on an API 37 emulator, through the extension: `stdio.h` found,
+`stddef.h` not, one error on every file that includes it). The row's argument gives it the real
+directory, and with it a C and a C++ file both check clean. The sysroot needs nothing, because
+clangd takes it from the `clang` it finds on `PATH`, which is `usr/bin/clang`: a link in tcbin
+named `clang` would be found first and would send the sysroot to `usr/libexec`, which is the
+other reason the compilers stay out of the table. `addLauncherRows` writes the row, and holds
+it to what the trampoline reads: the path is one of the manifest's `binaries` and an ELF on disk,
+there are at most `MAX_ROW_ARGS` (8, the trampoline's own constant, pinned by
+`ExecTrampolineRowLimitTest`) arguments, and none holds a tab or a line break. A pack from before
+this key has no row and clangd is simply absent from it.
+
+The command names are `symlinks` in the manifest (`clang`, `clang++`, `cc`, `c++`, `gcc` and `g++`
+onto the driver; `ld` and `ld.lld` onto lld; `ar`, `ranlib`, `nm`, `strip`, `objdump`, `objcopy`,
+`readelf` and `size` onto the `llvm-*` files), made in `usr/bin` at install time and removed with the
+toolchain, because neither an asset pack nor the release ZIP can carry a link. A symlink keeps the
+name it was reached by, which is what tells the driver C from C++ (`c++`, `clang++` and `g++` run it
+as `g++`) and lld `ld` from `ld.lld`.
+
+`aarch64-linux-android-clang` and `aarch64-linux-android-clang++` are the exception, and are files.
+clang also takes its target from the prefix of the name it runs under, and this prefix names no API
+level, so under a link either name compiled with an unversioned triple and bionic's headers stopped
+with `Unversioned target triples are not supported!`; a configuration file beside the link did not
+change that (measured on an API 33 emulator). Each is a two-line `#!/system/bin/sh` script that
+`exec`s the plain `clang` or `clang++` from its own directory, which has the driver's default target,
+`aarch64-unknown-linux-android24`. They are in `binaries`, so the install gives them the execute bit
+and an uninstall removes them, and they are not in `symlinks`, where the install would replace the
+file with a link. Python's sysconfig names the first as its `CC`, which is what `pip` runs for a C
+extension. The interceptor starts them like any `#!` script, so they need it as the rest do.
+
+`ownedPaths` is the manifest key for what a toolchain puts into directories it shares with the base
+install and does not own outright, because clang finds them there and nowhere else: one entry per
+top-level header in `usr/include`, the `usr/lib/clang` directory, the crt objects and archives, and
+the notices. Uninstall deletes exactly those, link-aware, and so does the reclaim of an install the
+system stopped part-way (`removeToolchainFiles`); a header the user added to `usr/include` beside
+them stays. An entry is refused unless it is under `usr/` and at least three components deep
+(`isOwnedPathName`). The build script ends by checking that every file in the pack is named by
+`binaries`, `libs` or `ownedPaths`, so an uninstall cannot leave one behind.
+
+Not in the pack, and not a defect: `clang-format` and the other clang tools, `libclang.so`, cmake, ninja,
+the sanitizer runtimes, OpenMP and the profile library. `make` is the base app's.
+
+**What it needs.** The terminal's interceptor, and only that, for the compilers. With `LD_PRELOAD`
+set to null, from an extension that starts a process itself, or as a `"type": "process"` task's own
+command, a compiler is a file under `filesDir` the kernel will not execute and nothing here makes
+it one. The card says so, and so does the user guide. clangd is the exception, through `launchers`
+above.
+
+## 8. Package Manager
+
+Not built. No `vscodroid pkg` command exists in the app or on the device, and nothing under
+`android/app/src/main` or `scripts/` implements one. It sits on the post-release roadmap in
+`MILESTONES.md`, and what follows is the design it would start from rather than a description of
+anything shipping. Additional packages are the user's own business through the terminal today.
+
+### 8.1 CLI Interface
+
+```bash
+# Search packages
+vscodroid pkg search <query>
+
+# Install package
+vscodroid pkg install <package>
+
+# List installed
+vscodroid pkg list
+
+# Remove package
+vscodroid pkg remove <package>
+
+# Update all
+vscodroid pkg update
+```
+
+### 8.2 Package Format
+
+The design reuses the Termux package repository rather than hosting one: `arm64` deb packages and
+a standard dpkg `Packages` index, which is already what `scripts/lib/termux-packages.sh` resolves
+and what `scripts/verify-termux-index.sh` anchors to Termux's signing key. No VSCodroid package
+host exists.
+
+> **Constraint that shapes it**: on a Play install every binary the app installs has to arrive
+> through Play, so an app-provided command that downloads executables from a third-party
+> repository could not run there. (A user running `pip install` or `apt`-style tools of their own
+> is a different case; see docs/10-RELEASE_PLAN.md section 5.3.) Any implementation would be
+> limited to installs that did not come from Play, which is the same split
+> `ToolchainManager.shouldUseHttpFallback()` already makes for toolchains.
+
+---
+
+## 9. Version Strategy
+
+### 9.1 Version Scheme
+
+```
+VSCodroid version: X.Y.Z
+  X = Major (breaking changes, new architecture)
+  Y = Minor (new features, VS Code upstream update)
+  Z = Patch (bug fixes, security patches)
+
+Mapping to VS Code version:
+  The pin lives in VSCODE_VERSION, and the commit it resolved to in VSCODE_COMMIT.
+  Both are read by build-vscode-oss.sh and by fetch-vscode-oss.sh, which refuse a
+  tree or a tarball that disagrees with them.
+
+```
+
+### 9.2 Update Cadence
+
+- VS Code releases monthly → VSCodroid targets monthly upstream sync
+- Patch releases as needed for critical bugs
+- Toolchain updates ride the release: the asset packs in the AAB and the ZIPs attached to the
+  GitHub Release must be built from the same download, or the two delivery channels ship
+  different toolchain versions for one app version
+
+---
+
+## 10. Android Backup Configuration
+
+```xml
+<!-- AndroidManifest.xml -->
+<application
+    android:allowBackup="true"
+    android:fullBackupContent="@xml/backup_rules"
+    android:dataExtractionRules="@xml/data_extraction_rules">
+```
+
+Two files, because the platform reads two. `android:fullBackupContent` is consulted
+up to Android 11 (API 30) and `android:dataExtractionRules` from Android 12 (API 31)
+onwards. `minSdk` is 30, so **both are live**: an Android 11 device reads
+`backup_rules.xml` and ignores `data_extraction_rules.xml`, and every later release
+does the reverse. Without `android:fullBackupContent` an Android 11 device would take
+unrestricted full backup, the SSH key and the connection token included. Keep the two
+in step, which `BackupRulesParityTest` holds: the header comment in each file carries
+the full reasoning.
+
+**Live rules** (`res/xml/data_extraction_rules.xml`):
+
+```xml
+<?xml version="1.0" encoding="utf-8"?>
+<data-extraction-rules>
+    <cloud-backup>
+        <include domain="file" path="home/.vscodroid/data/Machine" />
+    </cloud-backup>
+    <device-transfer>
+        <include domain="file" path="home/.vscodroid/data/Machine" />
+    </device-transfer>
+</data-extraction-rules>
+```
+
+`backup_rules.xml` holds the same single `<include>` in `<full-backup-content>` form, and is the rule an Android 11 device applies.
+
+**Rationale**: this is an **allowlist with no exclusions**, and the absence of
+`<exclude>` is the design rather than an omission. Under `<include>` semantics
+anything not named is already out, so exclusions would only restate paths that were
+never in scope, which is what lint reported, once per line.
+
+Fail-closed is the point. The app's private storage holds a passphrase-less SSH key
+(`Environment.getSshDir`) and the server's connection token
+(`Environment.getConnectionTokenPath`), and the token sits inside `data/`, one
+directory away from the settings that *are* backed up. A denylist protects exactly
+the secrets someone remembered to list; naming only what may leave keeps the next
+credential file out by default.
+
+What is included is `data/Machine`, where the workbench reads its settings from on
+this side, which is not the `User/` path it looks like it should be; see
+`Environment.getMachineSettingsPath`. Restoring it is worth doing because
+`FirstRunSetup.createDefaultSettings()` writes only when the file is absent, so a
+restored copy survives the new device's first run.
+
+Notably excluded by omission, and least obvious: `sharedpref`.
+`FirstRunSetup.isFirstRun()` answers from `setup_version` and `setup_version_code`
+in those preferences, so
+restoring them onto a device with an empty `filesDir` would make the app conclude
+setup had already run, skip extraction entirely, and start a server that is not
+there.

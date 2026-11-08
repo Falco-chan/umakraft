@@ -1,0 +1,179 @@
+name: Build Code - OSS artifact
+
+on:
+  workflow_call:
+    inputs:
+      vscode_version:
+        type: string
+        default: ""
+      runner:
+        type: string
+        default: ubuntu-24.04-arm
+      # A publish passes true. The tarball cache is keyed on the build's inputs,
+      # not on a build having run, so a tree that passed once is restored for
+      # every later run until an input changes. That is what CI wants, and it is
+      # wrong for a release whose notes say which run built the tarball.
+      fresh:
+        type: boolean
+        default: false
+    outputs:
+      version:
+        value: ${{ jobs.build.outputs.version }}
+      sha256:
+        value: ${{ jobs.build.outputs.sha256 }}
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 120
+    outputs:
+      version: ${{ steps.pin.outputs.version }}
+      sha256: ${{ steps.digest.outputs.sha256 }}
+
+    steps:
+      # No persisted push token either: nothing here pushes, and a persisted one
+      # would be readable by the npm install this job runs against upstream's
+      # dependency tree for the length of the job.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Resolve the pinned version
+        id: pin
+        env:
+          # Through the environment, never interpolated into the script body: a
+          # workflow_dispatch input is attacker-controlled text as far as the
+          # shell is concerned, and this one lands in a URL and a tag name.
+          INPUT_VERSION: ${{ inputs.vscode_version }}
+        run: |
+          version="${INPUT_VERSION:-$(cat VSCODE_VERSION)}"
+          case "$version" in
+            *[!0-9.]*|"") echo "refusing version: $version" >&2; exit 1 ;;
+          esac
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Building VS Code $version"
+
+          # The commit to build. A tag is a mutable name, so it is the commit
+          # that selects the source and the tag that is advisory -- the build
+          # script fetches this SHA directly and then compares, rather than
+          # fetching the tag and hoping.
+          #
+          # When the version comes from the file the commit does too, and the
+          # build refuses anything else. An operator who overrides the version
+          # is trying a tag before bumping to it, and there is no pin for that
+          # yet -- so resolve it here and say so, which also hands them the SHA
+          # to write into VSCODE_COMMIT if they go on to bump.
+          if [ -n "$INPUT_VERSION" ]; then
+            # Peeled first: for an annotated tag refs/tags/X is the tag object
+            # and refs/tags/X^{} is the commit, and it is the commit that has to
+            # be fetched. Asking for both in one call would not help, because
+            # ls-remote sorts by refname and the unpeeled ref sorts first. Two
+            # calls, no parsing.
+            #
+            # Do not delete the first call as dead code. It is dead against this
+            # repository's pin today -- VS Code's tags are lightweight, so
+            # refs/tags/X^{} does not exist and the fallback is what fires -- and
+            # it stops being dead the first time upstream publishes an annotated
+            # tag, silently pinning a tag object that no checkout can ever equal.
+            # Verified against torvalds/linux v6.6, where the two refs differ:
+            # 5260836 (tag object) against ffc2532 (commit).
+            commit=$(git ls-remote https://github.com/microsoft/vscode.git "refs/tags/$version^{}" | cut -f1)
+            [ -n "$commit" ] || commit=$(git ls-remote https://github.com/microsoft/vscode.git "refs/tags/$version" | cut -f1)
+            echo "::notice::$version resolves to $commit - record this in VSCODE_COMMIT if you bump to it"
+          else
+            commit=$(cat VSCODE_COMMIT)
+          fi
+
+          # A failed ls-remote leaves this empty, and cut exits 0 either way, so
+          # the emptiness is what gets tested rather than the pipeline's status.
+          case "$commit" in
+            *[!0-9a-f]*|"") echo "refusing commit: '$commit'" >&2; exit 1 ;;
+          esac
+          [ "${#commit}" -eq 40 ] || { echo "refusing commit, not 40 chars: $commit" >&2; exit 1; }
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
+          echo "Pinned to commit $commit"
+
+          # .nvmrc is authoritative for the build host. Reading it rather than
+          # hardcoding keeps a version bump from silently building on the wrong
+          # Node.
+          #
+          # Read at the commit, not at the tag, for the same reason the source
+          # is fetched at the commit: a moved tag would otherwise pick the Node
+          # of a tree this build is not building. Measured that raw serves a
+          # SHA, and that an unknown one fails rather than returning something.
+          # --retry rides out the rate limit raw.githubusercontent.com answers
+          # from a runner's shared address with a 429, which failed another
+          # download from the same host and left the build with no Node version.
+          node_version=$(curl -fsSL --retry 6 \
+            "https://raw.githubusercontent.com/microsoft/vscode/${commit}/.nvmrc")
+          echo "node=$node_version" >> "$GITHUB_OUTPUT"
+          echo "Building with Node $node_version"
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ steps.pin.outputs.node }}
+
+      # Skipped outright on a fresh build: nothing is restored, and the post step
+      # that would save the new tarball does not run either. cache-hit is then
+      # empty, which the three conditions below read as a miss.
+      - name: Cache the server tarball
+        id: cache
+        if: ${{ !inputs.fresh }}
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/codeoss/vscode-reh-web-linux-arm64-${{ steps.pin.outputs.version }}.tar.gz
+          key: codeoss-${{ runner.os }}-${{ runner.arch }}-${{ steps.pin.outputs.version }}-${{ steps.pin.outputs.commit }}-${{ hashFiles('VSCODE_VERSION', 'VSCODE_COMMIT', 'patches/**', 'branding/**', 'scripts/build-vscode-oss.sh', 'scripts/patch-js-debug-env.py', 'scripts/patch-language-detection.py', 'scripts/test-language-detection.py', 'scripts/check-editcontext-sync.py', 'scripts/check-patch-fingerprints.py', 'scripts/verify-server-tree.py', 'scripts/verify-android-elf.py', 'scripts/fetch-vscode-oss.sh', '.github/workflows/codeoss-build.yml') }}
+
+      - name: Install build dependencies
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential libkrb5-dev libsecret-1-dev libx11-dev \
+            libxkbfile-dev pkg-config python3 python3-setuptools
+
+      - name: Cache npm
+        if: steps.cache.outputs.cache-hit != 'true'
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.npm
+          key: codeoss-npm-${{ steps.pin.outputs.version }}-${{ runner.arch }}
+          restore-keys: codeoss-npm-${{ steps.pin.outputs.version }}-
+
+      - name: Build
+        if: steps.cache.outputs.cache-hit != 'true'
+        env:
+          VSCODE_VERSION: ${{ steps.pin.outputs.version }}
+          VSCODE_COMMIT: ${{ steps.pin.outputs.commit }}
+          WORK: ${{ runner.temp }}/codeoss
+        run: |
+          mkdir -p "$WORK"
+          bash scripts/build-vscode-oss.sh
+
+      - name: Report cost
+        if: always()
+        run: |
+          df -h "${{ runner.temp }}" | tail -1
+          du -sh "${{ runner.temp }}/codeoss"/* 2>/dev/null || true
+
+      - name: Verify the server tarball
+        id: digest
+        env:
+          TARBALL: ${{ runner.temp }}/codeoss/vscode-reh-web-linux-arm64-${{ steps.pin.outputs.version }}.tar.gz
+          VSCODE_VERSION: ${{ steps.pin.outputs.version }}
+          VSCODE_COMMIT: ${{ steps.pin.outputs.commit }}
+        run: |
+          digest=$(sha256sum "$TARBALL" | cut -d' ' -f1)
+          VSCODE_OSS_URL="file://$TARBALL" VSCODE_OSS_SHA256="$digest" bash scripts/fetch-vscode-oss.sh
+          echo "sha256=$digest" >> "$GITHUB_OUTPUT"
+
+      - name: Upload server tree
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: vscode-reh-web-linux-arm64-${{ steps.pin.outputs.version }}
+          path: ${{ runner.temp }}/codeoss/vscode-reh-web-linux-arm64-${{ steps.pin.outputs.version }}.tar.gz
+          retention-days: 7
+          if-no-files-found: error

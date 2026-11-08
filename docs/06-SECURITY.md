@@ -1,0 +1,371 @@
+# Security Design Document
+
+**Project**: VSCodroid
+**Version**: 1.0-draft
+**Date**: 2026-02-10
+
+---
+
+## 1. Security Principles
+
+| Principle             | Description                                                       |
+| --------------------- | ----------------------------------------------------------------- |
+| **Least privilege**   | Request only necessary Android permissions                        |
+| **Defense in depth**  | Multiple layers of protection                                     |
+| **Secure by default** | No telemetry, localhost-only server, no external network exposure |
+| **Transparency**      | Open source, no hidden data collection                            |
+
+---
+
+## 2. Threat Model
+
+### 2.1 System Boundaries
+
+```mermaid
+flowchart TD
+  subgraph SANDBOX["Trust Boundary: Android App Sandbox"]
+    W["WebView (workbench UI)"] <--> |"HTTP + WebSocket on 127.0.0.1"| E["EditorGateway<br/>app-owned loopback endpoint"]
+    E <--> |"Private filesystem socket"| N["VS Code Server (vscode-reh)<br/>extension host, terminals, the user's code"]
+    N --> |"HTTPS_PROXY"| P["dns-proxy.js<br/>loopback proxy inside the server process"]
+  end
+  W --> |"external HTTPS: gallery queries, READMEs, icons"| O["Open VSX"]
+  P --> |"external HTTPS: VSIX downloads, web extension resources"| O
+  N --> |"external HTTPS/SSH"| G["GitHub/GitLab remotes"]
+  N --> |"external HTTPS, after a GitHub sign-in"| C["GitHub Copilot service"]
+```
+
+The last edge is drawn because this document did not name it until 2026-08-23, and a threat model
+that omits the one shipped component which sends the user's source somewhere is not a threat model.
+`extensions/copilot` in the server tree is GitHub Copilot Chat (`GitHub.copilot-chat` 0.67.0 in the
+1.139.1 tree, 290 MB), the packaged `product.json` names it in `defaultChatAgent`, and its `package.json` declares
+only `main`, so it runs in the Node extension host and its requests leave from the server side.
+Section 5.1 carries the consequence for the data classification.
+
+Open VSX is reached from both sides. The WebView fetches gallery queries, READMEs and icons
+itself. The server downloads the VSIX for every install it performs, after checking the version
+against the gallery again (`checkAndGetCompatibleVersion`, `downloadExtension` in
+`out/server-main.js`), answers `/web-extension-resource` from the gallery's `resourceUrlTemplate`,
+and repeats through its `request` channel any request the WebView's fetch throws on or gets a 405
+for. The server side leaves through `dns-proxy.js`, which `server.js` preloads into the editor
+server: it binds a loopback proxy in that same process and exports it as `HTTPS_PROXY`, so the
+server's request service, and anything else in that process tree that honours the variable, goes
+out through it. Any app on the device can reach a loopback port, so the proxy refuses a client
+without the credential minted for that boot, which rides in the proxy URL.
+
+### 2.2 Threat Actors
+
+| Actor               | Capability                           | Motivation                |
+| ------------------- | ------------------------------------ | ------------------------- |
+| Malicious extension | Code execution in Extension Host     | Data theft, crypto mining |
+| Network attacker    | Traffic interception on same network | Credential theft          |
+| Other Android apps  | Inter-process communication          | Data access               |
+| Physical access     | Device access                        | Data theft                |
+
+### 2.3 Threat Matrix (STRIDE)
+
+| Threat                                                | Category                   | Impact | Likelihood | Mitigation                                                                          |
+| ----------------------------------------------------- | -------------------------- | ------ | ---------- | ----------------------------------------------------------------------------------- |
+| Other app connects to localhost server                | **Spoofing**               | Medium | Low        | localhost-only binding, plus a connection token except on the public routes listed in 3.1 |
+| Malicious extension impersonates trusted extension    | **Spoofing**               | Medium | Low        | Open VSX namespace ownership and the user's own reading of the listing. **Signatures are not checked**: see the extension provenance row in 3.3 |
+| Malicious extension steals files                      | **Tampering**              | High   | Medium     | **Not mitigated.** The extension host is a fault boundary, not a security one: an extension reaches app-private storage and the network exactly as the app does. What bounds it is the Android app sandbox and the SAF grants the user gave |
+| Man-in-middle on Open VSX downloads                   | **Tampering**              | High   | Low        | HTTPS only, certificate pinning (future)                                            |
+| No audit trail for file changes by extensions         | **Repudiation**            | Low    | Medium     | VS Code timeline/git history, extension activity logging (future)                   |
+| User denies executing destructive terminal command    | **Repudiation**            | Low    | Low        | Accepted, no audit trail. Each terminal spawns bash directly on a PTY through node-pty, and the only record is bash's own history file in app-private storage, which the user can edit or clear |
+| Extension phones home with user data                  | **Information Disclosure** | High   | Medium     | **Not mitigated.** The extension host is a Node process with the app's own network access, and nothing in this app filters what it reaches. "No internet by default for the extension host" was listed here as a planned control until 2026-08-23; nothing was built and the shipped configuration goes the other way, see the row below |
+| Bundled chat provider sends the user's source to GitHub | **Information Disclosure** | High   | Medium     | **By design, and disclosed rather than blocked.** GitHub Copilot Chat ships in the server tree and `product.json` makes it the editor's chat provider. It has no account and no chat until the user signs in to GitHub. When it is enabled, its manifest lists `onStartupFinished`, so it activates in the extension host on every start, signed in or not; whether it sends anything before sign-in has not been established here. From sign-in on, a prompt and the context the extension attaches (the open file, and other parts of the project) go to GitHub. It can be turned off from the Extensions view (its menu offers **Disable AI Features** rather than Uninstall, because it ships as a built-in). `docs/PRIVACY_POLICY.md` states this in the terms a user reads |
+| SSH key theft via backup                              | **Information Disclosure** | High   | Low        | Backup rules exclude ~/.ssh/ (M1); Android Keystore migration (post-v1.0 hardening) |
+| Crash-loop DoS on Node.js server                      | **Denial of Service**      | Low    | Medium     | Auto-restart with exponential backoff, max restart count                            |
+| Malicious extension consuming all memory/CPU          | **Denial of Service**      | Medium | Low        | **Nothing caps total memory.** The V8 old-space ceiling the server is started with (`ProcessManager.heapCeilingForDevice`) caps each isolate at that number rather than capping their sum, so the extension host worker gets its own allowance of it rather than drawing on the server's, and a language server the extension host forks sets its own ceiling outside this control (tsserver builds one from `tsserver.maxMemory`, upstream default 3072). What the ceiling buys is that no single isolate grows without bound. `process-monitor.js` marks idle language servers in the process tree and kills nothing, since a killed server is restarted by its extension within a second. Neither bounds CPU, and a busy loop in the extension host is not reachable from here |
+| WebView XSS via malicious file content                | **Elevation of Privilege** | Medium | Low        | VS Code CSP, WebView sandboxing                                                     |
+| Extension/webview script abuses AndroidBridge methods | **Elevation of Privilege** | High   | Medium     | Per-session capability token on every bridge method, pinned by a reflection test    |
+| Extension reads files outside the app                 | **Elevation of Privilege** | High   | Low        | Android app sandbox, and SAF grants for anything outside it. The worker_thread the extension host runs in is not part of this: it exists so the host does not spend a phantom process slot |
+| Config file in an opened folder runs on open          | **Elevation of Privilege** | Medium | Medium     | **Not mitigated. There is no Workspace Trust prompt, ever.** `assets/server.js` starts the server with `--disable-workspace-trust`, the server parses that once at spawn, and one server here serves every folder the app opens, so the flag cannot follow a folder. A folder opened through the SAF picker is therefore as trusted as the user's own projects directory, and the bundled `dbaeumer.vscode-eslint` loads and executes its `eslint.config.js`. The flag also buys activation: eslint and `ms-python.python` both declare `untrustedWorkspaces.supported: false`, so without it neither runs at all |
+
+---
+
+## 3. Security Controls
+
+### 3.1 Network Security
+
+`EditorGateway` keeps the loopback endpoint bound for the app process lifetime, including while the service stops or restarts the editor. Node listens on a separate filesystem socket for each run under app-private storage. The gateway relays HTTP and WebSocket bytes unchanged, including the `Host` header. Backend replacement closes the old run's connections without releasing the public port; with no backend selected, new connections receive HTTP 503. Another app therefore cannot occupy the workbench origin during an editor restart while this app process is alive. The relay preserves the server's connection-token checks.
+
+| Control                     | Implementation                                                               |
+| --------------------------- | ---------------------------------------------------------------------------- |
+| Local editor transport      | The app's gateway binds to `127.0.0.1` exclusively; Node's editor listener uses an app-private filesystem socket |
+| Connection token            | Required on every route except `/version`, `/delay-shutdown`, `/callback` and `/vscodroid-server-proof/<nonce>`. The run-proof endpoint signs a fresh challenge with the private per-run key before the app marks a spawned listener ready or adopts an existing one. The connection token is generated by the server on first start, kept in app-private storage, owner-readable only. Replaced by the app before every server start that is not an adoption. The app attaches it, and forwards webview asset requests to the port at all, only while its own server reports ready. Readiness is also withdrawn for the seconds it takes to adopt back a server that outlived its bootstrap, while the page stays connected to that server, so a webview asset requested while the server is not ready waits for it on the request's own thread, for up to four seconds (twice the backoff before the first restart) and no more than two requests at a time, and is then forwarded with the token, or refused with nothing sent to the port. The limit is there because each waiting request holds a worker of the WebView thread pool that serves every request the page makes. A webview refused this way stays blank. Hiding it and showing it again afterwards, for example by switching to another tab and back, loads it afresh; a webview that keeps its content while hidden has to be closed and opened again instead. The page is not reloaded to repair it, because reloading the workbench would cost the open editor that adoption exists to keep. `/callback` is open because it arrives in the system browser, which holds neither the cookie nor the token; what proves such a callback is the per-request secret the workbench mints into the callback URL. That secret goes out to the provider inside the redirect the extension registers and comes back in the query the browser is redirected to, so it proves the callback came back from the sign-in this app launched rather than from an app on the device that guessed the request id. The provider sees it, as it sees the whole redirect, and it is the party the user is signing in to; nothing else is served it, which is what the page behind `/callback` used to do |
+| HTTPS for external requests | Open VSX, GitHub, the GitHub Copilot endpoints the bundled chat extension uses, and the schema and package-registry endpoints the built-in language extensions query (`json.schemastore.org`, the other schema hosts in `json.schemaDownload.trustedDomains`, and `registry.npmjs.org`): all HTTPS |
+| No telemetry                | `branding/product.json` sets `enableTelemetry: false` and `telemetryOptIn: false` into the Code - OSS build, `server.js` writes both again at every start, and the default settings pin `telemetry.telemetryLevel: "off"`. The packaged `product.json` carries no telemetry endpoint |
+| Bundled extension telemetry | Not the same claim as the row above, and worth stating separately. `extensions/copilot/dist/extension.js` carries its own senders (`copilot-telemetry.githubusercontent.com`, two Application Insights hosts). They are gated on the editor's own switch, which this build pins off: the extension reads `vscode.env.isTelemetryEnabled` and the `TelemetryLogger` the editor derives from `telemetry.telemetryLevel`. That gate is a setting, not a removal: what the extension sends is decided by the editor's telemetry level at the time, and the row above is what pins it |
+| No auto-update phone home   | No update URL in `product.json` and `update.mode: "none"` in the default settings. New versions arrive from the Play Store or a GitHub Release APK |
+
+### 3.2 Application Security
+
+| Control                              | Implementation                                                                                                                                                                                                                     |
+| ------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Android App Sandbox                  | Standard Android process isolation                                                                                                                                                                                                 |
+| App-private storage                  | Settings, secrets, server files, runtimes and new installs' projects remain in app-private internal storage. Existing shared-storage projects are retained at their previous location, see 5.2 |
+| WebView process isolation            | WebView renderer runs in separate process                                                                                                                                                                                          |
+| AndroidBridge access control         | Every bridge method requires the per-session token and refuses without it; a reflection test fails the build if one is added that does not. There is no origin check -- `@JavascriptInterface` does not carry the caller's origin |
+| Code signing                         | APK/AAB signed with release key                                                                                                                                                                                                    |
+| No self-updating code (Play Store) | Core binaries bundled as .so in the APK; toolchains as on-demand asset packs via Play Store. The app downloads no executable code for itself on a Play install. User programs (compiled, or installed by pip or npm) run inside the sandbox through the system linker, and a program an extension brings with it is started by a loader the app ships; the app's server binds loopback only and takes a token, so there is no remote path to that execution. Sideload installs download toolchain ZIPs from GitHub Releases; `vscodroid pkg` is planned, not shipped |
+| Foreground Service notification      | The server runs under a foreground service; notification visibility follows Android's notification permission and system UI rules |
+
+### 3.3 Extension Security
+
+| Control                        | Implementation                                                                                           |
+| ------------------------------ | -------------------------------------------------------------------------------------------------------- |
+| Extension Host isolation       | Runs as a worker_thread inside the server process, applied by `patches/0004-exthost-as-worker-thread.patch`, so it does not spend one of Android's 32 phantom process slots |
+| Extension reach                | **No sandbox.** The extension host is Node, so an extension can `require('fs')` and reach whatever the app can. The `vscode.*` API is a convenience, not a boundary |
+| AndroidBridge capability model | All bridge APIs require the valid per-session token; no origin component, and section 3.7 says who shares that origin |
+| Extension provenance           | **A VSIX is trusted on the HTTPS connection to Open VSX and nothing else.** `FirstRunSetup` writes `extensions.verifySignature: false` into the machine defaults, and it has to: signature checking loads `@vscode/vsce-sign`, which no Code - OSS build ships and which is absent from `vscode-reh/node_modules`, so with the setting left at its default every gallery install fails with `SignatureVerificationInternal` (`out/server-main.js`, `downloadExtension`). There is no revocation feed either: `server.js` sets `extensionsGallery.controlUrl` to the empty string, and `getExtensionsControlManifest` then answers an empty malicious-and-deprecated list without asking anyone |
+| Extension updates              | Unattended. `extensions.autoCheckUpdates` (default true) and `extensions.autoUpdate` (default `"on"`) are APPLICATION-scoped, so the machine settings file this app writes cannot change them; the workbench asks Open VSX at startup and every 12 hours (not while the connection counts as metered) and installs what it finds, with no publisher verification behind it. The download itself runs in the server, through the proxy drawn in 2.1. The user can turn both off in the editor's own settings |
+| File system scoping            | Extensions see workspace folder by default                                                               |
+| Open VSX moderation            | Open VSX has namespace ownership and abuse reporting                                                     |
+| User consent                   | User explicitly installs each extension. The exception is `GitHub.copilot-chat`, which ships in the server tree and is present from first launch |
+
+### 3.4 Data Protection
+
+| Data             | Protection                                                                                                  |
+| ---------------- | ----------------------------------------------------------------------------------------------------------- |
+| User source code | Two locations, see 5.2. Not backed up. Sent nowhere by the app itself; the bundled chat provider is the exception and section 5.1 names it |
+| VS Code settings | App-private storage                                                                                         |
+| Git credentials  | Git credential store in app-private home dir                                                                |
+| SSH keys         | File permissions 600, app-private storage                                                                   |
+| OAuth tokens     | Held by the workbench's `LocalStorageSecretStorageProvider`, which the app switches on with the `vscode-secret-key-path` cookie. They are sealed with AES-GCM into the WebView's localStorage under a 32-byte key kept in `no_backup` (`SecretStorageKey`), which the WebView client answers to a POST on the workbench origin (see 3.7). Neither is backed up. Any script running on the workbench origin, and any process in the app sandbox (extensions, terminals, build scripts, `/vscode-remote-resource` with the token), can obtain both the key and the sealed data, so the sandbox is still the boundary. |
+| Clipboard data   | Transient, follows Android clipboard lifecycle                                                              |
+
+### 3.5 Toolchain Delivery Security
+
+There are two delivery paths, chosen at runtime, and they have different integrity stories.
+`ToolchainManager` reads `getInstallSourceInfo().installingPackageName`: an install that came
+from `com.android.vending` or the legacy `com.google.android.feedback` installer uses Play Asset Delivery, and every other install (sideload, debug
+build, `adb install`) downloads the same toolchains over HTTPS from this project's GitHub
+Releases. Only the first is covered by Play's signing.
+
+| Control             | Implementation                                                                 |
+| ------------------- | ------------------------------------------------------------------------------ |
+| Play delivery       | Toolchains delivered as on-demand asset packs: Ruby, Java 21 and C/C++, those three |
+| Code signing        | Asset packs signed with same key as base APK (Play Store enforced)             |
+| HTTPS delivery      | For non-Play installs, each ZIP is checked against the sha256 the release publishes in `toolchains.sha256` beside it, before anything is extracted. A ZIP the manifest does not name is refused rather than installed unverified |
+| User-initiated only | Toolchains only downloaded when user selects them in Language Picker           |
+| App-private storage | Toolchains extracted to /data/data/com.vscodroid/, inaccessible to other apps  |
+| Sideload integrity  | GitHub Releases APKs include SHA256 checksums for verification                 |
+
+### 3.6 Backup Security
+
+| Data                                   | Backup Behavior                                |
+| -------------------------------------- | ---------------------------------------------- |
+| Machine-scoped defaults (`home/.vscodroid/data/Machine`) | Included. It is the only path the allowlist names |
+| Themes, keybindings and workbench state the user chose | **Excluded.** They live in the WebView's IndexedDB, which no rule includes, so they do not survive a restore |
+| SSH keys (~/.ssh/)                     | Excluded from backup                           |
+| Git credentials (~/.gitconfig)         | Excluded from backup                           |
+| User workspace files                   | Excluded from backup (too large, user-managed) |
+| Installed extensions                   | Excluded (re-downloadable)                     |
+| Server logs                            | Excluded                                       |
+
+### 3.7 Origins Inside the WebView
+
+One WebView renders documents from three different origin shapes, and most of what follows is
+enforced in `VSCodroidWebViewClient.shouldInterceptRequest` because nothing else is in a position
+to: patch 0005 disables the service worker upstream uses to scope each webview to its own
+`localResourceRoots`, so the interception is the only place a resource request is judged.
+
+| Origin                                  | What it is                                                                 |
+| --------------------------------------- | -------------------------------------------------------------------------- |
+| `http://127.0.0.1:<port>`               | The workbench, the only document served by our own server                  |
+| `https://<uuid>.vscode-cdn.net`         | Extension webview documents, answered locally by the interception           |
+| `https://<scheme>+.vscode-resource.vscode-cdn.net` | Subresources of those documents, read off the filesystem         |
+
+Native responses on the workbench origin require `EditorGateway` to own the client's expected port. Every request the app intercepts on that origin, the secret storage key and translated interface bundles included, is refused with HTTP 503 when that ownership check fails. This check depends on the retained listener, so an unavailable editor backend does not let a different process inherit that origin. The gateway itself answers HTTP 503 to every connection while no editor backend is selected and to any connection beyond 32 open at once, and it closes a connection that makes no progress for two minutes.
+
+- **Two arms answer ahead of all of this, and both are on our own origin.** A request to
+  `http://127.0.0.1:<port>/_nls/<commit>/<version>/<locale>/nls.messages.js` is answered out of
+  the APK by `interfaceBundleResponse` and never reaches the rules below, which judge
+  `*.vscode-cdn.net` and nothing else. It is deliberately unguarded: no `Origin`, `Referer`,
+  `parentOrigin` or connection token is consulted, because what it serves is a table of
+  translated interface strings that ships identically in every copy of the app and holds nothing
+  about the device or its files. The locale is resolved against the bundle names actually present
+  in `assets/nls` (`EditorLocale.resolveTag`), so no path in that segment can name another file,
+  and a language this build does not carry is a 404 that leaves the interface in English. The
+  port must be the one this client was constructed with, so no other loopback service is
+  addressable through it, and the response carries no `Access-Control-Allow-Origin`, so only the
+  workbench, which is same-origin with it, can read the body.
+- **The secret storage key is the second arm.** `POST http://127.0.0.1:<port>/_vscodroid/secret-key`
+  is answered by `secretKeyResponse` with the 32 bytes of `SecretStorageKey`,
+  `Cache-Control: no-store`, no `Access-Control-Allow-Origin` and no connection token. Any other method gets 403, and
+  so does a request whose `Origin` is not the workbench or whose `Sec-Fetch-Site` is not
+  `same-origin` (`secretKeyRequest`). A request carrying neither header is answered, because
+  refusing the workbench would lose its stored secrets. Measured on an API 33 emulator, WebView
+  passes `Origin` to `shouldInterceptRequest` (a sandboxed frame's POST arrived as
+  `origin=null` and was refused) and does not pass `Sec-Fetch-Site`. The missing
+  `Access-Control-Allow-Origin` stops another origin reading the key either way, and the key opens
+  nothing without the workbench origin's localStorage. Every other localhost request returns null here and is answered
+  by our own server, which does require the token.
+- **Only the workbench is loaded as the page on our own origin.** The server answers more than
+  the workbench there: `/vscode-remote-resource` serves any file as its own type, a workspace's
+  HTML included, and a page loaded from it shares the workbench's localStorage, the secret storage
+  key and, if taken for the workbench, the bridge token. Measured on an emulator before this rule:
+  one tap on a link in a Markdown preview replaced the editor with such a page, which decrypted the
+  stored secrets and read the token. The `window.open` override, which is how the workbench opens a
+  link, now navigates in place only to `/` with a query or fragment and quietly refuses any other
+  path on the origin. It has to be refused there: `shouldOverrideUrlLoading` also refuses a
+  main-frame load of any path but `/` on the workbench port, but by then the workbench has run
+  `beforeunload` and stopped its extension host, which left the editor half dead. `isWorkbenchUrl`,
+  which decides who is given the token, requires the same path. Subframes are not gated, because
+  the web extension host runs in a same-origin iframe under the static path (see the web extension
+  host entry below). Extension webview documents are on `*.vscode-cdn.net` and keep that origin
+  although the interception serves their bytes locally, so this rule never reaches them.
+- **Resources are answered to the origin that asked, never with `*`.** The response carries
+  `Access-Control-Allow-Origin: <the requesting origin>` and `Vary: Origin`. A request with no
+  `Origin` gets no such header: those are the no-cors subresource loads (`<img>`, `<link>`,
+  `<script src>`), whose bodies are opaque to the page whatever the response says.
+- **A no-cors request is judged by its `Referer`.** Opaque is not inert: a workspace `.js` goes out
+  as `application/javascript`, so a page on another origin could name it in `<script src>` and run
+  it in its own realm, and `<img onerror>` against a guessed path told that page which files exist.
+  `Cross-Origin-Resource-Policy: same-site` is sent and is the right header, but **Android WebView
+  does not apply that check to a response `shouldInterceptRequest` synthesises** (measured: the
+  same WebView refuses an ordinary network response carrying `same-origin`, and served ours
+  regardless). So a request carrying no `Origin` is served only when its `Referer` names the
+  workbench or a `*.vscode-cdn.net` document. An absent `Referer` is refused, because a page
+  suppresses its own with one `<meta name="referrer">` and measured still read the workspace
+  without it. CORS-mode loads (module scripts, fonts) carry an `Origin` and are judged above.
+- **The resource authority is not trusted to ask a different origin of ours.** `isOurOrigin`
+  accepts the workbench and a webview document and excludes anything under
+  `*.vscode-resource.vscode-cdn.net`. An `.html` file under a published root (a checked-out
+  repository, routinely) can be loaded as a document from that authority, and this stops it
+  reaching the workbench origin or a webview origin with a CORS-mode request.
+  **Residual, and wider than it used to say here:** the gate sees only requests carrying an
+  `Origin`. A same-origin `fetch` sends none, so a document at that authority asking for another
+  file under another published root is judged by the `Referer` rule instead, which accepts the
+  resource authority on purpose, because a stylesheet served from there is what asks for its own
+  `url(...)` subresources. A navigation carries no origin either, so the same document can frame
+  another path and read it back. Closing either needs a test for what the request is for, and the
+  only candidate header has not been measured on this WebView.
+- **A `*.vscode-cdn.net` request naming a foreign `parentOrigin` is refused.** The webview host page
+  takes its parent's origin from its own query string, so a page that can compose a URL could
+  otherwise host its script at an origin ending `.vscode-cdn.net`. Asset requests carry no
+  `parentOrigin` and pass untouched.
+- **The web extension host is same-origin with the workbench.** `product.json` carries no
+  `webEndpointUrlTemplate`, and without one the workbench starts that host in a same-origin iframe
+  and says so in the console. The consequence is the `BroadcastChannel` relay that lets a web
+  extension reach `AndroidBridge`: the channel is scoped by origin, so every installed web extension
+  shares it, and the per-session token is no barrier there because it is read from
+  `window.__vscodroid` on that same origin. `MainActivity.injectBridgeRelay` carries the per-command
+  reasoning for what that makes acceptable, and which commands were narrowed because of it.
+
+---
+
+## 4. Android Permissions
+
+### 4.1 Required Permissions
+
+| Permission                       | Reason                                          | When Requested |
+| -------------------------------- | ----------------------------------------------- | -------------- |
+| `INTERNET`                       | Open VSX, GitHub, toolchain downloads, built-in schema and package-registry lookups | Install time   |
+| `FOREGROUND_SERVICE`             | Keep Node.js alive in background                | Install time   |
+| `FOREGROUND_SERVICE_SPECIAL_USE` | Dev server foreground service type              | Install time   |
+| `POST_NOTIFICATIONS`             | Foreground Service notification (API 33+)       | Runtime        |
+
+Those four are what **this app's own** `AndroidManifest.xml` declares. The **installed** app holds
+more, because the manifest merger adds permissions from libraries, and a Play Store listing shows
+the merged set rather than ours:
+
+| Merged in                                        | By                                                                         |
+| ------------------------------------------------ | -------------------------------------------------------------------------- |
+| `FOREGROUND_SERVICE_DATA_SYNC`                    | `com.google.android.play:asset-delivery`, which backs toolchain downloads   |
+| `<applicationId>.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION` | AndroidX, for its own runtime-registered receivers                 |
+
+Neither table is the authority. `android/app/build/outputs/logs/manifest-merger-release-report.txt`
+is, and reading it is the step that catches a library adding a permission nobody asked for.
+
+### 4.2 Permissions this app does not hold
+
+Nothing below is declared. The first two were listed in this document as though they were held,
+until 2026-08-20; the rest have never been in scope.
+
+| Permission                                              | Why not                                                                                                                                                                                                                                                          |
+| ------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `MANAGE_EXTERNAL_STORAGE`                               | It would pull in a Play declaration process the app has no need of. Folders outside app storage are reached through SAF, which is a per-folder user grant rather than a permission, and which has the sync engine that makes write-back work                       |
+| `WAKE_LOCK`                                             | A consequence worth knowing: a foreground service raises process priority but does not keep the CPU awake, so a long build or test run in the terminal can stall when the screen goes off. Holding a wake lock is a product decision nobody has made yet           |
+| `READ_EXTERNAL_STORAGE`                                 | SAF is used instead, which grants one folder at a time rather than the whole of shared storage                                                                                                                                                                    |
+| `REQUEST_INSTALL_PACKAGES`                              | Not needed. The app installs no APKs; toolchains land in `filesDir` as plain files                                                                                                                                                                                |
+| `CAMERA`, `MICROPHONE`, `LOCATION`, `CONTACTS`, `PHONE` | Not needed by a code editor                                                                                                                                                                                                                                      |
+
+---
+
+## 5. Sensitive Data Handling
+
+### 5.1 Data Classification
+
+| Classification  | Examples                              | Handling                                                              |
+| --------------- | ------------------------------------- | --------------------------------------------------------------------- |
+| **User Code**   | Source files in workspace             | App-scoped storage, see 5.2. The app uploads none of it. **One shipped component does**: GitHub Copilot Chat, once the user has signed in to GitHub and used it, sends the prompt and the source it attaches as context. Nothing else in this build sends a workspace file anywhere, and a git push is the user's own instruction |
+| **Credentials** | Git passwords, SSH keys, OAuth tokens | App-private internal storage. Not included in backups.                |
+| **Settings**    | VS Code settings, preferences         | App-private internal storage. No sync store is configured in `product.json`, so Settings Sync has nowhere to send them. |
+| **Cache**       | WebView cache, extension cache        | Clearable. The app drops the WebView's cache on the first launch after each update; beyond that only Android's own Clear cache or Clear storage reach it, not `VSCodroid: Clear Caches`. No sensitive data. |
+| **Telemetry**   | None from VSCodroid or the editor build | Nothing is collected or transmitted by this app. The bundled chat extension carries senders of its own, gated on the editor's telemetry level; see 3.1 |
+
+### 5.2 Data at Rest
+
+Two locations, and the difference matters to a user rather than only to a reader of this document.
+
+| Tree                                                                | Where                                                                        |
+| ------------------------------------------------------------------- | ---------------------------------------------------------------------------- |
+| Settings, secrets, the server tree, bundled runtimes, installed toolchains, and the mirrors of folders opened through SAF | App-private internal storage, `/data/data/com.vscodroid/`. No other app can read it |
+| The default workspace, `projects/`                                  | Internal storage, `filesDir/projects`, on a new install. An install that already has `getExternalFilesDir(null)/projects` keeps it (`Environment.getProjectsDir`): shared storage cannot hold a symbolic link, which is what broke `npm install` there, but moving an existing install's files behind the user's back is not a fix |
+
+Android 11 closed `Android/data` to other apps and to the system Files app, and `minSdk` here is 30,
+which is that release, so an install still on the shared-storage location is not sharing in the pre-Android-11 sense. What
+survives there is MTP over USB and a few OEM file managers, which is enough that such a user can lose
+the projects tree from outside the app, and enough that "app-private" is the wrong word for that
+location. Clear Data wipes both.
+
+- Both trees are protected by Android's Linux-based file permissions
+- Encrypted at rest by Android full-disk encryption (enabled by default on modern devices)
+
+### 5.3 Data in Transit
+
+| Flow                              | Protocol         | Notes                                             |
+| --------------------------------- | ---------------- | ------------------------------------------------- |
+| WebView ↔ EditorGateway           | HTTP and WebSocket (127.0.0.1) | App-owned endpoint; connection token and origin checks still apply |
+| EditorGateway ↔ Server           | HTTP and WebSocket over a private filesystem socket | Raw bytes, with the original HTTP Host header preserved |
+| App ↔ Open VSX                    | HTTPS            | TLS 1.2+                                          |
+| App ↔ GitHub                      | HTTPS or SSH     | TLS 1.2+ or SSH                                   |
+| Extension host ↔ GitHub Copilot   | HTTPS            | Prompts and attached source, after a GitHub sign-in |
+| App ↔ Play Store (Asset Delivery) | HTTPS            | Managed by Play Store                             |
+| Built-in language features ↔ Schema and package registries | HTTPS | `json.schemastore.org`, the other schema hosts in `json.schemaDownload.trustedDomains`, and `registry.npmjs.org` when editing JSON, `package.json`, or JS/TS files; see `docs/PRIVACY_POLICY.md` |
+
+---
+
+## 6. Incident Response
+
+### 6.1 Vulnerability Disclosure
+
+- Reporting channels, response times and disclosure policy: [`SECURITY.md`](../SECURITY.md) holds the single copy, so a reporter who reads both documents is not given two answers
+
+### 6.2 Malicious Extension Response
+
+If a malicious extension is reported:
+
+1. Verify the report
+2. Report to Open VSX for removal
+3. Add to local blocklist in next app update (if needed)
+4. Notify affected users via in-app message (if possible)
+
+---
+
+## 7. Security Testing Checklist
+
+| Test                                   | Method                                                             | Frequency     |
+| -------------------------------------- | ------------------------------------------------------------------ | ------------- |
+| Local editor transport ownership       | Loopback port scan, private socket checks, and Stop/restart tests that retain the public listener | Every release |
+| No telemetry network requests          | Network traffic capture (Charles/mitmproxy)                        | Every release |
+| Extension Host isolation               | Install test extension that attempts privilege escalation          | Every release |
+| WebView CSP headers                    | Chrome DevTools Network tab                                        | Every release |
+| APK signature verification             | `apksigner verify`                                                 | Every release |
+| Dependency vulnerability scan          | `npm audit`, `safety check` (Python)                               | Weekly        |
+| Binary provenance                      | Checked where a binary enters the tree, not where it ships, and by three different anchors. Termux and Alpine packages resolve through their own signature chains (`scripts/verify-termux-index.sh`). The Node tarball, its headers and the fetched VSIXes are pinned to a sha256 written in the fetching script, as are the `node-pty`, `@parcel/watcher`, `@vscode/sqlite3` and `zeromq` sources `scripts/build-native-addons.sh` compiles, each with `node-addon-api` pinned to an exact version and a sha256, fetched with `npm pack` like the addons. The libzmq that `zeromq` links is a GitHub source archive at a fixed revision, pinned by sha256 in the same script. The Code - OSS server tarball is checked against the digest its GitHub Release carries, which `fetch-vscode-oss.sh` refuses to proceed without; that anchors it to the release rather than to this repository. The Gradle distribution is pinned by the `distributionSha256Sum` in `gradle-wrapper.properties`, which the wrapper checks before unpacking, and `lint.yml` refuses a tree whose wrapper carries none. The wheels pip is pointed at are not in the APK but are served from this project's own release: `wheelhouse.json` pins each one by sha256: Termux User Repository wheels, and Termux's `python-psutil` package, which `scripts/build-wheelhouse.py` checks against Termux's signed index before repacking it. The script runs every shared object through `verify-android-elf.py`, and the find-links page carries each digest, which pip enforces | Every download |
+| Bundled ELF integrity                  | `scripts/verify-android-elf.py` checks 16 KB page alignment and refuses any `DT_NEEDED` that Bionic does not provide and this app does not bundle. Each download script runs it on what it fetches; at packaging the Gradle sweep covers every binary in `jniLibs/arm64-v8a` and prints how many it checked, and the ~53 libraries under `assets/usr/lib` are read only as resolution sources there, having been checked when they were written. Most are downloaded. Two scripts build the rest and run the same check on each file they write: `scripts/build-glibc-shim.sh` writes `libglibc-shim.so` and ten stubs named after glibc's libraries (`libc.so.6` among them), and `scripts/build-termux-exec.sh` writes the exec interceptor `libtermux-exec.so` | Download or build, and packaging for `jniLibs` |
+| Storage permission scope               | Attempt to read/write outside app directory                        | Every release |
+| AndroidBridge token enforcement        | Call bridge methods with a wrong or absent token, verify rejected  | Every release |
+| Backup exclusion verification          | Validate backup payload excludes `~/.ssh`, `.gitconfig`, workspace | Every release |

@@ -1,0 +1,855 @@
+package com.vscodroid.setup
+
+import android.content.Context
+import com.google.android.play.core.assetpacks.AssetPackManagerFactory
+import com.vscodroid.util.Logger
+import io.mockk.Runs
+import io.mockk.every
+import io.mockk.just
+import io.mockk.mockk
+import io.mockk.mockkObject
+import io.mockk.mockkStatic
+import io.mockk.unmockkAll
+import org.junit.jupiter.api.AfterEach
+import org.junit.jupiter.api.Assertions.assertEquals
+import org.junit.jupiter.api.Assertions.assertFalse
+import org.junit.jupiter.api.Assertions.assertTrue
+import org.junit.jupiter.api.Assumptions.assumeTrue
+import org.junit.jupiter.api.BeforeEach
+import org.junit.jupiter.api.Test
+import org.junit.jupiter.api.io.TempDir
+import java.io.File
+
+/**
+ * What `toolchain-env.sh` has to contain for a downloaded toolchain to run at
+ * all.
+ *
+ * SELinux denies `execute_no_trans` on `app_data_file`, so nothing whose inode
+ * lives under `filesDir` can be `execve`d whatever its mode, and every byte of
+ * a downloaded toolchain lives there. The only thing that makes `go` or `ruby` a
+ * working command is the wrapper this file emits: a shell function that hands the
+ * binary to `/system/bin/linker64`, which the app is allowed to execute, and
+ * which loads the payload itself.
+ *
+ * That indirection had no test. The predicate it consults did, dozens of names
+ * against a real bash, while the line that actually routes through the loader
+ * was pinned nowhere, and neither was the ELF guard that decides which names get
+ * a wrapper at all. Both are one-line edits that read like leftovers, both leave
+ * every other test in this package green, and on a device the result is a picker
+ * that still says Installed and a command that answers `Permission denied` with
+ * exit 126.
+ *
+ * The wrapper is asserted as a whole line rather than by searching for the loader
+ * path: the loader has to come first, before the binary, and a line that merely
+ * mentions it somewhere is not the same thing.
+ */
+class ToolchainEnvFileTest {
+
+    @TempDir
+    lateinit var filesDir: File
+
+    private lateinit var context: Context
+    private lateinit var stateFile: File
+    private lateinit var envFile: File
+
+    @BeforeEach
+    fun setUp() {
+        mockkObject(Logger)
+        every { Logger.d(any(), any()) } just Runs
+        every { Logger.i(any(), any()) } just Runs
+        every { Logger.w(any(), any(), any()) } just Runs
+        every { Logger.e(any(), any(), any()) } just Runs
+
+        // The constructor reaches Play Core through field initialisation, so it
+        // runs before any method can be called.
+        mockkStatic(AssetPackManagerFactory::class)
+        every { AssetPackManagerFactory.getInstance(any()) } returns mockk(relaxed = true)
+
+        context = mockk(relaxed = true)
+        every { context.filesDir } returns filesDir
+
+        File(filesDir, "home/.vscodroid").mkdirs()
+        stateFile = File(filesDir, "home/.vscodroid/toolchains.json")
+        envFile = File(filesDir, "home/.vscodroid/toolchain-env.sh")
+    }
+
+    @AfterEach
+    fun tearDown() = unmockkAll()
+
+    /** The four bytes every ELF object starts with, plus enough body to be a file. */
+    private fun elf(relPath: String) = File(filesDir, relPath).apply {
+        parentFile?.mkdirs()
+        writeBytes(
+            byteArrayOf(0x7F, 'E'.code.toByte(), 'L'.code.toByte(), 'F'.code.toByte()) +
+                ByteArray(64)
+        )
+    }
+
+    private fun script(relPath: String) = File(filesDir, relPath).apply {
+        parentFile?.mkdirs()
+        writeText("#!/usr/bin/env ruby\nputs 1\n")
+    }
+
+    private fun install(vararg binaries: String) {
+        val list = binaries.joinToString(",") { "\"$it\"" }
+        stateFile.writeText(
+            """[{"name":"ruby","installRoot":"usr/opt/ruby","binaries":[$list],""" +
+                """"env":{"GEM_HOME":"${'$'}FILESDIR/usr/opt/ruby/gems"},""" +
+                """"pathDirs":["usr/opt/ruby/bin"]}]"""
+        )
+    }
+
+    /**
+     * A record whose `scriptWrappers` names [scripts], with `ruby` as the
+     * interpreter, exactly as `download-ruby.sh` writes one.
+     */
+    private fun installWithScripts(vararg scripts: String) {
+        val wrappers = scripts.joinToString(",") { """"$it":"usr/opt/ruby/bin/$it"""" }
+        val binaries = (listOf("ruby") + scripts)
+            .joinToString(",") { """"usr/opt/ruby/bin/$it"""" }
+        // `env` is not decoration here: the generator's per-toolchain loop reads
+        // it with `?: continue`, so a record without one is skipped whole and
+        // neither loop below it runs.
+        stateFile.writeText(
+            """[{"name":"ruby","installRoot":"usr/opt/ruby","binaries":[$binaries],""" +
+                """"env":{"GEM_HOME":"${'$'}FILESDIR/usr/opt/ruby/gems"},""" +
+                """"scriptWrappers":{"interpreter":"ruby","scripts":{$wrappers}}}]"""
+        )
+    }
+
+    private fun regenerate() = ToolchainManager(context).regenerateDerivedFiles()
+
+    private fun envLines() = envFile.readText().lines().map { it.trim() }
+
+    @Test
+    fun `a binary is invoked through the system loader, not directly`() {
+        elf("usr/opt/ruby/bin/ruby")
+        install("usr/opt/ruby/bin/ruby")
+
+        regenerate()
+
+        assertTrue(
+            envLines().contains(
+                """ruby() { /system/bin/linker64 "${'$'}PREFIX/../usr/opt/ruby/bin/ruby" "${'$'}@"; }"""
+            ),
+            "the wrapper no longer hands the binary to the system loader, so every " +
+                "downloaded toolchain command answers Permission denied:\n" +
+                envFile.readText(),
+        )
+    }
+
+    /**
+     * The env file is not only wrappers, and this is the control for the test
+     * above: a generator that emitted nothing at all, or that skipped this
+     * toolchain, would satisfy an assertion written as "no bad line is present".
+     */
+    @Test
+    fun `the toolchain's own environment and PATH still reach the file`() {
+        elf("usr/opt/ruby/bin/ruby")
+        install("usr/opt/ruby/bin/ruby")
+
+        regenerate()
+
+        val lines = envLines()
+        assertTrue(
+            lines.contains("""export GEM_HOME="${'$'}PREFIX/../usr/opt/ruby/gems""""),
+            "the toolchain's environment is missing:\n" + envFile.readText(),
+        )
+        assertTrue(
+            pathLine().contains(""""${'$'}PREFIX/../usr/opt/ruby/bin""""),
+            "the toolchain's PATH entry is missing:\n" + envFile.readText(),
+        )
+    }
+
+    /** The one line that adds the toolchains' directories to PATH, in the form it is written. */
+    private fun pathLine() = envLines().single { it.startsWith("for __vscodroid_d in ") }
+
+    /**
+     * Appended, never prepended, and the direction is the whole point.
+     *
+     * `pathDirs` names the directories the payload actually sits in, and for
+     * Ruby that is `usr/bin`, where `ruby` is the interpreter ELF itself, an
+     * inode under filesDir that SELinux refuses to execve. The trampoline
+     * directory that CAN start it is already ahead of them on the PATH the
+     * server process was given. A shell that prepended these would put the
+     * unexecutable copies back in front of it, for itself and for every child it
+     * spawns, and the fix would be invisible in exactly the place a user tests
+     * it first. Bash resolves its own functions before consulting PATH at all,
+     * so nothing about the interactive terminal would change to give it away.
+     */
+    @Test
+    fun `the toolchain PATH line appends rather than prepends`() {
+        elf("usr/opt/ruby/bin/ruby")
+        install("usr/opt/ruby/bin/ruby")
+
+        regenerate()
+
+        val pathLine = pathLine()
+        assertTrue(
+            pathLine.contains("""PATH="${'$'}PATH:${'$'}__vscodroid_d""""),
+            "the raw, unexecutable payload directories were put back in front of the " +
+                "trampoline directory: $pathLine",
+        )
+        assertFalse(
+            pathLine.contains("""PATH="${'$'}__vscodroid_d:"""),
+            "a directory is prepended: $pathLine",
+        )
+    }
+
+    /**
+     * Only ELF objects get a loader wrapper. A script handed to `linker64` is not
+     * a program it can load, so wrapping one would replace "this command does not
+     * exist" with a command that exists and always fails, and it would shadow
+     * the interpreter wrapper that does work, since that is written further down
+     * the same file.
+     */
+    @Test
+    fun `a script in the binaries list gets no loader wrapper`() {
+        script("usr/opt/ruby/bin/gem")
+        install("usr/opt/ruby/bin/gem")
+
+        regenerate()
+
+        assertEquals(
+            emptyList<String>(),
+            envLines().filter { it.startsWith("gem()") },
+            "a Ruby script was wrapped as though the loader could execute it",
+        )
+    }
+
+    /**
+     * A manifest naming a binary that is not on disk, a partial extraction, or
+     * a file an uninstall took, produces no wrapper for it either. Same guard,
+     * and worth holding separately: this is the case where the wrapper would be
+     * syntactically fine and fail only when the user runs it.
+     */
+    @Test
+    fun `a missing binary gets no wrapper`() {
+        install("usr/opt/ruby/bin/ruby")
+
+        regenerate()
+
+        assertEquals(
+            emptyList<String>(),
+            envLines().filter { it.startsWith("ruby()") },
+            "a wrapper was written for a binary that is not on disk",
+        )
+    }
+
+    /**
+     * A script wrapper is held to the same naming bar as a binary wrapper, and
+     * for the same reason.
+     *
+     * These names are not this repository's choice: `download-ruby.sh` takes each
+     * one from the `basename` of whatever upstream ships in the package's bin
+     * directory, splitting binaries from scripts by reading the file rather than
+     * by naming it. `.bashrc` sources this file unconditionally, and a name bash
+     * cannot use as a function is a parse error that costs every definition after
+     * it -- measured: sourcing `good() {...}`, `a=b() {...}`, `after() {...}`
+     * leaves `good` defined and `after` gone. The binaries loop refused such a
+     * name; the scripts loop beside it wrote it out.
+     *
+     * Dropping the [isShellFunctionName] check from the scripts loop turns this
+     * red on its first assertion.
+     */
+    @Test
+    fun `a script whose name bash cannot use as a function gets no wrapper`() {
+        every { Logger.w(any(), any()) } just Runs
+        elf("usr/opt/ruby/bin/ruby")
+        script("usr/opt/ruby/bin/gem")
+        script("usr/opt/ruby/bin/a=b")
+        installWithScripts("a=b", "gem")
+
+        regenerate()
+
+        assertEquals(
+            emptyList<String>(),
+            envLines().filter { it.startsWith("a=b()") },
+            "a name that is a parse error was written into a file .bashrc sources, " +
+                "so every wrapper after it is lost in every new terminal:\n" +
+                envFile.readText(),
+        )
+        // The control, and the half that says the refusal is narrow: the usable
+        // name beside it still gets its wrapper, so this is not a generator that
+        // simply stopped emitting script wrappers.
+        assertTrue(
+            envLines().contains(
+                """gem() { ruby "${'$'}PREFIX/../usr/opt/ruby/bin/gem" "${'$'}@"; }"""
+            ),
+            "the usable script name lost its wrapper too:\n" + envFile.readText(),
+        )
+    }
+
+    /**
+     * And a toolchain whose every script name is unusable writes no header for a
+     * section with nothing in it, which is what the binaries loop already does.
+     */
+    @Test
+    fun `a section with no usable script names is not written at all`() {
+        every { Logger.w(any(), any()) } just Runs
+        elf("usr/opt/ruby/bin/ruby")
+        script("usr/opt/ruby/bin/a;b")
+        installWithScripts("a;b")
+
+        regenerate()
+
+        assertEquals(
+            emptyList<String>(),
+            envLines().filter { it.contains("script wrappers") },
+            "an empty script-wrapper section was announced:\n" + envFile.readText(),
+        )
+    }
+
+    private val jdk = "usr/lib/jvm/java-21-openjdk"
+
+    /** What the java wrapper hands the loader ahead of the caller's arguments. */
+    private val java = "</p/../$jdk/bin/java><-Duser.home=/h o/me><-Djava.io.tmpdir=/t m/p>"
+
+    /** What the jshell wrapper hands the loader ahead of the caller's arguments. */
+    private val jshell = "</p/../$jdk/bin/jshell><-J-Djdk.lang.Process.launchMechanism=VFORK>" +
+        "<-J-Duser.home=/h o/me>"
+
+    /**
+     * Writes the env file for a Java toolchain holding `java` and `jshell`,
+     * sources it in a real bash with the loader replaced by a function that
+     * prints its arguments, runs [commands] there and returns what they printed.
+     * Anything the file prints while it is sourced, a syntax error included,
+     * lands in the same output.
+     */
+    private fun runJavaWrappers(commands: String, jvmFlags: String = ""): List<String> {
+        assumeTrue(File("/bin/bash").canExecute(), "no /bin/bash on this host")
+        elf("$jdk/bin/java")
+        elf("$jdk/bin/jshell")
+        elf("$jdk/bin/keytool")
+        elf("$jdk/bin/javac")
+        elf("$jdk/lib/jexec")
+        stateFile.writeText(
+            """[{"name":"java","installRoot":"$jdk",""" +
+                """"binaries":["$jdk/bin/java","$jdk/bin/jshell","$jdk/bin/keytool","$jdk/bin/javac","$jdk/lib/jexec"],""" +
+                jvmFlags +
+                """"env":{"JAVA_HOME":"${'$'}FILESDIR/$jdk"}}]"""
+        )
+
+        regenerate()
+
+        val sourced = File(filesDir, "env-under-test.sh")
+        sourced.writeText(envFile.readText().replace("/system/bin/linker64", "argv"))
+        val builder = ProcessBuilder(
+            "/bin/bash", "-c",
+            """argv() { printf '<%s>' "${'$'}@"; echo; }; PREFIX=/p; HOME='/h o/me'; TMPDIR='/t m/p'; """ +
+                """. "${'$'}1"; $commands""",
+            "bash", sourced.path,
+        ).redirectErrorStream(true)
+        builder.environment().apply {
+            remove("BASH_ENV")
+            remove("SSH_CLIENT")
+            remove("SSH2_CLIENT")
+        }
+        val out = finishTestProcess(builder.start()).second
+        return out.lines().filter { it.isNotEmpty() }
+    }
+
+    /**
+     * `jshell` is the one wrapper that adds arguments, and they are what make it
+     * start at all: its default engine launches a second JVM by absolute path,
+     * which cannot be exec'd from filesDir without the exec interceptor, and
+     * the wrapper is also sourced where none is preloaded, so it selects the
+     * local engine unless the caller chose one. jshell refuses `--execution`
+     * given twice and accepts abbreviations of it, so the guard is asserted in
+     * all three spellings. The `$HOME` with a space in it holds the quoting.
+     * `java` runs beside it with its own two properties, which must not pick up
+     * jshell's engine argument.
+     */
+    @Test
+    fun `jshell runs its snippets in its own JVM`() {
+        val out = runJavaWrappers(
+            """jshell; jshell a 'b c'; jshell --execution jdi; """ +
+                """jshell --exec=jdi; jshell -execution jdi; java -version"""
+        )
+
+        assertEquals(
+            listOf(
+                "$jshell<--execution><local>",
+                "$jshell<--execution><local><a><b c>",
+                "$jshell<--execution><jdi>",
+                "$jshell<--exec=jdi>",
+                "$jshell<-execution><jdi>",
+                "$java<-version>",
+            ),
+            out,
+            "the jshell wrapper no longer selects the local engine exactly once, so " +
+                "jshell fails to launch or refuses its arguments:\n" + envFile.readText(),
+        )
+    }
+
+    /**
+     * Termux compiled its own directories into libjava as the defaults of `user.home`
+     * and `java.io.tmpdir`, which this app can neither read nor create, so a program
+     * that makes a temporary file or reads the home directory fails on a path that
+     * belongs to another application. The wrapper passes the shell's values; a
+     * `-D` the caller writes after them wins because the last one is the one the
+     * JVM keeps, and an unset variable adds nothing rather than an empty property.
+     * keytool takes the home as a launcher option and nothing else.
+     */
+    @Test
+    fun `java and keytool start with this app's home and temporary directory`() {
+        val out = runJavaWrappers(
+            """java -version; java -Djava.io.tmpdir=/mine Main; """ +
+                """(unset TMPDIR; java -version); (unset HOME TMPDIR; java -version); """ +
+                """keytool -list; (unset HOME; keytool -list)"""
+        )
+
+        assertEquals(
+            listOf(
+                "$java<-version>",
+                "$java<-Djava.io.tmpdir=/mine><Main>",
+                "</p/../$jdk/bin/java><-Duser.home=/h o/me><-version>",
+                "</p/../$jdk/bin/java><-version>",
+                "</p/../$jdk/bin/keytool><-J-Duser.home=/h o/me><-list>",
+                "</p/../$jdk/bin/keytool><-list>",
+            ),
+            out,
+            "the java or keytool wrapper no longer hands over the home or the temporary " +
+                "directory exactly once:\n" + envFile.readText(),
+        )
+    }
+
+    /**
+     * A JVM from 20 on probes the CPU's SVE vector length with prctl, which the app's
+     * seccomp filter refuses, and says so on stderr at the start of every run on a
+     * phone whose CPU advertises SVE. A manifest that lists `-XX:UseSVE=0` has every
+     * launcher in the JDK's bin/ start with it: `java` takes it as it is, and the tools
+     * beside it take it as a -J option, which they hand to the VM they start. A manifest
+     * that lists none, an install made while the pack held JDK 17, starts them without it,
+     * because JDK 17 has no such flag and refuses to start with one. A flag that is not
+     * the shape of one is dropped, for the same reason the names of the wrappers are
+     * held to a bar: the line is read by every new terminal.
+     */
+    @Test
+    fun `the JVM flags a manifest lists reach every launcher in the JDK`() {
+        val flags = """"jvmFlags":["-XX:UseSVE=0","a b","-X;rm","-Dx=\"y\"","-agentlib:jdwp=transport=dt_socket",""" +
+            """"-javaagent:a.jar","-Dx=y","-Xbootclasspath","-XX:","-XX:=1","-XX:+"],"""
+        val out = runJavaWrappers(
+            """java -version; javac -version; keytool -list; jshell; """ +
+                """javac -J-Dx=1 A.java""",
+            jvmFlags = flags,
+        )
+
+        assertEquals(
+            listOf(
+                "</p/../$jdk/bin/java><-XX:UseSVE=0><-Duser.home=/h o/me><-Djava.io.tmpdir=/t m/p><-version>",
+                "</p/../$jdk/bin/javac><-J-XX:UseSVE=0><-version>",
+                "</p/../$jdk/bin/keytool><-J-XX:UseSVE=0><-J-Duser.home=/h o/me><-list>",
+                "</p/../$jdk/bin/jshell><-J-XX:UseSVE=0><-J-Djdk.lang.Process.launchMechanism=VFORK>" +
+                    "<-J-Duser.home=/h o/me><--execution><local>",
+                "</p/../$jdk/bin/javac><-J-XX:UseSVE=0><-J-Dx=1><A.java>",
+            ),
+            out,
+            "a JDK launcher no longer starts with the manifest's JVM flags, or took one that is " +
+                "not shaped like a flag:\n" + envFile.readText(),
+        )
+    }
+
+    @Test
+    fun `a binary kept in lib is no command at all`() {
+        // jexec and jspawnhelper live in lib/ and are listed in the manifest so that they get an
+        // execute bit. The JVM starts the helper by absolute path and jexec is a `#!` target, so a
+        // function named after either only added a command that prints nothing useful.
+        val out = runJavaWrappers(
+            """declare -F jexec || echo none; type -t java""",
+            jvmFlags = """"jvmFlags":["-XX:UseSVE=0"],""",
+        )
+
+        assertEquals(
+            listOf("none", "function"),
+            out,
+            "a helper the JVM starts by absolute path became a shell function",
+        )
+    }
+
+    @Test
+    fun `a manifest without JVM flags starts the launchers as before`() {
+        val out = runJavaWrappers("""java -version; javac -version""")
+
+        assertEquals(
+            listOf(
+                "$java<-version>",
+                "</p/../$jdk/bin/javac><-version>",
+            ),
+            out,
+            "an install made while the pack held JDK 17 must not be given a flag its JVM refuses",
+        )
+    }
+
+    /**
+     * The engine guard looks at each argument on its own, never at the joined
+     * command line. A search of `" $* "` for `" -ex"` failed both ways. A value
+     * holding a space before `-ex`, as these two paths do, read as an engine
+     * choice, so jshell got its default engine back and failed to launch it.
+     * And `"$*"` joins with the first character of IFS, so under the IFS a
+     * script in strict mode sets, or an empty one, a later `--execution` had
+     * no space before it, went unseen, and jshell refused the option given
+     * twice. The third line is the control in the other direction: `-ex`
+     * inside an argument, rather than at its start, is not an engine choice.
+     */
+    @Test
+    fun `jshell judges each argument on its own, whatever IFS holds`() {
+        val out = runJavaWrappers(
+            """jshell --startup 'My -experiments/a.jsh'; """ +
+                """jshell --class-path 'build/lib -extra/x.jar'; """ +
+                """jshell -R-Dexample=1 -C-Xlint:-exports my-example.jsh; """ +
+                """IFS=${'$'}'\n\t'; jshell -v --execution jdi; """ +
+                """IFS=; jshell -q --exec=jdi x.jsh"""
+        )
+
+        assertEquals(
+            listOf(
+                "$jshell<--execution><local><--startup><My -experiments/a.jsh>",
+                "$jshell<--execution><local><--class-path><build/lib -extra/x.jar>",
+                "$jshell<--execution><local><-R-Dexample=1><-C-Xlint:-exports><my-example.jsh>",
+                "$jshell<-v><--execution><jdi>",
+                "$jshell<-q><--exec=jdi><x.jsh>",
+            ),
+            out,
+            "the jshell wrapper read its arguments as one string, so a path holding " +
+                "' -ex' lost the local engine or a non-default IFS passed --execution " +
+                "twice:\n" + envFile.readText(),
+        )
+    }
+
+    /**
+     * An option's value is not an option. jshell's parser hands an option that
+     * takes a value the next argument whatever it looks like, so a value starting
+     * with `-ex` read as an engine choice and jshell lost the local engine:
+     * `--startup -extras.jsh` names a startup file. Each spelling that parser
+     * accepts for such an option is here: the name with two dashes or one, an
+     * abbreviation (`--st`, `-cl`, `-mo`, `-add-m`, `-add-e`, `-fe`, and `-c`,
+     * the shortest for --class-path), `--R`, `--C` and `-R`, and each of `-R`,
+     * `-C`, `-c` and `-m` closing a cluster of the flags `n`, `q`, `s` and `v`.
+     * So is the launcher's rule for `-J` arguments: it hands them to the JVM, so
+     * the argument after one is still the value. After `--` nothing is an option.
+     * The last four lines are the controls: an option takes one value and no
+     * more, and none at all when it is attached by `=` or written on after `-c`
+     * or `-m`, so the engine choice after it still counts. Every expectation was
+     * checked against the options jshell 17 declares, parsed by its own copy of
+     * jopt-simple.
+     */
+    @Test
+    fun `jshell steps over the value of an option that takes one`() {
+        val out = runJavaWrappers(
+            """jshell --startup -extras.jsh; jshell -startup -ex.jsh; jshell --st -ex.jsh; """ +
+                """jshell --class-path -ex.jar; jshell -c -ex.jar; jshell -cl -ex.jar; """ +
+                """jshell --module-path -ex; jshell -mo -ex; jshell --add-modules -ex; """ +
+                """jshell -add-m -ex; jshell --add-exports -ex/p=ALL-UNNAMED; """ +
+                """jshell -add-e -ex/p=ALL-UNNAMED; jshell --feedback -ex; jshell -fe -ex; """ +
+                """jshell --R -exx; jshell --C -exx; jshell -R -exx; """ +
+                """jshell -qC -exx; jshell -nR -exx; jshell -sc -ex.jar; jshell -vm -ex; """ +
+                """jshell --startup -J-Dx=1 -ex.jsh; jshell -- -ex.jsh; """ +
+                """jshell --startup a.jsh --exec=jdi; jshell --startup=a.jsh --exec=jdi; """ +
+                """jshell -cfoo -ex jdi; jshell -mfoo -ex jdi"""
+        )
+
+        assertEquals(
+            listOf(
+                "$jshell<--execution><local><--startup><-extras.jsh>",
+                "$jshell<--execution><local><-startup><-ex.jsh>",
+                "$jshell<--execution><local><--st><-ex.jsh>",
+                "$jshell<--execution><local><--class-path><-ex.jar>",
+                "$jshell<--execution><local><-c><-ex.jar>",
+                "$jshell<--execution><local><-cl><-ex.jar>",
+                "$jshell<--execution><local><--module-path><-ex>",
+                "$jshell<--execution><local><-mo><-ex>",
+                "$jshell<--execution><local><--add-modules><-ex>",
+                "$jshell<--execution><local><-add-m><-ex>",
+                "$jshell<--execution><local><--add-exports><-ex/p=ALL-UNNAMED>",
+                "$jshell<--execution><local><-add-e><-ex/p=ALL-UNNAMED>",
+                "$jshell<--execution><local><--feedback><-ex>",
+                "$jshell<--execution><local><-fe><-ex>",
+                "$jshell<--execution><local><--R><-exx>",
+                "$jshell<--execution><local><--C><-exx>",
+                "$jshell<--execution><local><-R><-exx>",
+                "$jshell<--execution><local><-qC><-exx>",
+                "$jshell<--execution><local><-nR><-exx>",
+                "$jshell<--execution><local><-sc><-ex.jar>",
+                "$jshell<--execution><local><-vm><-ex>",
+                "$jshell<--execution><local><--startup><-J-Dx=1><-ex.jsh>",
+                "$jshell<--execution><local><--><-ex.jsh>",
+                "$jshell<--startup><a.jsh><--exec=jdi>",
+                "$jshell<--startup=a.jsh><--exec=jdi>",
+                "$jshell<-cfoo><-ex><jdi>",
+                "$jshell<-mfoo><-ex><jdi>",
+            ),
+            out,
+            "the jshell wrapper read an option's value as an engine choice, so jshell " +
+                "lost the local engine, or took an engine choice for a value and was " +
+                "handed --execution twice:\n" + envFile.readText(),
+        )
+    }
+
+    /**
+     * The guard keeps nothing from one call to the next. The function is sourced
+     * into every bash, scripts included, so a flag that outlived its call would
+     * let one `jshell --execution jdi` take the local engine away from every
+     * later `jshell` in that shell, and a global `arg` or `skip` would overwrite
+     * the caller's own. `set -u` is what a strict-mode script runs under, and there
+     * a flag declared without a value is unbound and ends the script. That last
+     * one shows only where bash leaves such a flag unset, as bash 5 on CI and on
+     * the device does; the bash 3.2 macOS ships gives it an empty value.
+     */
+    @Test
+    fun `jshell keeps nothing from one call to the next`() {
+        val out = runJavaWrappers(
+            """set -u; jshell --execution jdi; jshell x.jsh; """ +
+                """argv "${'$'}{arg-unset}" "${'$'}{chosen-unset}" "${'$'}{skip-unset}""""
+        )
+
+        assertEquals(
+            listOf(
+                "$jshell<--execution><jdi>",
+                "$jshell<--execution><local><x.jsh>",
+                "<unset><unset><unset>",
+            ),
+            out,
+            "the jshell wrapper's engine check outlived its call or failed under " +
+                "set -u, so a later jshell lost the local engine, the caller's " +
+                "variables changed, or the script stopped:\n" + envFile.readText(),
+        )
+    }
+
+    /**
+     * A state file nothing can parse is not "no toolchains installed".
+     *
+     * `readState` answers a damaged file with an empty array because it cannot do
+     * better, and the per-launch regeneration treats empty as "nothing is
+     * installed" and deletes the env file. The devices that have such a file are
+     * the ones upgrading from a version that wrote it with `writeText`: the
+     * truncation window this build closes with `writeAtomically` is exactly the
+     * damage being read back. Deleting over it takes the loader wrappers out of
+     * every new terminal while the several hundred MB they make runnable stay on
+     * disk, and the env file written by the version that installed them is then
+     * the only working record of how to run any of it. The bashrc repair keeps
+     * damaged files it cannot parse for the same reason; this is its toolchain
+     * counterpart.
+     */
+    @Test
+    fun `a state file that cannot be parsed leaves the env file alone`() {
+        every { Logger.w(any(), any()) } just Runs
+
+        elf("usr/opt/ruby/bin/ruby")
+        install("usr/opt/ruby/bin/ruby")
+        regenerate()
+        val writtenByTheInstall = envFile.readText()
+
+        stateFile.writeText("""[{"name":"ruby","installRoot":"usr/op""")
+
+        regenerate()
+
+        assertTrue(envFile.isFile, "the env file was deleted over an unreadable state")
+        assertEquals(
+            writtenByTheInstall, envFile.readText(),
+            "the env file was rewritten over an unreadable state"
+        )
+    }
+
+    // -- a toolchain that starts only through the preloaded exec --------------
+
+    private fun installPreloadOnly(vararg binaries: String) {
+        val list = binaries.joinToString(",") { "\"$it\"" }
+        stateFile.writeText(
+            """[{"name":"cpp","preloadOnly":true,"binaries":[$list],""" +
+                """"env":{},"pathDirs":["usr/bin"]}]"""
+        )
+    }
+
+    /**
+     * A function hands the file to `/system/bin/linker64` by hand, and the
+     * loader then reports itself as the program's own path. clang finds its
+     * resource directory and sysroot from that path, so a `clang()` wrapper
+     * would make the compiler look in the loader's directory. The flag keeps the
+     * wrapper out; the program is found through PATH and started by the exec of
+     * the shell, which a terminal preloads.
+     */
+    @Test
+    fun `a preloadOnly toolchain gets no loader wrapper`() {
+        elf("usr/bin/clang-21")
+        installPreloadOnly("usr/bin/clang-21")
+
+        regenerate()
+
+        assertEquals(
+            emptyList<String>(),
+            envLines().filter { it.startsWith("clang-21()") },
+            "a toolchain that must not start through the loader by hand was wrapped:\n" +
+                envFile.readText(),
+        )
+    }
+
+    /**
+     * The control for the case above, and the half of the claim that matters
+     * more: what the flag does NOT remove. The directory still reaches PATH, so
+     * the compiler is found at all, and the file says why it has no functions.
+     */
+    @Test
+    fun `a preloadOnly toolchain keeps its PATH entry and says why it has no wrappers`() {
+        elf("usr/bin/clang-21")
+        installPreloadOnly("usr/bin/clang-21")
+
+        regenerate()
+
+        val lines = envLines()
+        assertTrue(
+            pathLine().contains(""""${'$'}PREFIX/../usr/bin""""),
+            "the flag took the PATH entry too:\n" + envFile.readText(),
+        )
+        assertTrue(
+            lines.any { it.startsWith("# cpp programs start through the terminal's preloaded exec") },
+            "nothing in the file explains the missing functions:\n" + envFile.readText(),
+        )
+    }
+
+    @Test
+    fun `the same record without the flag is wrapped`() {
+        elf("usr/bin/clang-21")
+        stateFile.writeText(
+            """[{"name":"cpp","binaries":["usr/bin/clang-21"],"env":{}}]"""
+        )
+
+        regenerate()
+
+        assertTrue(
+            envLines().contains(
+                """clang-21() { /system/bin/linker64 "${'$'}PREFIX/../usr/bin/clang-21" "${'$'}@"; }"""
+            ),
+            "the control: without the flag the binary gets its wrapper:\n" + envFile.readText(),
+        )
+    }
+
+    @Test
+    fun `a preloadOnly toolchain gets no script wrapper either`() {
+        elf("usr/bin/interp")
+        script("usr/bin/tool")
+        stateFile.writeText(
+            """[{"name":"x","preloadOnly":true,"binaries":["usr/bin/interp","usr/bin/tool"],""" +
+                """"env":{},"scriptWrappers":{"interpreter":"interp",""" +
+                """"scripts":{"tool":"usr/bin/tool"}}}]"""
+        )
+
+        regenerate()
+
+        assertEquals(
+            emptyList<String>(),
+            envLines().filter { it.startsWith("tool()") || it.startsWith("interp()") },
+            envFile.readText(),
+        )
+    }
+    /**
+     * The generated lines, run by a real bash the way every new terminal runs them.
+     *
+     * Sourced twice, because that is what a bash started from a terminal's bash does:
+     * a plain `export PATH="$PATH:..."` carried every toolchain directory twice, and a
+     * plain `export RUBYOPT=...` put `-rrubygems` over the `-rbundler/setup` a
+     * `bundle exec` had set, so a bash started under it lost the Gemfile's gems.
+     */
+    private fun sourcedTwice(env: Map<String, String>): Map<String, String> {
+        val script = File(filesDir, "source.sh")
+        script.writeText(
+            ". '${envFile.absolutePath}'; . '${envFile.absolutePath}'; " +
+                "printf 'PATH=%s\\nRUBYOPT=%s\\nLOOPVAR=%s\\nCALLERD=%s\\n' \"\$PATH\" \"\${RUBYOPT-}\" \"\${__vscodroid_d+leaked}\" \"\${d-unset}\"",
+        )
+        val builder = ProcessBuilder("bash", script.absolutePath).redirectErrorStream(true)
+        builder.environment().apply {
+            clear()
+            putAll(env)
+            put("PREFIX", "${filesDir.absolutePath}/usr")
+        }
+        val out = finishTestProcess(builder.start()).second
+        return out.lines().filter { '=' in it }.associate { it.substringBefore('=') to it.substringAfter('=') }
+    }
+
+    private fun rubyWithOptions() {
+        elf("usr/opt/ruby/bin/ruby")
+        stateFile.writeText(
+            """[{"name":"ruby","installRoot":"usr/opt/ruby","binaries":["usr/opt/ruby/bin/ruby"],""" +
+                """"env":{"RUBYOPT":"-rrubygems"},"pathDirs":["usr/opt/ruby/bin","usr/opt/ruby/bin"]}]""",
+        )
+    }
+
+    @Test
+    fun `sourcing the file twice adds each directory to PATH once`() {
+        rubyWithOptions()
+        regenerate()
+
+        val path = sourcedTwice(mapOf("PATH" to "/bin:/usr/bin"))["PATH"]!!.split(":")
+
+        assertEquals(1, path.count { it.endsWith("/usr/opt/ruby/bin") }, "PATH: $path")
+        assertEquals(listOf("/bin", "/usr/bin"), path.take(2), "the existing PATH was reordered: $path")
+    }
+
+    @Test
+    fun `sourcing the file leaves no loop variable in the shell`() {
+        rubyWithOptions()
+        regenerate()
+
+        val shell = sourcedTwice(mapOf("PATH" to "/bin:/usr/bin"))
+
+        assertEquals("", shell["LOOPVAR"], "the PATH loop's variable is left set in every terminal")
+    }
+
+    @Test
+    fun `sourcing the file leaves a d the caller already had as it was`() {
+        rubyWithOptions()
+        regenerate()
+
+        val shell = sourcedTwice(mapOf("PATH" to "/bin:/usr/bin", "d" to "mine"))
+
+        assertEquals("mine", shell["CALLERD"], "the PATH loop overwrote or removed the caller's d")
+    }
+
+    @Test
+    fun `RUBYOPT is added to what the caller already set, once`() {
+        rubyWithOptions()
+        regenerate()
+
+        assertEquals(
+            "-rbundler/setup -rrubygems",
+            sourcedTwice(mapOf("PATH" to "/bin", "RUBYOPT" to "-rbundler/setup"))["RUBYOPT"],
+        )
+        assertEquals("-rrubygems", sourcedTwice(mapOf("PATH" to "/bin"))["RUBYOPT"])
+        assertEquals(
+            "-W0 -rrubygems",
+            sourcedTwice(mapOf("PATH" to "/bin", "RUBYOPT" to "-W0 -rrubygems"))["RUBYOPT"],
+            "an option already present was added again",
+        )
+    }
+    /**
+     * Not a boundary against the pack, whose manifest is as trusted as its binaries; a bar
+     * that keeps one unusable entry from taking out the file every new terminal sources,
+     * the way an unusable function name already is. Run through a real bash: the line after
+     * the refused ones has to still be defined.
+     */
+    @Test
+    fun `an entry that cannot be written safely is skipped and the rest still source`() {
+        assumeTrue(File("/bin/bash").canExecute(), "no /bin/bash on this host")
+        elf("usr/opt/ruby/bin/ruby")
+        stateFile.writeText(
+            """[{"name":"ruby","installRoot":"usr/opt/ruby","binaries":["usr/opt/ruby/bin/ruby"],""" +
+                """"env":{"BAD KEY":"x","QUOTE":"a\"b","SUBST":"${'$'}(id)","TICK":"`id`","SLASH":"trailing\\",""" +
+                """"GOOD":"${'$'}FILESDIR/ok"},""" +
+                """"pathDirs":["usr/opt/ruby/bin","../up","/abs","a/${'$'}x","bad\"dir","trailing\\"]}]""",
+        )
+
+        regenerate()
+
+        val text = envFile.readText()
+        assertTrue(text.contains("""export GOOD="${'$'}PREFIX/../ok""""), text)
+        for (bad in listOf("BAD KEY", "QUOTE", "SUBST", "TICK", "SLASH")) {
+            assertFalse(text.contains(bad), "$bad reached the file:\n$text")
+        }
+        assertEquals(
+            """for __vscodroid_d in "${'$'}PREFIX/../usr/opt/ruby/bin"; do""",
+            pathLine().substringBefore("; do") + "; do",
+        )
+        val check = finishTestProcess(ProcessBuilder("bash", "-n", envFile.absolutePath).redirectErrorStream(true).start())
+        assertEquals(0, check.first, "the generated file does not parse:\n${check.second}")
+    }
+}

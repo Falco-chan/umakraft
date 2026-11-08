@@ -1,0 +1,383 @@
+name: Lint
+
+# Both triggers, because the pull request is not how most code arrives here.
+# Measured 2026-08-16: of 362 first-parent commits since v1.0.0, 11 are merges,
+# so 351 landed straight on main and reached none of the gates below. The one
+# that made this concrete is the patch-parse step: a prose edit inside a patch
+# body that breaks its hunk header passes every other check in the repository,
+# and without a push trigger it surfaced only in build-vscode-oss.yml, which is
+# manual and runs once per VS Code bump. The diagnosis arrived weeks after the
+# commit.
+#
+# Safe on push because every step below reads committed sources or the stubs it
+# creates itself: no secrets, no downloaded assets, and no github.event field.
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+concurrency:
+  group: lint-${{ github.ref }}
+  cancel-in-progress: true
+
+# Read by default. Nothing here publishes, and nothing here reaches the network
+# except the Gradle and Node toolchain downloads. Without this block the token's
+# scope is whatever the repository's default workflow permissions happen to be,
+# which is a setting outside this file and outside review. release.yml has said
+# this since it was written.
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: Android Lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Full history, for document dates and bundled extension version checks.
+          # `git log -1 -- <file>` in checkout's default single-commit clone
+          # reports the tip commit for every file it can see, so that check
+          # cannot answer here without this and refuses to guess. 58 MiB of
+          # pack, measured 2026-08-22, against a release that used to be the
+          # first place anybody found out.
+          fetch-depth: 0
+          # Nothing here pushes, and reading the local history the line above
+          # fetches needs no credential. A persisted token would be readable by
+          # `./gradlew lint` and every gate below it for the length of the job.
+          persist-credentials: false
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@77dd5b2ce225ea11469928ac317850245a74ae78 # v6.2.0
+        with:
+          java-version: "17"
+          distribution: "temurin"
+
+      # No api-level here, and that is deliberate rather than an omission.
+      # android-actions/setup-android has never declared one: its inputs are
+      # cmdline-tools-version, accept-android-sdk-licenses,
+      # log-accepted-android-sdk-licenses and packages. Passing api-level: 36
+      # produced "Unexpected input(s) 'api-level'" on every run and set nothing,
+      # for as long as it was there. The platform this build needs is fetched by
+      # Gradle from compileSdk, which is why removing it changes no behaviour.
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@be39fa834029ff78f1a44aa3bb0819b8fc2bd8fd # v4.0.4
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@8da46b539cd8fe6ab27ca75128919a18d757604c # v6.4.1
+        with:
+          # Pinned to a non-commercial value, not left to the default.
+          #
+          # gradle/actions v6 added cache-provider and defaults it to 'enhanced',
+          # which the action's own description calls "the full-featured commercial
+          # caching service (gradle-actions-caching)". This project drops
+          # dependencies over their licences and publishes a source offer, so a
+          # dependency bump does not get to move it onto a commercial service.
+          # Naming the value also means a later default change cannot move it.
+          #
+          # `external` rather than `basic`: this action saves its cache even when
+          # the job failed (its post step runs unless cancelled), and the basic
+          # provider keeps the first entry written under a key, with no restore
+          # keys and no overwrite. A job that failed before Gradle had downloaded
+          # anything saved an empty entry (444 bytes, 2026-11-08), and every later
+          # job with the same Gradle files restored it and downloaded everything
+          # again. The Gradle home is cached by the actions/cache step below,
+          # which saves only after a successful job.
+          cache-provider: external
+
+      - name: Cache the Gradle user home
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          # Follows the Gradle scripts, the version catalogue and the wrapper. A
+          # change to any of them restores the newest earlier entry by prefix and
+          # saves a new one, so a build file edit no longer starts from nothing.
+          key: gradle-home-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('android/**/*.gradle.kts', 'android/gradle/**') }}
+          restore-keys: |
+            gradle-home-${{ runner.os }}-${{ runner.arch }}-
+
+      # For the JavaScript self-checks below. Pinned rather than left to
+      # whatever the runner image happens to carry, and pinned to the major
+      # the APK ships: the code under test runs on the device under the
+      # Termux nodejs-lts that build-native-addons.sh names in NODE_VERSION,
+      # and nowhere else, so a self-check green on another major says nothing
+      # about the device. It ran on 20 while every APK carried 24, which
+      # check-build-steps.py now refuses.
+      - name: Set up Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "24"
+
+      # Lint only needs compiled Kotlin, not runtime assets.
+      # Create minimal directory structure so Gradle does not fail.
+      - name: Create minimal asset stubs
+        run: |
+          mkdir -p android/app/src/main/jniLibs/arm64-v8a
+          mkdir -p android/app/src/main/assets/vscode-reh/out
+          mkdir -p android/app/src/main/assets/usr
+          mkdir -p android/app/src/main/assets/extensions
+          printf '\x7fELF' > android/app/src/main/jniLibs/arm64-v8a/libnode.so
+          dd if=/dev/zero bs=1 count=60 >> android/app/src/main/jniLibs/arm64-v8a/libnode.so 2>/dev/null
+
+      # Reads no assets and needs no toolchain, so it runs before the slow part
+      # and reports the mismatch on its own rather than inside a lint report.
+      - name: Check the documented build steps match the workflows
+        run: python3 scripts/check-build-steps.py
+
+      # Beside it because it asks the other half of the question: that one checks
+      # which scripts the workflows run, this one checks that every step is a
+      # step the runner will accept at all. Valid YAML is not valid workflow, and
+      # a step carrying only a name loads cleanly and is rejected at dispatch.
+      - name: Check every workflow step is runnable and pinned
+        run: python3 scripts/check-workflow-steps.py
+
+      # Seven gates whose refusal has no file in the tree to fire on: every
+      # release gate is an allowlist, every bundled executable names Android's
+      # loader, every server tree carries the Copilot CLI licence, every
+      # patch in patches/ carries a number the manifest can key it by, the
+      # editor source still updates synchronously where 0022 relies on it, a
+      # virtualenv's activate script carries the home the app runs from, and
+      # every glibc forwarder has a Bionic or shim symbol behind it. A
+      # refusal that has quietly stopped firing prints exactly what a clean
+      # tree prints, so each one is handed the input it exists to refuse, and
+      # a control it must accept, on every run.
+      - name: Check the gates still refuse what they exist to refuse
+        run: |
+          python3 scripts/check-workflow-steps.py --self-test
+          python3 scripts/verify-android-elf.py --self-test
+          python3 scripts/verify-server-tree.py --self-test
+          python3 scripts/check-patch-fingerprints.py --self-test
+          python3 scripts/check-editcontext-sync.py --self-test
+          python3 scripts/patch-venv-home.py --self-test
+          python3 scripts/gen-glibc-forwarders.py --self-test
+          python3 scripts/test-language-detection.py
+
+      # The same question asked of the build tool itself, which the step above
+      # cannot reach: `uses:` pinning covers the actions, and the wrapper
+      # downloads Gradle from a URL. Presence only, deliberately. A sum that is
+      # present and WRONG is not a silent failure -- the wrapper refuses the
+      # distribution on the next invocation and says so -- while a sum that is
+      # absent looks exactly like a pinned tree and runs whatever the URL
+      # serves. Absence is also how it comes back: `gradle wrapper
+      # --gradle-version X` regenerates that file from a fixed set of keys and
+      # drops the sum unless the bump passes --gradle-distribution-sha256-sum.
+      - name: Check the Gradle distribution is pinned to a digest
+        run: |
+          props=android/gradle/wrapper/gradle-wrapper.properties
+          if ! grep -q '^distributionSha256Sum=[0-9a-f]\{64\}$' "$props"; then
+            echo "::error file=$props::no distributionSha256Sum; the wrapper would" \
+                 "run whatever $(grep -m1 '^distributionUrl=' "$props") serves." \
+                 "Take the digest from that URL with .sha256 appended."
+            exit 1
+          fi
+          grep '^distributionUrl=\|^distributionSha256Sum=' "$props"
+
+      # Same reasoning, one file further: reads two committed sources and no
+      # assets. The contract an extension author writes against had never been
+      # held to the bridge it describes, and one pass found fourteen
+      # disagreements across twenty-eight methods.
+      - name: Check the bridge API spec matches the registered signatures
+        run: python3 scripts/check-bridge-api-spec.py
+
+      # Reads two files and no assets, so it runs beside the other cheap check
+      # rather than inside the build. What it guards arrives a whole release
+      # after the change that causes it: raising targetSdk closes the local
+      # network, and the symptom is a friend's browser timing out.
+      - name: Check local network access survives the targetSdk in use
+        run: python3 scripts/check-local-network-permission.py
+
+      # The privacy policy is the one document here that makes a closed statement
+      # about permissions, and nothing measured it: it said four and no others
+      # while the installed app declared six, because the two extras are folded in
+      # by the manifest merger and appear in no committed file. A bare checkout has
+      # no merged manifest, so this covers the committed half and says so; the
+      # merged half runs from the checkPermissionClaims Gradle task on a real build.
+      - name: Check the privacy policy matches the permissions that ship
+        run: python3 scripts/check-permission-claims.py
+
+      # Beside `Run lint` rather than inside it, and the pairing is the point:
+      # lint's own HardcodedText detector reads layouts and nothing else, so a
+      # message raised from Kotlin has never been anyone's to catch. Reads the
+      # Kotlin sources only, so it costs nothing and needs no assets.
+      - name: Check no user-facing text is stranded in Kotlin
+        run: python3 scripts/check-translatable-strings.py
+
+      # Here rather than after `Run lint` below, because it reads the committed
+      # baseline and not the report. The count lint prints is a property of the
+      # machine: the same regenerated file filtered all 91 of its entries in the
+      # checkout that wrote it and 46 anywhere else, so a report-based check
+      # would read green exactly where the accident happens.
+      - name: Check the lint baseline has not grown
+        run: python3 scripts/check-lint-baseline.py
+
+      # The committed half: the bundled extension list and the notices table are
+      # two hand-kept copies of one fact, and each edit only ever touched one.
+      # The other half of this script reads the extracted trees for the licence
+      # they declare, and runs from download-extensions.sh, because those trees
+      # are gitignored and no job here builds them.
+      # Three Unicode dashes this project does not write, replaced by ordinary
+      # punctuation. 857 of them had accumulated across 118 files before anyone
+      # counted, because each arrives one edit at a time from an editor that
+      # substitutes them, which is the shape a convention cannot hold on its own.
+      # Verbatim licence text and the body of a patch are exempt: both are
+      # reproduced rather than written, and a patch context line has to match the
+      # file it applies to byte for byte.
+      - name: Check the tree writes plain punctuation
+        run: python3 scripts/check-plain-punctuation.py
+
+      - name: Check the bundled extensions match the notices
+        run: python3 scripts/check-bundled-extensions.py
+
+      - name: Check extension extraction recovers after an interrupted copy
+        run: python3 scripts/test-download-extensions.py
+
+      - name: Check the Copilot compile stage leaves a complete SDK directory
+        run: python3 scripts/test-copilot-compile-guard.py
+
+      - name: Check the sysroot header patcher rewrites tmpfile and the passwd entry
+        run: python3 scripts/test-patch-sysroot-paths.py
+
+      - name: Check toolchain argument parsing with the host compiler
+        run: python3 scripts/test-exec-trampoline.py
+
+      - name: Check release version declarations are read exactly
+        run: python3 scripts/test-release-versions.py
+
+      - name: Check packaging and device maintenance commands offline
+        run: python3 scripts/test-maintenance-scripts.py
+
+      - name: Check native shim behavior
+        run: python3 scripts/test-native-shims.py
+
+      # The release preflight reads this repository's real server tag, which differs
+      # whenever a server input changed since the last publish, so lint does not run
+      # it. This builds throwaway repositories from a copy of the real cache key and
+      # changes one input at a time.
+      - name: Check the release refuses a server built from other inputs
+        run: python3 scripts/test-check-server-published.py
+
+      # The picker is built from ToolchainRegistry.available; nothing else that
+      # names a toolchain is. Withdrawing one left seven documents and the
+      # in-app walkthrough still offering it, so the app promised a language it
+      # would then refuse to install.
+      - name: Check no document offers a withdrawn toolchain
+        run: python3 scripts/check-toolchain-claims.py
+
+      # Reads two Markdown files, the checklist and the release plan that cites
+      # its rows, and no assets. The summary it checks is derived data kept by
+      # hand, and it is the only record of whether a manual test pass covered
+      # everything, so a wrong count is a coverage claim nobody made.
+      - name: Check the device-test checklist accounts for its own rows
+        run: python3 scripts/check-checklist-totals.py
+
+      # The same question one directory over, and the answer had rotted twice.
+      # Nothing runs the instrumented suite -- no runner measured here can, and
+      # CI compiles it and stops -- so androidTest/README.md is the only account
+      # of what it covers, and it had the total wrong and three of its classes
+      # missing from the table. A directory nobody executes, described by a
+      # document nobody checks, reads as coverage twice over.
+      - name: Check the instrumented suite matches what documents it
+        run: python3 scripts/check-instrumented-inventory.py
+
+      # Also in release.yml, where it is the last thing standing between a tag
+      # and a published build. It ran there alone, and there is no cheaper place
+      # for a check whose oracle is git history, so a documentation sweep that
+      # restaled either date was invisible until the tag was already public and
+      # the release job had aborted twenty seconds in. The checkout above takes
+      # full history for this step.
+      - name: Check the shipped documents are not dated before their contents
+        run: python3 scripts/check-document-dates.py
+
+      # `git apply --stat` parses a patch without needing the tree it applies to,
+      # so the one thing that cannot be checked on a pull request -- whether the
+      # patches still apply -- is separated here from the thing that can: whether
+      # git can still read them at all. Editing prose inside a patch body without
+      # adjusting the hunk header produces a file that every check in this
+      # repository passed, because check-patch-fingerprints.py inspects the
+      # downloaded server tree rather than the patches. The failure then surfaced
+      # only in build-vscode-oss.yml, which is manual and runs once per VS Code
+      # bump, so the diagnosis arrived weeks after the commit that caused it.
+      - name: Check every patch is still readable by git
+        run: |
+          bad=0
+          for p in patches/*.patch; do
+            if ! git apply --stat "$p" >/dev/null 2>&1; then
+              echo "::error file=$p::git cannot parse this patch; the hunk header line counts probably no longer match the body"
+              git apply --stat "$p" || true
+              bad=1
+            fi
+          done
+          [ "$bad" -eq 0 ] && echo "ok -- $(ls patches/*.patch | wc -l | tr -d ' ') patches parse"
+          exit "$bad"
+
+      # The device suite itself cannot run here -- no /dev/kvm on GitHub's arm64
+      # runners, and the bundled binaries need Android's linker. What can run is
+      # the part that rots silently: the versions it derives from the tree.
+      - name: Check the device suite can still read what it asserts
+        run: bash scripts/device-test.sh --self-check
+
+      # The JavaScript that ships inside the APK: the server bootstrap, the
+      # phantom-process monitor and the extension that displays it, the platform
+      # override preloaded into every Node process, and the loopback DNS proxy.
+      # All of them need Node and nothing else -- no assets, no SDK; the
+      # extension is committed rather than downloaded -- so they belong beside
+      # the other cheap gates rather than behind fifteen minutes of downloads in
+      # build.yml.
+      #
+      # test-dns-proxy.js existed, passed, and was run by nothing. What it
+      # covers is the Basic-auth token on the proxy every musl DNS lookup goes
+      # through, and loopback on Android is not isolated per app: that token is
+      # the only thing standing between the proxy and every other app on the
+      # device.
+      - name: Check the bundled JavaScript runtime
+        run: |
+          node scripts/test-dns-proxy.js
+          node scripts/test-process-monitor.js
+          node scripts/test-platform-fix.js
+          node scripts/test-server-bootstrap.js
+          node scripts/test-server-run-proof.js
+          node scripts/test-process-monitor-extension.js
+          node scripts/test-bridge-relay.js
+          node scripts/test-auth-callback-provider.js
+          node scripts/test-saf-mirror-usage.js
+          node scripts/test-server-startup.js
+          node scripts/test-ui-scale.js
+          node scripts/test-plain-text-page.js
+          node scripts/test-download-capture.js
+          node scripts/test-arrow-edge-guard.js
+          node scripts/test-modifier-release.js
+          node scripts/test-composing-enter.js
+          node scripts/test-leave-curtain.js
+          node scripts/test-status-bar-scroll.js
+          node scripts/test-keyboard-guard.js
+          node scripts/test-caret-drag.js
+          node scripts/test-serve-network.js
+          node scripts/test-welcome.js
+          node scripts/test-workbench-layout.js
+          node scripts/test-run-file.js
+          node scripts/test-auth-bootstrap.js
+          python3 scripts/test-extension-updates.py
+          python3 scripts/check-extension-updates.py
+          node scripts/test-xdg-open.js
+          node scripts/test-page-scripts.js
+          node scripts/test-server-serve-file.js
+
+      - name: Run lint
+        working-directory: android
+        run: ./gradlew lint
+
+      - name: Upload lint report
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: lint-report
+          path: |
+            android/app/build/reports/lint-results-*.html
+            android/app/build/reports/lint-results-*.xml
+          retention-days: 14

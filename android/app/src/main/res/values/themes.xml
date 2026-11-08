@@ -1,0 +1,72 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+
+    <style name="Theme.VSCodroid" parent="Theme.Material3.DayNight.NoActionBar">
+        <!-- Primary brand color -->
+        <item name="colorPrimary">@color/colorPrimary</item>
+        <item name="colorPrimaryDark">@color/colorPrimaryDark</item>
+        <item name="colorAccent">@color/colorAccent</item>
+        <!-- Overriding colorPrimary without this left Material3 supplying its own
+             onPrimary, which in the dark palette is a dark violet. On this app's
+             blue that measured 2.92:1, so the label of the picker's Continue
+             button, the control the whole screen exists to reach, failed even the
+             3:1 floor for large text. White on the same blue is 4.51:1.
+             ⚠️ That margin is 0.01. It clears AA and nothing more. Moving the
+             button ground to colorPrimaryDark would give 7.10:1, but that is a
+             visual-design decision rather than an accessibility fix, so it is
+             raised rather than taken here. -->
+        <item name="colorOnPrimary">@android:color/white</item>
+
+        <!-- Window background: VS Code dark editor -->
+        <item name="android:windowBackground">@color/colorBackground</item>
+
+        <!-- Transparent bars, so an edge-to-edge window shows the app behind them.
+             Attributes rather than Window.setStatusBarColor/setNavigationBarColor,
+             which is the whole point: Play flags those two calls in the bundle, and
+             the attribute form is not bytecode. API 35+ ignores both and paints the
+             bars from the window background regardless, so this decides API 30 to
+             34 only. Without it those draw the Material3 default, which is blue
+             against this app's dark editor: measured on an API 33 emulator. -->
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:navigationBarColor">@android:color/transparent</item>
+
+        <!-- Declarative, and it replaces what androidx's enableEdgeToEdge() set
+             from code. API 35+ forces `always` whatever is asked for, so this
+             only decides API 30 to 34 (30 is the first release that has `always`);
+             naming the value the platform settles on keeps them the same. See
+             util/ViewInsets.drawBehindSystemBars. -->
+        <item name="android:windowLayoutInDisplayCutoutMode">always</item>
+
+        <!-- The bars stay transparent rather than having the platform paint a scrim
+             behind them. This is the fifth thing enableEdgeToEdge() did and the one
+             the move to attributes first missed: androidx.activity 1.13.0's
+             EdgeToEdgeApi29.setUp calls setStatusBarContrastEnforced(false)
+             unconditionally and setNavigationBarContrastEnforced(nightMode == 0),
+             and every call site here passed SystemBarStyle.dark(), whose nightMode
+             is MODE_NIGHT_YES, so both arrived as false. Read from its bytecode.
+
+             ⚠️ The two defaults are NOT the same, and this comment said they were.
+             PhoneWindow.generateLayout reads Window_enforceStatusBarContrast with a
+             default of FALSE and Window_enforceNavigationBarContrast with a default
+             of TRUE. So only the navigation line changes behaviour; the status line
+             restates the default. It is kept anyway, because the pair is what the
+             call this replaced set, and a reader finding one without the other would
+             reasonably wonder which bar was left out and why.
+
+             Attributes rather than the setters for the same reason as the colours:
+             Play scans bytecode and an attribute is not a call. Both are API 29
+             attributes, read from the platform's api-versions.xml, and minSdk is
+             30, so no version-qualified copy is needed. -->
+        <item name="android:enforceStatusBarContrast">false</item>
+        <item name="android:enforceNavigationBarContrast">false</item>
+    </style>
+
+    <!-- The theme keepStartColor names for a light editor. Empty here on purpose:
+         the starting window is a theme API from Android 12 and its white
+         background is declared in values-v31, so Android 11 never parses an
+         attribute it does not have. Nothing names this style below API 31. The
+         declaration stays so the resource has a default, which is what a
+         reference from code needs. -->
+    <style name="Theme.VSCodroid.LightStart" />
+
+</resources>

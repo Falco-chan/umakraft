@@ -1,0 +1,403 @@
+package com.vscodroid.setup
+
+import android.content.Context
+import android.content.Intent
+import android.net.Uri
+import com.vscodroid.SourceScan
+import com.vscodroid.SplashActivity
+import com.vscodroid.util.Logger
+import io.mockk.Runs
+import io.mockk.every
+import io.mockk.just
+import io.mockk.mockk
+import io.mockk.mockkConstructor
+import io.mockk.mockkObject
+import io.mockk.unmockkAll
+import io.mockk.verify
+import org.junit.jupiter.api.AfterEach
+import org.junit.jupiter.api.Assertions.assertEquals
+import org.junit.jupiter.api.Assertions.assertFalse
+import org.junit.jupiter.api.Assertions.assertNull
+import org.junit.jupiter.api.Assertions.assertTrue
+import org.junit.jupiter.api.BeforeEach
+import org.junit.jupiter.api.Test
+
+/**
+ * What `SplashActivity` may still do once the user has left the download screen,
+ * and what it may not.
+ *
+ * The download queue outlives this screen. Only Cancel sets `cancelled`, so
+ * pressing Back on the first-run download screen finishes the activity while the
+ * transfer carries on: the HTTP path reports straight through `onStateChange`
+ * rather than through the Play Core listener `onDestroy` unregisters, so minutes
+ * later `downloadNext()` drains the queue and calls `launchMain`. Starting
+ * MainActivity from there either pops the app into the foreground long after the
+ * user left it or is dropped by the background-activity-start rules with nothing
+ * said.
+ *
+ * Guarding the whole method is the obvious fix and it costs more than it saves.
+ * `publishToolchainShortcut()` sits at the end of it and is the ONLY publisher of
+ * the launcher shortcut, which is the route to the Toolchains screen that does
+ * not need a loaded workbench: the screen is not exported and has no launcher
+ * entry, and the other way in is a Command Palette command that only exists once
+ * saf-bridge has activated. An early return therefore took that route away for
+ * the session, to stop a launch that was going to be refused anyway.
+ *
+ * Covered in two ways: the structural checks read the source through
+ * [SourceScan], and the behavioral cases invoke `launchMain`, `onStop`, and
+ * `onStart` directly on a mocked [SplashActivity] instance to verify the
+ * `stopped` and `launchPending` state machine and the `startActivity`,
+ * `publishToolchainShortcut`, and `finish` call order.
+ */
+class SplashLaunchGuardTest {
+
+    private val source = SourceScan.read("src/main/kotlin/com/vscodroid/SplashActivity.kt")
+
+    /**
+     * The body of a declaration, bounded so an extraction that ran on cannot
+     * satisfy an assertion by finding a name somewhere else.
+     *
+     * [SourceScan.body] has no bound of its own -- its brace match is
+     * string-unaware, so overrunning is the failure mode it names -- and every
+     * case here is a search for a token, which an overrun makes easier to satisfy
+     * rather than harder.
+     */
+    private fun bodyOf(declaration: String): String {
+        val body = SourceScan.body(source, declaration)
+        check(body.length in 200..6_000) {
+            "extracted ${body.length} characters of $declaration, which means the extraction " +
+                "is wrong rather than the code"
+        }
+        return body
+    }
+
+    /** Comments name most of this, so the checks below read code only. */
+    private fun code(body: String) = SourceScan.withoutComments(body)
+
+    @Test
+    fun `the editor is not started from a screen the user has already left`() {
+        val body = code(bodyOf("private fun launchMain("))
+
+        assertTrue(
+            "isFinishing" in body && "isDestroyed" in body,
+            "launchMain no longer asks whether this screen is still alive, so a download " +
+                "queue draining minutes after Back starts MainActivity behind the user",
+        )
+        val guard = body.indexOf("isFinishing")
+        val start = body.indexOf("startActivity(")
+        assertTrue(start > guard, "startActivity is reached before the liveness check")
+    }
+
+    /**
+     * The half that an early return took away.
+     *
+     * NEGATIVE CONTROL: put `return` back in the guard branch. The shortcut
+     * publish then sits behind it and this reddens.
+     */
+    @Test
+    fun `the toolchain shortcut is published whether or not the editor is started`() {
+        val body = code(bodyOf("private fun launchMain("))
+
+        assertTrue(
+            "publishToolchainShortcut()" in body,
+            "launchMain no longer publishes the launcher shortcut, which is the route to " +
+                "the Toolchains screen that does not need a loaded workbench",
+        )
+        assertTrue(
+            !Regex("""\breturn\b""").containsMatchIn(body),
+            "launchMain returns early again, which skips publishToolchainShortcut() and " +
+                "costs the user the route to the Toolchains screen that does not need a " +
+                "loaded workbench, for the session",
+        )
+    }
+
+    private lateinit var act: SplashActivity
+    private var finishing = false
+    private var destroyed = false
+    private val events = mutableListOf<String>()
+    private lateinit var incomingUri: Uri
+
+    private fun field(name: String) =
+        SplashActivity::class.java.getDeclaredField(name).apply { isAccessible = true }
+
+    private fun flag(name: String) = field(name).getBoolean(act)
+
+    /** Runs the compiled body of a SplashActivity method and returns what it threw, if anything. */
+    private fun runReal(name: String): Throwable? {
+        every { act[name]() } answers { callOriginal() }
+        val m = SplashActivity::class.java.getDeclaredMethod(name).apply { isAccessible = true }
+        return try {
+            m.invoke(act)
+            null
+        } catch (e: java.lang.reflect.InvocationTargetException) {
+            e.targetException
+        }
+    }
+
+    @BeforeEach
+    fun setUp() {
+        mockkObject(Logger)
+        every { Logger.d(any(), any()) } just Runs
+        every { Logger.i(any(), any()) } just Runs
+        every { Logger.w(any(), any(), any()) } just Runs
+        every { Logger.e(any(), any(), any()) } just Runs
+        mockkConstructor(Intent::class)
+        every { anyConstructed<Intent>().setData(any()) } returns mockk(relaxed = true)
+
+        finishing = false
+        destroyed = false
+        events.clear()
+        act = mockk(relaxed = true)
+        val appContext = mockk<Context>(relaxed = true)
+        every { act.applicationContext } returns appContext
+        incomingUri = mockk(relaxed = true)
+        val incoming = mockk<Intent>(relaxed = true)
+        every { incoming.data } returns incomingUri
+        every { act.intent } returns incoming
+        every { act.isFinishing } answers { finishing }
+        every { act.isDestroyed } answers { destroyed }
+        every { act.finish() } answers { events += "finish"; finishing = true }
+        every { act.startActivity(any<Intent>()) } answers { events += "startActivity(MainActivity)" }
+        every { act["publishToolchainShortcut"]() } answers { events += "shortcut" }
+    }
+
+    @AfterEach
+    fun tearDown() = unmockkAll()
+
+    @Test
+    fun `a cold launch on a visible screen starts the editor publishes the shortcut and finishes`() {
+        assertNull(runReal("launchMain"))
+
+        assertEquals(listOf("startActivity(MainActivity)", "shortcut", "finish"), events)
+        assertFalse(flag("launchPending"))
+        verify(exactly = 1) { anyConstructed<Intent>().setData(incomingUri) }
+    }
+
+    @Test
+    fun `onStop records that the user has left`() {
+        runReal("onStop")
+
+        assertTrue(flag("stopped"), "onStop did not record that the user has left")
+    }
+
+    @Test
+    fun `a launch asked for after onStop is held without starting or finishing`() {
+        runReal("onStop")
+
+        assertNull(runReal("launchMain"))
+
+        assertEquals(listOf("shortcut"), events, "nothing may start or finish while the user is away")
+        assertTrue(flag("launchPending"), "a launch asked for while away was not remembered")
+    }
+
+    @Test
+    fun `a finishing or destroyed screen starts nothing and still publishes the shortcut`() {
+        finishing = true
+        assertNull(runReal("launchMain"))
+        assertEquals(listOf("shortcut"), events)
+
+        events.clear()
+        finishing = false
+        destroyed = true
+        assertNull(runReal("launchMain"))
+        assertEquals(listOf("shortcut"), events)
+    }
+
+    /**
+     * Setup that ends while the user is in another app.
+     *
+     * The screen is stopped but not finishing, so the liveness guard above lets the
+     * launch through: the platform drops a background `startActivity` or shows the
+     * editor over whatever the user is doing, and `finish()` then closes the task with
+     * nothing started. The launch is held instead and `onStart` runs it on return.
+     *
+     * The flag is not `lifecycle.currentState`, which reads CREATED inside `onCreate`,
+     * where a cold launch starts the editor and has to keep doing so.
+     */
+    @Test
+    fun `a stopped screen holds the launch until the user is back`() {
+        val body = code(bodyOf("private fun launchMain("))
+
+        val held = body.indexOf("stopped")
+        assertTrue(held in 0 until body.indexOf("startActivity("),
+            "launchMain no longer asks whether the user has left before it starts the editor")
+        assertTrue("launchPending = true" in body, "a launch asked for while away is not remembered")
+
+        val onStart = code(SourceScan.body(source, "override fun onStart("))
+        val clearStopped = onStart.indexOf("stopped = false")
+        val askPending = onStart.indexOf("if (launchPending) {")
+        val clearPending = onStart.indexOf("launchPending = false")
+        val callLaunch = onStart.indexOf("launchMain()")
+        assertTrue(
+            clearStopped in 0 until askPending &&
+                askPending in 0 until clearPending &&
+                clearPending in 0 until callLaunch,
+            "onStart no longer clears stopped, checks launchPending, clears launchPending, " +
+                "and replays launchMain in order",
+        )
+        val onStop = code(SourceScan.body(source, "override fun onStop("))
+        assertTrue(
+            Regex("""(?m)^\s*stopped = true\s*$""").containsMatchIn(onStop) &&
+                !Regex("""\b(if|when)\b""").containsMatchIn(onStop),
+            "onStop no longer unconditionally records that the user has left",
+        )
+    }
+
+    /**
+     * The queue that outlives the screen must not depend on when the collector
+     * runs.
+     *
+     * `onStateChange` is the only thing that advances it: `handleDownloadState`
+     * ends in `downloadNext()`, which installs the pack behind the one that has
+     * just settled. Held behind a `WeakReference`, the callback stopped firing as
+     * soon as the finished Activity was collected, so pressing Back during the
+     * first-run downloads installed the pack in flight and silently abandoned
+     * every one queued behind it -- on the HTTP path only, which is every
+     * sideload and GitHub-release install, and with the outcome decided by the
+     * timing of a garbage collection.
+     *
+     * Checked in the source text because the callback is installed inside
+     * `startDownloads` alongside UI view setup and this module has no Robolectric.
+     */
+    @Test
+    fun `the download callback is not gated on a reference that can be collected`() {
+        val body = code(bodyOf("private fun startDownloads("))
+
+        assertTrue(
+            "manager.onStateChange" in body,
+            "startDownloads no longer installs the state callback, so nothing advances the " +
+                "first-run download queue at all",
+        )
+        assertFalse(
+            "WeakReference" in body,
+            "the state callback is behind a reference that can be collected, so the download " +
+                "queue stops advancing whenever the collector reaches this finished screen " +
+                "and every pack behind the one in flight is silently never installed",
+        )
+    }
+
+    /**
+     * And the other end of it: holding the screen strongly is only bounded
+     * because the queue hands it back.
+     *
+     * `endDownloadQueue` clears the callback and unregisters the Play Core
+     * listener when the queue drains and when Cancel ends it. Without the clear a
+     * finished window stays reachable through the manager; without the
+     * unregister, `ToolchainManager.install` has already re-registered the
+     * listener that `onDestroy` handed back, so a queue draining after Back ends
+     * with this screen in a process-wide registry that nothing takes it out of.
+     */
+    @Test
+    fun `the queue hands the screen back when it ends`() {
+        assertTrue(
+            "endDownloadQueue()" in code(bodyOf("private fun downloadNext(")),
+            "the drained queue no longer releases what the manager holds of this screen",
+        )
+        assertTrue(
+            "endDownloadQueue()" in code(bodyOf("private fun startDownloads(")),
+            "Cancel no longer releases what the manager holds of this screen",
+        )
+        val release = code(SourceScan.body(source, "private fun endDownloadQueue("))
+        assertTrue(
+            "unregisterListener()" in release && "onStateChange = null" in release,
+            "endDownloadQueue gives back only half of what the manager holds, and either " +
+                "half alone keeps this screen alive for the life of the process",
+        )
+    }
+
+    /**
+     * The one pack status that neither settles nor can be asked about twice.
+     *
+     * REQUIRES_USER_CONFIRMATION is Play holding a metered download until the
+     * app puts its cellular-data question, and `showCellularDataConfirmation`
+     * needs a live Activity to put it in. The queue outlives this screen, so a
+     * pack reaching that status after Back was asking a window that is gone: the
+     * call fails and is only logged, `isTerminalPackStatus` answers false, and
+     * nothing calls `downloadNext()` again. The queue stopped rather than
+     * skipped, so that toolchain and every one behind it were silently never
+     * installed; `endDownloadQueue` is reached only where the queue ends, so this
+     * destroyed screen stayed in Play Core's process-wide registry for the life
+     * of the process; and the Cancel button that would have ended it is on a
+     * screen the user has already left. ToolchainActivity can defer the question
+     * to its next `onStart`, which is why the shared `isTerminalPackStatus` must
+     * go on calling this status unsettled; only the branch here knows the screen
+     * is never coming back.
+     *
+     * NEGATIVE CONTROL: drop the liveness test from the confirmation branch and
+     * the first assertion reddens; take the extra term back out of the advance
+     * and the second does.
+     */
+    @Test
+    fun `a confirmation this screen cannot put ends the pack instead of waiting`() {
+        val body = code(SourceScan.body(source, "private fun handleDownloadState("))
+        assertFalse(
+            "private fun launchMain" in body,
+            "the body ran past handleDownloadState and swallowed what follows it, so the " +
+                "assertions below are really a file-wide search",
+        )
+
+        assertTrue(
+            "isFinishing" in body && "isDestroyed" in body,
+            "handleDownloadState no longer asks whether this screen is still alive, so a " +
+                "pack that reaches REQUIRES_USER_CONFIRMATION after the user has left waits " +
+                "on a cellular-data question nobody can be asked",
+        )
+
+        val advance = body.indexOf("downloadNext()")
+        assertTrue(advance > 0, "handleDownloadState no longer advances the queue at all")
+        val condition = body.substring(body.lastIndexOf("if (", advance), advance)
+        assertTrue(
+            "isTerminalPackStatus(status)" in condition,
+            "the advance no longer reads the pack status: $condition",
+        )
+        assertTrue(
+            "||" in condition,
+            "the queue advances on the pack status alone again, so a confirmation this " +
+                "screen cannot put stops it for good: isTerminalPackStatus answers false for " +
+                "that status and nothing else calls downloadNext(). Condition: $condition",
+        )
+    }
+
+    /**
+     * And the queue's other way of reaching a user who is elsewhere.
+     *
+     * The row carries one word and the reason is a sentence, so a failed pack
+     * says why in a Toast. The queue outlives the screen, so a failure landing
+     * after Back put that sentence over the editor, about a screen that is no
+     * longer there. `ToolchainActivity` gates the same message on its screen
+     * being started; this one has no coming back to defer to, so the message is
+     * dropped rather than held.
+     */
+    @Test
+    fun `the reason for a failure is not put in front of a user who has left`() {
+        val body = code(bodyOf("private fun startDownloads("))
+
+        val toast = body.indexOf("Toast.makeText")
+        assertTrue(toast > 0, "startDownloads no longer says why a pack failed at all")
+        val guard = body.indexOf("isFinishing")
+        assertTrue(
+            guard in 0 until toast && "isDestroyed" in body,
+            "the failure Toast is not gated on this screen still being here, so a download " +
+                "that fails minutes after Back explains itself over the editor",
+        )
+    }
+
+    /**
+     * The control for every extraction above, because a body that ran past its
+     * own declaration would satisfy the token searches by finding them somewhere
+     * else.
+     */
+    @Test
+    fun `each extracted body stops at the declaration that follows it`() {
+        assertFalse(
+            "private fun publishToolchainShortcut" in bodyOf("private fun launchMain("),
+            "bodyOf ran past launchMain and swallowed the next declaration, so its " +
+                "assertions are really a file-wide search",
+        )
+        assertFalse(
+            "private fun buildProgressRow" in bodyOf("private fun startDownloads("),
+            "bodyOf ran past startDownloads and swallowed the next declaration, so its " +
+                "assertions are really a file-wide search",
+        )
+    }
+}

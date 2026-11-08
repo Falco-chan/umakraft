@@ -1,0 +1,162 @@
+package com.vscodroid.setup
+
+import android.content.Context
+import android.content.pm.ApplicationInfo
+import com.google.android.play.core.assetpacks.AssetPackManagerFactory
+import com.vscodroid.util.Environment
+import com.vscodroid.util.Logger
+import io.mockk.Runs
+import io.mockk.every
+import io.mockk.just
+import io.mockk.mockk
+import io.mockk.mockkObject
+import io.mockk.mockkStatic
+import io.mockk.unmockkAll
+import org.junit.jupiter.api.AfterEach
+import org.junit.jupiter.api.Assertions.assertEquals
+import org.junit.jupiter.api.Assertions.assertTrue
+import org.junit.jupiter.api.BeforeEach
+import org.junit.jupiter.api.Test
+import org.junit.jupiter.api.io.TempDir
+import java.io.File
+
+/**
+ * That everything in the terminal which speaks TLS is given a trust store it can
+ * actually read, and not only git.
+ *
+ * A directory trust store is not scanned, it is looked up: OpenSSL hashes the
+ * issuer name and opens `<hash>.0`. Android names its files with the OpenSSL
+ * 0.9.8 hash and everything since 1.0 uses a different one, so pointing
+ * `SSL_CERT_DIR` at the system store yields a directory that can be listed and
+ * never read. Measured against a certificate out of
+ * `/system/etc/security/cacerts` on an API 37 emulator: the file is `01419da9.0`,
+ * `openssl x509 -subject_hash_old` answers `01419da9`, and `-hash` answers
+ * `8d89cda1`, which is the name OpenSSL 3 goes looking for and which is not
+ * there.
+ *
+ * What that cost, measured on device before the file variable existed: the
+ * bundled Python loaded zero certificates and every `urllib` or
+ * `ssl.create_default_context()` HTTPS request failed with
+ * CERTIFICATE_VERIFY_FAILED. git was unaffected the whole time, because it had
+ * been handed the file form separately, which is exactly why nothing noticed.
+ */
+class TerminalTrustStoreTest {
+
+    @TempDir
+    lateinit var filesDir: File
+
+    private lateinit var context: Context
+
+    @BeforeEach
+    fun setUp() {
+        mockkObject(Logger)
+        every { Logger.d(any(), any()) } just Runs
+        every { Logger.i(any(), any()) } just Runs
+        every { Logger.w(any(), any()) } just Runs
+        every { Logger.w(any(), any(), any()) } just Runs
+        every { Logger.e(any(), any(), any()) } just Runs
+
+        mockkStatic(AssetPackManagerFactory::class)
+        every { AssetPackManagerFactory.getInstance(any()) } returns mockk(relaxed = true)
+
+        context = mockk(relaxed = true)
+        every { context.filesDir } returns filesDir
+        every { context.cacheDir } returns File(filesDir, "cache")
+        every { context.applicationInfo } returns ApplicationInfo().apply {
+            nativeLibraryDir = "/data/app/~~hash==/com.vscodroid-hash==/lib/arm64"
+        }
+        every { context.getExternalFilesDir(null) } returns File(filesDir, "external")
+
+        File(filesDir, "home/.vscodroid").mkdirs()
+    }
+
+    @AfterEach
+    fun tearDown() = unmockkAll()
+
+    private fun env(): Map<String, String> = Environment.buildProcessEnvironment(context, 1234)
+
+    @Test
+    fun `the bundle reaches git and OpenSSL clients`() {
+        val environment = env()
+        val bundle = "${filesDir.absolutePath}/usr/etc/tls/cert.pem"
+
+        assertEquals(
+            bundle, environment["GIT_SSL_CAINFO"],
+            "git no longer names the bundle the app builds; this case reads both halves",
+        )
+        assertEquals(
+            bundle, environment["SSL_CERT_FILE"],
+            "nothing but git is given a readable trust store. The directory store beside " +
+                "this is named with the pre-1.0 OpenSSL hash, so OpenSSL 3 looks up a name " +
+                "that is not there and finds no issuer: Python's urllib and OpenSSL clients " +
+                "fail at TLS",
+        )
+    }
+
+    /**
+     * A user's `requests` code reads REQUESTS_CA_BUNDLE rather than SSL_CERT_FILE,
+     * and pip loads both alongside its vendored certifi snapshot. Without
+     * REQUESTS_CA_BUNDLE, `requests` falls back to certifi alone and a CA the
+     * device owner installed does not reach it.
+     */
+    @Test
+    fun `requests and curl use the generated bundle when present`() {
+        File(filesDir, "usr/etc/tls").mkdirs()
+        File(filesDir, "usr/etc/tls/cert.pem").writeText("-----BEGIN CERTIFICATE-----\n")
+        val environment = env()
+
+        assertEquals(
+            "${filesDir.absolutePath}/usr/etc/tls/cert.pem", environment["REQUESTS_CA_BUNDLE"],
+            "requests is back on its vendored certifi alone, so a CA " +
+                "the device owner installed does not reach a user's requests code",
+        )
+        assertEquals("${filesDir.absolutePath}/usr/etc/tls/cert.pem", environment["CURL_CA_BUNDLE"])
+    }
+
+    /**
+     * And only when the file is there.
+     *
+     * requests and pip treat a REQUESTS_CA_BUNDLE they cannot open as fatal
+     * rather than falling back, so naming one `setupGitCaBundle` never wrote
+     * would break both: pip's vendored certifi works without any of this, and
+     * breaking it to improve trust would be the worse trade.
+     */
+    @Test
+    fun `requests and curl bundle overrides are absent when no bundle exists`() {
+        assertTrue(
+            !File(filesDir, "usr/etc/tls/cert.pem").exists(),
+            "this case has to run with no bundle written, or it proves nothing",
+        )
+
+        val environment = env()
+        assertTrue(
+            environment["REQUESTS_CA_BUNDLE"] == null,
+            "requests and pip are pointed at a bundle that does not exist, which both " +
+                "treat as fatal: every request stops with \"Could not find a suitable TLS " +
+                "CA certificate bundle\" instead of falling back to the vendored bundle",
+        )
+        assertTrue(environment["CURL_CA_BUNDLE"] == null, "a missing bundle disables curl's own trust store")
+    }
+
+    @Test
+    fun `an empty bundle remains explicit for requests and curl`() {
+        val bundle = File(filesDir, "usr/etc/tls/cert.pem")
+        bundle.parentFile?.mkdirs()
+        bundle.writeText("")
+
+        val environment = env()
+
+        assertEquals(bundle.absolutePath, environment["REQUESTS_CA_BUNDLE"])
+        assertEquals(bundle.absolutePath, environment["CURL_CA_BUNDLE"])
+    }
+
+    /** Directory lookup must not bypass the platform store's excluded roots. */
+    @Test
+    fun `directory trust stays inside the managed bundle directory`() {
+        val environment = env()
+        val managed = "${filesDir.absolutePath}/usr/etc/tls"
+
+        assertEquals(managed, environment["SSL_CERT_DIR"], "raw roots can override bundle removals")
+        assertEquals(managed, environment["GIT_SSL_CAPATH"], "raw roots can override git's CA bundle")
+    }
+}

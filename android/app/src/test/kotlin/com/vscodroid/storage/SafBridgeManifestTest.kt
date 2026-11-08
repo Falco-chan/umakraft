@@ -1,0 +1,148 @@
+package com.vscodroid.storage
+
+import org.json.JSONObject
+import org.junit.jupiter.api.Assertions.assertEquals
+import org.junit.jupiter.api.Assertions.assertTrue
+import org.junit.jupiter.api.Test
+import java.io.File
+
+/**
+ * That the bridge extension's manifest and its code agree about which commands exist.
+ *
+ * The two are written in different files and nothing between them is checked by a
+ * compiler, a lint pass or the extension host. A command declared in `package.json` and
+ * never registered appears in the palette and fails with "command not found"; one
+ * registered and never declared is reachable from nowhere at all, which is not a
+ * failure anybody sees, only a feature that quietly does not exist. Both have shipped
+ * in editors that look exactly like a working one.
+ *
+ * The menu entry is here for a stronger reason than symmetry. `vscodroid.about` opens
+ * the only screen in the app carrying the written offer of source and the licence texts
+ * the bundled libraries require, and the palette is not a route a user finds by
+ * looking. The remote indicator is: it is the one control always on screen. An edit
+ * that drops the entry leaves the notices shipped and unreachable.
+ */
+class SafBridgeManifestTest {
+
+    /**
+     * The bundled extension, found by prefix rather than by version, because the
+     * directory name carries the version and moves with every release of it.
+     */
+    private fun extensionDir(): File {
+        val root = File("src/main/assets/extensions")
+        val matches = root.listFiles { entry: File ->
+            entry.isDirectory && entry.name.startsWith("vscodroid.vscodroid-saf-bridge-")
+        }?.toList().orEmpty()
+        assertEquals(
+            1, matches.size,
+            "expected exactly one bundled SAF bridge extension under ${root.absolutePath}; " +
+                "found ${matches.map { it.name }}",
+        )
+        return matches.single()
+    }
+
+    private fun manifest(): JSONObject =
+        JSONObject(File(extensionDir(), "package.json").readText())
+
+    /** Every command id the extension actually registers at activation. */
+    private fun registered(): Set<String> {
+        val source = File(extensionDir(), "extension.js")
+        assertTrue(source.isFile) { "no extension.js in ${extensionDir().name}" }
+        return Regex("""registerCommand\(\s*['"`]([\w.]+)['"`]""")
+            .findAll(source.readText())
+            .map { it.groupValues[1] }
+            .toSet()
+    }
+
+    private fun declared(): Set<String> {
+        val commands = manifest().getJSONObject("contributes").getJSONArray("commands")
+        return (0 until commands.length())
+            .map { commands.getJSONObject(it).getString("command") }
+            .toSet()
+    }
+
+    /**
+     * Exactly, with no room for a built-in id. Declaring one here, even without
+     * registering it, gives this extension an implicit `onCommand:<id>` activation event
+     * because it has a `browser` entry point, and the first invocation of that command
+     * after each extension host start then waits on the extension hosts. Built-in ids a
+     * menu needs are declared by the editor-menus extension, which has no entry point;
+     * see `EditorMenusManifestTest`.
+     */
+    @Test
+    fun `the manifest declares exactly the commands the extension registers`() {
+        val registered = registered()
+        check(registered.isNotEmpty()) {
+            "no registerCommand call was read from extension.js, so this would pass by " +
+                "comparing two empty sets"
+        }
+        assertEquals(
+            emptySet<String>(), registered - declared(),
+            "these commands are registered and not declared, so nothing can invoke them",
+        )
+        assertEquals(
+            emptySet<String>(), declared() - registered,
+            "these commands are declared and never registered, so the palette offers " +
+                "them and each one fails with \"command not found\"",
+        )
+    }
+
+    @Test
+    fun `the remote indicator menu keeps a way into the licence notices`() {
+        val entries = manifest().getJSONObject("contributes")
+            .getJSONObject("menus")
+            .getJSONArray("statusBar/remoteIndicator")
+        val commands = (0 until entries.length())
+            .map { entries.getJSONObject(it).getString("command") }
+        assertTrue(
+            "vscodroid.about" in commands,
+            "the About screen carries the written offer of source and the licence " +
+                "texts, and the remote indicator is the only route to it that a user " +
+                "does not have to already know about; found $commands",
+        )
+    }
+
+    @Test
+    fun `the remote indicator menu keeps a way back to a hidden key row`() {
+        val entries = manifest().getJSONObject("contributes")
+            .getJSONObject("menus")
+            .getJSONArray("statusBar/remoteIndicator")
+        val commands = (0 until entries.length())
+            .map { entries.getJSONObject(it).getString("command") }
+        assertTrue(
+            "vscodroid.toggleExtraKeyRow" in commands,
+            "with the row hidden and no hardware keyboard, Ctrl+Shift+P cannot be typed, " +
+                "so a tap on the remote indicator is the discoverable way to bring the row " +
+                "back; found $commands",
+        )
+    }
+
+    /**
+     * Open Folder from Device is the only way to a phone folder that shows the files
+     * other apps saved in it. The workbench's own Open Folder dialog reaches the same
+     * directories by path and opens them with their subfolders and none of their
+     * files, so the route has to be offered where a user looks first: the empty
+     * Explorer and the remote indicator, not only the palette.
+     */
+    @Test
+    fun `the device folder route is offered in the empty Explorer and the remote indicator`() {
+        val contributes = manifest().getJSONObject("contributes")
+        val indicator = contributes.getJSONObject("menus").getJSONArray("statusBar/remoteIndicator")
+        val commands = (0 until indicator.length()).map { indicator.getJSONObject(it).getString("command") }
+        assertTrue(
+            "vscodroid.openFolderFromDevice" in commands,
+            "the remote indicator no longer offers Open Folder from Device; found $commands",
+        )
+
+        val english = JSONObject(File(extensionDir(), "package.nls.json").readText())
+        val welcome = contributes.optJSONArray("viewsWelcome")
+        val explorer = (0 until (welcome?.length() ?: 0))
+            .map { welcome!!.getJSONObject(it) }
+            .filter { it.getString("view") == "explorer" }
+            .map { english.optString(it.getString("contents").trim('%'), it.getString("contents")) }
+        assertTrue(
+            explorer.any { "(command:vscodroid.openFolderFromDevice)" in it },
+            "the empty Explorer no longer links to Open Folder from Device; found $explorer",
+        )
+    }
+}

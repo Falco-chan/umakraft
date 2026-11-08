@@ -1,0 +1,105 @@
+Build a debug terminal command that does not name /usr/bin/env.
+
+prepareCommand assembles the shell line the debug adapter asks the terminal to
+run. For a POSIX shell it sets the child's environment by prefixing the command
+with /usr/bin/env, which is right everywhere it was written for and wrong here:
+Android has no /usr/bin at all. A command naming an absolute path that does not
+exist is not a lookup failure the shell can recover from, so bash answers
+
+  bash: /usr/bin/env: No such file or directory
+
+and the program never starts. Measured on an API 37 emulator with the three
+launch configurations this app seeds: the session starts, the debug toolbar
+appears, the status bar names the configuration, and the only sign that nothing
+ran is one line in the terminal panel. That is worse than an error, because
+every visible indicator says it is working.
+
+Inline assignments and unset do the same job with no binary. A subshell keeps
+those changes local to the debuggee when the terminal is reused. Empty commands
+remain valid, and the child exit status passes through.
+
+A name a shell cannot assign to is skipped rather than emitted, which is the
+one place this cannot match what env does. env takes NAME=VALUE as a single
+argument and calls execve itself, so any name without an '=' reaches the child;
+a shell treats a word as an assignment only when the part before '=' is a valid
+name, and runs it as a command otherwise. A project whose .env holds `my-var=1`
+would therefore stop the program starting, with the debug toolbar up and the
+session hanging, which is this patch's own symptom arriving by another door, and
+a name holding a semicolon would run what follows it. Dropping the variable is
+the mild outcome and the only one available without env.
+
+Only the VALUE is quoted, and that is the whole of the difference between this
+and the first version of it. `env` takes NAME=VALUE as a single argument, so
+quoting the pair is correct there; a shell reads a quoted pair as one word and
+tries to execute it, which on the device read as
+
+  bash: NODE_OPTIONS= --require .../bootloader.js: No such file or directory
+
+one layer further along and looking like a different bug. The key is left
+unquoted because `'NAME'=value` is not an assignment to a shell, and the names
+reaching `unset` need no quoting either: the guard above has already reduced
+them to letters, digits and underscores.
+
+diff --git a/src/vs/workbench/contrib/debug/node/terminals.ts b/src/vs/workbench/contrib/debug/node/terminals.ts
+index b3b5a84..a2b294b 100644
+--- a/src/vs/workbench/contrib/debug/node/terminals.ts
++++ b/src/vs/workbench/contrib/debug/node/terminals.ts
+@@ -173,16 +173,44 @@ export function prepareCommand(shell: string, args: string[], argsCanBeInterpret
+ 				command += `cd ${quote(cwd)} ; `;
+ 			}
+ 			if (env) {
++				command += '( ';
+-				command += '/usr/bin/env';
++				// Android has no /usr/bin, so naming that path produces
++				// "/usr/bin/env: No such file or directory" and the debug
++				// session starts a terminal that runs nothing. Inline
++				// assignments and unset are POSIX shell and need no binary.
++				//
++				// Only the value is quoted. env takes NAME=VALUE as one
++				// argument, so quoting the pair is right there; a shell reads a
++				// quoted pair as one word and tries to execute it.
++				//
++				// A name a shell cannot assign to is skipped rather than
++				// emitted. env accepts any name without an '=' because it calls
++				// execve itself; a shell treats a word as an assignment only
++				// when the part before '=' is a valid name, and runs it as a
++				// command otherwise. So 'my-var=1' from a project's .env would
++				// stop the program starting, and a name holding ';' would run
++				// what follows it. Losing such a variable is the mild outcome
++				// and it is the only one available without env.
++				const assignable = /^[A-Za-z_][A-Za-z0-9_]*$/;
++				const removed: string[] = [];
++				let assigned = '';
+ 				for (const key in env) {
++					if (!assignable.test(key)) {
++						continue;
++					}
+ 					const value = env[key];
+ 					if (value === null) {
+-						command += ` -u ${hardQuote(key)}`;
++						removed.push(key);
+ 					} else {
+-						command += ` ${hardQuote(`${key}=${value}`)}`;
++						assigned += ` ${key}=${hardQuote(value)}`;
+ 					}
+ 				}
+-				command += ' ';
++				if (removed.length > 0) {
++					command += `unset ${removed.join(' ')} ; `;
++				}
++				if (assigned.length > 0) {
++					command += `${assigned.substring(1)} `;
++				}
+ 			}
+ 			for (const a of args) {
+ 				command += (a === '<' || a === '>' || argsCanBeInterpretedByShell) ? a : quote(a);
+@@ -189,6 +217,9 @@
+ 				command += ' ';
+ 			}
++			if (env) {
++				command += args.length > 0 ? '\n)' : ': )';
++			}
+ 			break;
+ 		}
+ 	}
+ 

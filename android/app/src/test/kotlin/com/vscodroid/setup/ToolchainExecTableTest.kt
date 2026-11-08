@@ -1,0 +1,1296 @@
+package com.vscodroid.setup
+
+import android.content.Context
+import android.system.Os
+import android.system.StructStat
+import com.google.android.play.core.assetpacks.AssetPackManagerFactory
+import com.vscodroid.util.Logger
+import io.mockk.Runs
+import io.mockk.every
+import io.mockk.just
+import io.mockk.mockk
+import io.mockk.mockkObject
+import io.mockk.mockkStatic
+import io.mockk.unmockkAll
+import org.junit.jupiter.api.AfterEach
+import org.junit.jupiter.api.Assertions.assertEquals
+import org.junit.jupiter.api.Assertions.assertFalse
+import org.junit.jupiter.api.Assertions.assertTrue
+import org.junit.jupiter.api.Assumptions.assumeTrue
+import org.junit.jupiter.api.BeforeEach
+import org.junit.jupiter.api.Test
+import org.junit.jupiter.api.io.TempDir
+import java.io.File
+import java.nio.file.Files
+import java.nio.file.LinkOption
+import java.nio.file.Path
+
+/**
+ * What `toolchain-exec.tsv` has to contain for a toolchain command to work when
+ * the caller is a program rather than a person.
+ *
+ * The loader wrappers in `toolchain-env.sh` are bash functions, so they are
+ * reachable from bash and from nothing else. A direct `spawn("ruby", args)` from
+ * an extension, a `make` recipe (mksh, by way of `patch-default-shell.py`), and
+ * a `"type": "process"` task all resolve a bare name against PATH and execve
+ * what they find, which is an ELF under filesDir that SELinux refuses. This
+ * table is what the execution trampoline reads to answer the same question for
+ * those callers, and the trampoline is a C program, not a shell: every claim
+ * below is about the difference that makes.
+ *
+ * Deliberately separate from [ToolchainEnvFileTest] rather than folded into it.
+ * The two generators read the same state and must NOT agree on everything, and
+ * the third test here is the one that keeps them from being tidied together.
+ */
+class ToolchainExecTableTest {
+
+    @TempDir
+    lateinit var filesDir: File
+
+    private lateinit var context: Context
+    private lateinit var stateFile: File
+    private lateinit var execTable: File
+    private lateinit var envFile: File
+    private lateinit var nativeLibDir: File
+
+    @BeforeEach
+    fun setUp() {
+        mockkObject(Logger)
+        every { Logger.d(any(), any()) } just Runs
+        every { Logger.i(any(), any()) } just Runs
+        every { Logger.w(any(), any()) } just Runs
+        every { Logger.w(any(), any(), any()) } just Runs
+        every { Logger.e(any(), any(), any()) } just Runs
+
+        // Play Core is reached through field initialisation, so it runs before
+        // any method can be called on the manager.
+        mockkStatic(AssetPackManagerFactory::class)
+        every { AssetPackManagerFactory.getInstance(any()) } returns mockk(relaxed = true)
+
+        // Backed by the real filesystem, so a symlink in usr/bin is told apart
+        // from a script the way the generator tells them apart on a device.
+        mockkStatic(Os::class)
+        every { Os.lstat(any()) } answers {
+            val path = Path.of(firstArg<String>())
+            if (!Files.exists(path, LinkOption.NOFOLLOW_LINKS)) {
+                throw java.io.FileNotFoundException(path.toString())
+            }
+            mockk<StructStat>(relaxed = true)
+        }
+        every { Os.readlink(any()) } answers {
+            Files.readSymbolicLink(Path.of(firstArg<String>())).toString()
+        }
+        every { Os.symlink(any(), any()) } answers {
+            Files.createSymbolicLink(Path.of(secondArg<String>()), Path.of(firstArg<String>()))
+            Unit
+        }
+        every { Os.rename(any(), any()) } answers {
+            Files.move(
+                Path.of(firstArg<String>()), Path.of(secondArg<String>()),
+                java.nio.file.StandardCopyOption.REPLACE_EXISTING,
+                java.nio.file.StandardCopyOption.ATOMIC_MOVE,
+            )
+            Unit
+        }
+
+        context = mockk(relaxed = true)
+        every { context.filesDir } returns filesDir
+        // The only directory this app may execve from, and the one every
+        // interpreter row has to name. Real files, because the generator declines
+        // to write a row naming an interpreter that is not there.
+        nativeLibDir = File(filesDir, "nativeLib").apply { mkdirs() }
+        File(nativeLibDir, "libnode.so").writeText("elf")
+        File(nativeLibDir, "libpython.so").writeText("elf")
+        every { context.applicationInfo } answers {
+            android.content.pm.ApplicationInfo().apply {
+                nativeLibraryDir = this@ToolchainExecTableTest.nativeLibDir.absolutePath
+            }
+        }
+
+        File(filesDir, "home/.vscodroid").mkdirs()
+        stateFile = File(filesDir, "home/.vscodroid/toolchains.json")
+        execTable = File(filesDir, "home/.vscodroid/toolchain-exec.tsv")
+        envFile = File(filesDir, "home/.vscodroid/toolchain-env.sh")
+    }
+
+    @AfterEach
+    fun tearDown() = unmockkAll()
+
+    /** The four bytes every ELF object starts with, plus enough body to be a file. */
+    private fun elf(relPath: String) = File(filesDir, relPath).apply {
+        parentFile?.mkdirs()
+        writeBytes(
+            byteArrayOf(0x7F, 'E'.code.toByte(), 'L'.code.toByte(), 'F'.code.toByte()) +
+                ByteArray(64)
+        )
+    }
+
+    private fun script(relPath: String) = File(filesDir, relPath).apply {
+        parentFile?.mkdirs()
+        writeText("#!/usr/bin/env ruby\nputs 1\n")
+    }
+
+    private fun regenerate() = ToolchainManager(context).regenerateDerivedFiles()
+
+    private fun tableLines() = execTable.readText().lines().filter { it.isNotEmpty() }
+
+    /**
+     * The table without the row the app owns rather than a toolchain.
+     *
+     * `xdg-open` is written into every table, on a device with no toolchain
+     * installed included, because a browser opener is not a toolchain's to
+     * provide. The cases below are each about one toolchain's own rows and say so
+     * by reading this; the base row has its own case, which is where a change to
+     * it should fail.
+     */
+    private fun toolchainLines() = tableLines().filterNot { it.startsWith("xdg-open\t") }
+
+    /**
+     * The trampoline gets no working directory it can trust and no shell to
+     * expand anything, so the row has to name the payload outright. The env file
+     * writes `$PREFIX/../usr/...` for its own reader, and copying that spelling
+     * here would produce a path with a literal `$PREFIX` component in it.
+     */
+    @Test
+    fun `an ELF binary gets one absolute row`() {
+        elf("usr/opt/ruby/bin/ruby")
+        stateFile.writeText(
+            """[{"name":"ruby","installRoot":"usr/opt/ruby",""" +
+                """"binaries":["usr/opt/ruby/bin/ruby"]}]"""
+        )
+
+        regenerate()
+
+        assertEquals(
+            listOf("ruby\t${filesDir.absolutePath}/usr/opt/ruby/bin/ruby"),
+            toolchainLines(),
+            "the trampoline cannot resolve this row, so `ruby` from a task or a " +
+                "make recipe still fails:\n" + execTable.readText(),
+        )
+    }
+
+    /**
+     * A shebang script under filesDir is refused on its own inode before its
+     * interpreter is ever consulted, so a script row carries two paths: the
+     * interpreter to load, then the script to hand it. Order decides which is
+     * which, and the interpreter has to be the absolute path of an ELF the
+     * manifest ships, because the trampoline must never search PATH itself: a
+     * poisoned PATH would otherwise choose what runs a toolchain's own scripts.
+     */
+    @Test
+    fun `a script row names the interpreter first, then the script`() {
+        elf("usr/opt/ruby/bin/ruby")
+        script("usr/opt/ruby/bin/gem")
+        stateFile.writeText(
+            """[{"name":"ruby","installRoot":"usr/opt/ruby",""" +
+                """"binaries":["usr/opt/ruby/bin/ruby","usr/opt/ruby/bin/gem"],""" +
+                """"scriptWrappers":{"interpreter":"ruby",""" +
+                """"scripts":{"gem":"usr/opt/ruby/bin/gem"}}}]"""
+        )
+
+        regenerate()
+
+        val root = filesDir.absolutePath
+        assertTrue(
+            tableLines().contains("gem\t$root/usr/opt/ruby/bin/ruby\t$root/usr/opt/ruby/bin/gem"),
+            "the script row is not interpreter-then-script with both resolved:\n" +
+                execTable.readText(),
+        )
+    }
+
+    /**
+     * The variables a manifest exports travel in this table too, because of
+     * when each reader looks. Bash re-reads `toolchain-env.sh` in every shell;
+     * the server process reads the same variables once, at start, and every
+     * non-bash child inherits that snapshot. Measured on an API 37 emulator
+     * with Ruby installed while the server ran: a `"type": "process"` task
+     * found `ruby` through the trampoline and got RUBYLIB unset, a load path
+     * inside Termux's prefix and `LoadError` on `require "json"`, while the
+     * same probe through bash worked.
+     *
+     * Expanded to absolute paths for the reason the command rows are, and with
+     * `$HOME` resolved as well: the trampoline is not a shell.
+     */
+    @Test
+    fun `each variable the manifest exports gets an environment row`() {
+        elf("usr/bin/ruby")
+        stateFile.writeText(
+            """[{"name":"ruby","installRoot":"usr/lib/ruby","binaries":["usr/bin/ruby"],""" +
+                """"env":{"RUBYLIB":"${'$'}FILESDIR/usr/lib/ruby/3.4.0",""" +
+                """"GEM_HOME":"${'$'}HOME/.gem/ruby"}}]"""
+        )
+
+        regenerate()
+
+        val root = filesDir.absolutePath
+        val lines = tableLines()
+        assertTrue(
+            lines.contains("\tRUBYLIB\t$root/usr/lib/ruby/3.4.0"),
+            "a task or a make recipe starting ruby minutes after the install runs it " +
+                "without its load path:\n" + execTable.readText(),
+        )
+        assertTrue(
+            lines.contains("\tGEM_HOME\t$root/home/.gem/ruby"),
+            "\$HOME was not resolved, and the trampoline is not a shell:\n" + execTable.readText(),
+        )
+    }
+
+    /**
+     * An environment row leads with an empty field, and that is what keeps it
+     * harmless on a device whose trampoline predates it: that reader takes the
+     * first field as a command name, and a basename is never empty, so it walks
+     * past. A marker word would be a name a toolchain could ship (`env` is
+     * one), and the old reader would then try to run a variable's name as a
+     * path. The command rows are the control: they still lead with the name.
+     */
+    @Test
+    fun `an environment row never starts with a command name`() {
+        elf("usr/bin/ruby")
+        stateFile.writeText(
+            """[{"name":"ruby","installRoot":"usr/lib/ruby","binaries":["usr/bin/ruby"],""" +
+                """"env":{"RUBYLIB":"${'$'}FILESDIR/usr/lib/ruby/3.4.0"}}]"""
+        )
+
+        regenerate()
+
+        val (envRows, commandRows) = toolchainLines().partition { it.startsWith("\t") }
+        assertEquals(1, envRows.size, "expected one environment row:\n" + execTable.readText())
+        assertEquals(
+            listOf("ruby\t${filesDir.absolutePath}/usr/bin/ruby"), commandRows,
+            "the command rows changed shape alongside the environment rows",
+        )
+    }
+
+    /**
+     * A name the record cannot carry costs that variable and nothing else. The
+     * trampoline splits a row on its tabs, so a tab inside the name would be
+     * read as the value starting early, and the variables after a bad one must
+     * still be written: losing the whole toolchain's environment over one key
+     * is the larger failure, and the log says which key it was.
+     */
+    @Test
+    fun `a variable name the table cannot carry is skipped and the rest are written`() {
+        elf("usr/bin/ruby")
+        stateFile.writeText(
+            """[{"name":"ruby","installRoot":"usr/lib/ruby","binaries":["usr/bin/ruby"],""" +
+                """"env":{"BAD\tNAME":"x","GEM_HOME":"${'$'}HOME/.gem/ruby"}}]"""
+        )
+
+        regenerate()
+
+        val lines = tableLines()
+        assertTrue(lines.none { it.contains("BAD") }, "a torn record was written:\n" + execTable.readText())
+        assertTrue(
+            lines.contains("\tGEM_HOME\t${filesDir.absolutePath}/home/.gem/ruby"),
+            "one unusable name cost the variables after it:\n" + execTable.readText(),
+        )
+    }
+
+    /**
+     * The one rule the two generators must NOT share.
+     *
+     * `toolchain-env.sh` skips a command [isShellFunctionName] refuses, because
+     * one unusable name is a parse error that takes out every new terminal. The
+     * trampoline has no naming constraint at all: a symlink can be called
+     * anything a filesystem allows. Applying that filter here out of symmetry
+     * would drop exactly the commands this mechanism exists to reach, and the
+     * only visible sign would be one missing command.
+     *
+     * The fixture is `[`, coreutils' own name for `test` and therefore a name a
+     * regenerated manifest can genuinely carry. It is also chosen because the
+     * predicate really does refuse it: `2to3` and `foo-bar` LOOK like the
+     * awkward cases and are not, which `ShellFunctionNameTest` establishes
+     * against a real bash. A fixture named after one of those leaves this test
+     * passing whether or not the filter has been copied over, which is how it
+     * was first written.
+     */
+    @Test
+    fun `a name the shell wrapper skips still gets a row`() {
+        // Stated rather than assumed, so the fixture cannot quietly stop being
+        // the awkward case the rest of this test is about.
+        assertFalse(isShellFunctionName("["), "the fixture is no longer a name the env file skips")
+
+        elf("usr/opt/ruby/bin/[")
+        stateFile.writeText(
+            """[{"name":"ruby","installRoot":"usr/opt/ruby",""" +
+                """"binaries":["usr/opt/ruby/bin/["]}]"""
+        )
+
+        regenerate()
+
+        assertTrue(
+            tableLines().any { it.startsWith("[\t") },
+            "the shell's naming rule was applied to a file name:\n" + execTable.readText(),
+        )
+        // The control for the claim above: if the env file also carried it, the
+        // two generators would not in fact differ and this test would be
+        // asserting nothing about them.
+        assertFalse(
+            envFile.exists() && envFile.readText().contains("[()"),
+            "the env file wrapped a name its own predicate refuses",
+        )
+    }
+
+    /**
+     * Damage is not absence, exactly as for the env file.
+     *
+     * A state file nothing can parse is what a device upgrading from the build
+     * that truncated it in place carries. Reading it as "no toolchains" would
+     * delete the table, taking every toolchain command off PATH on every launch
+     * while the payload it names is still on disk and still runnable.
+     */
+    @Test
+    fun `a state file that cannot be parsed leaves the table alone`() {
+        elf("usr/opt/ruby/bin/ruby")
+        stateFile.writeText(
+            """[{"name":"ruby","installRoot":"usr/opt/ruby",""" +
+                """"binaries":["usr/opt/ruby/bin/ruby"]}]"""
+        )
+        regenerate()
+        val writtenByTheInstall = execTable.readText()
+
+        stateFile.writeText("""[{"name":"ruby","installRoot":"usr/op""")
+
+        regenerate()
+
+        assertTrue(execTable.isFile, "the table was deleted over an unreadable state")
+        assertEquals(
+            writtenByTheInstall, execTable.readText(),
+            "the table was rewritten over an unreadable state",
+        )
+    }
+
+    /**
+     * The same damage must not freeze what does not come from the record. The
+     * app's own rows name nativeLibraryDir, which a reinstall moves, so a table
+     * kept whole over an unreadable state would name the old directory for good.
+     */
+    @Test
+    fun `a state file that cannot be parsed still rebuilds the rows the app owns`() {
+        elf("usr/opt/ruby/bin/ruby")
+        stateFile.writeText(
+            """[{"name":"ruby","installRoot":"usr/opt/ruby",""" +
+                """"binaries":["usr/opt/ruby/bin/ruby"],"env":{"RUBYLIB":"x"}}]"""
+        )
+        regenerate()
+        // What an earlier install left: its own rows, plus an opener naming a
+        // library directory this install no longer has.
+        execTable.writeText(
+            execTable.readText().lines().filterNot { it.startsWith("xdg-open\t") }
+                .joinToString("\n") + "xdg-open\t/data/app/old/lib/arm64/libnode.so\t/x.js\n"
+        )
+        stateFile.writeText("""[{"name":"ruby","installRoot":"usr/op""")
+
+        regenerate()
+
+        val lines = tableLines()
+        assertTrue(
+            lines.contains("ruby\t${filesDir.absolutePath}/usr/opt/ruby/bin/ruby"),
+            "the toolchain's row was lost over an unreadable state:\n" + execTable.readText(),
+        )
+        assertTrue(lines.contains("\tRUBYLIB\tx"), "the toolchain's environment row was lost")
+        assertFalse(
+            execTable.readText().contains("/data/app/old/"),
+            "a row naming the previous install's library directory survived:\n" + execTable.readText(),
+        )
+        assertTrue(
+            lines.any { it.startsWith("xdg-open\t${nativeLibDir.absolutePath}/libnode.so") },
+            "the app's own opener was not rebuilt:\n" + execTable.readText(),
+        )
+    }
+
+    /**
+     * A manifest naming a binary that is not on disk, a partial extraction, or a
+     * file an uninstall took, gets no row. A row for it would be a command that
+     * exists on PATH and always fails, which is worse than one that is not there.
+     */
+    @Test
+    fun `a binary that is not on disk gets no row`() {
+        stateFile.writeText(
+            """[{"name":"ruby","installRoot":"usr/opt/ruby",""" +
+                """"binaries":["usr/opt/ruby/bin/ruby"]}]"""
+        )
+
+        regenerate()
+
+        assertEquals(
+            emptyList<String>(),
+            toolchainLines(),
+            "a row was written for a binary that is not on disk",
+        )
+    }
+
+    /**
+     * With nothing installed a removed toolchain's rows go, and the row the app
+     * owns stays.
+     *
+     * The table used to be deleted outright here, which was right while every row
+     * in it belonged to a toolchain. It no longer is: `xdg-open` is what a Node
+     * browser helper spawns, it has to be reachable on a device that has never
+     * installed a toolchain, and that is most devices.
+     */
+    @Test
+    fun `an empty record removes a toolchain's rows and keeps the app's own`() {
+        elf("usr/opt/ruby/bin/ruby")
+        stateFile.writeText(
+            """[{"name":"ruby","installRoot":"usr/opt/ruby",""" +
+                """"binaries":["usr/opt/ruby/bin/ruby"]}]"""
+        )
+        regenerate()
+        assertTrue(execTable.isFile, "the table was never written, so this proves nothing")
+        assertTrue(toolchainLines().isNotEmpty(), "control: the toolchain never got a row")
+
+        stateFile.writeText("[]")
+        regenerate()
+
+        assertEquals(
+            emptyList<String>(),
+            toolchainLines(),
+            "a removed toolchain's rows outlived it",
+        )
+        assertTrue(
+            execTable.isFile,
+            "the table went with the last toolchain and took the browser opener with it",
+        )
+    }
+
+    /**
+     * The row the app owns, which no toolchain provides and every device needs.
+     *
+     * Node's browser helpers spawn the literal command `xdg-open`, so the name is
+     * not ours to choose. The interpreter form is: the payload is JavaScript under
+     * `filesDir`, which SELinux will not execve, so the row names `libnode.so` in
+     * `nativeLibraryDir` and hands it the script.
+     */
+    @Test
+    fun `the browser opener gets a row on a device with no toolchain`() {
+        stateFile.writeText("[]")
+
+        regenerate()
+
+        val fields = tableLines().single().split("\t")
+        assertEquals(
+            3, fields.size,
+            "the row is not the interpreter form, so the trampoline would try to execve a " +
+                "JavaScript file:\n" + execTable.readText(),
+        )
+        assertEquals("xdg-open", fields[0], "the command is not the name Node helpers spawn")
+        assertTrue(
+            fields[1].endsWith("/libnode.so"),
+            "the interpreter is not the bundled Node, so nothing can run the payload: ${fields[1]}",
+        )
+        assertEquals(
+            "${filesDir.absolutePath}/server/xdg-open.js", fields[2],
+            "the row does not name the opener FirstRunSetup extracts",
+        )
+    }
+
+    /**
+     * The other end of that path, which lives in another file.
+     *
+     * `xdg-open.js` is not a bootstrap script: nothing requires it, and the only
+     * thing that names it is the row above. So it rides in the bootstrap list
+     * purely because the row expects it at `server/`, and dropping it from that
+     * list as "not a bootstrap script" leaves a table pointing at a file nothing
+     * puts there. The symptom is a link in the editor that opens nothing, with
+     * every case here still green.
+     */
+    @Test
+    fun `the opener the row names is a file setup extracts`() {
+        val setup = File("src/main/kotlin/com/vscodroid/setup/FirstRunSetup.kt")
+        check(setup.isFile) { "FirstRunSetup.kt not found at ${setup.absolutePath}" }
+
+        // Comments dropped: the reason it is in that list is written above it.
+        val code = setup.readLines().filterNot {
+            val t = it.trimStart()
+            t.startsWith("//") || t.startsWith("*") || t.startsWith("/*")
+        }
+
+        assertTrue(
+            code.any { it.contains("\"xdg-open.js\"") },
+            "FirstRunSetup no longer extracts xdg-open.js, so the row above names a file " +
+                "that is never written and every external link opens nothing",
+        )
+        assertTrue(
+            code.any { it.contains("""extractAssetFile(script, "server/${'$'}script")""") },
+            "the bootstrap scripts no longer land in server/, which is where the row above " +
+                "and every require() in server.js look for them",
+        )
+    }
+
+    /**
+     * The directory pip writes console scripts into, holding the `python3` link
+     * [FirstRunSetup.setupToolSymlinks] puts there. Without the link the generator
+     * writes no pip rows at all, and every case below that expects none would pass
+     * for that reason instead of its own.
+     */
+    private fun pipBin() = File(filesDir, "usr/bin").apply {
+        mkdirs()
+        val python = File(this, "python3").toPath()
+        if (!Files.exists(python, LinkOption.NOFOLLOW_LINKS)) {
+            Files.createSymbolicLink(python, File(nativeLibDir, "libpython.so").toPath())
+        }
+    }
+
+    /**
+     * What `pip install black` leaves behind, and why it does not run without this.
+     *
+     * pip writes an executable `usr/bin/black` whose first line points at the
+     * interpreter, and that directory is already on PATH, so the command is found.
+     * Running it then fails: reaching the interpreter means execve on the script's
+     * own inode, and SELinux refuses that for anything under filesDir. Measured in
+     * the app's terminal as `bad interpreter: Permission denied`.
+     *
+     * The interpreter form has no such step. The trampoline starts because it lives
+     * in nativeLibraryDir, and it runs the bundled Python with the script as an
+     * argument, so nothing under filesDir is ever execve'd.
+     *
+     * The interpreter is the `usr/bin/python3` link and not the `.so` behind it,
+     * because Python reports the path it was started by as `sys.executable`, and a
+     * path under nativeLibraryDir is one the next app update moves.
+     */
+    @Test
+    fun `a command pip installed gets a row that runs it through Python`() {
+        stateFile.writeText("[]")
+        File(pipBin(), "black").writeText("#!${filesDir.absolutePath}/usr/bin/python3\nprint(1)\n")
+
+        regenerate()
+
+        assertEquals(
+            listOf(
+                "black\t${filesDir.absolutePath}/usr/bin/python3" +
+                    "\t${filesDir.absolutePath}/usr/bin/black"
+            ),
+            tableLines().filter { it.startsWith("black\t") },
+            "nothing runs `black`, so a formatter that spawns it still reports it missing:\n" +
+                execTable.readText(),
+        )
+    }
+
+    /**
+     * The bundled tools in the same directory are symlinks onto ELFs that already
+     * run, and a row for one would send `bash` or `node` through Python.
+     */
+    @Test
+    fun `a bundled tool in the same directory gets no row`() {
+        stateFile.writeText("[]")
+        // The target is written as a Python script, which a bundled tool never
+        // is, so that the link is the only term left able to refuse this row. An
+        // ELF is refused twice over, by the link test and by the shebang, and a
+        // case using one stayed green with the link test deleted: the shebang
+        // answered it, and every symlink in usr/bin pointing at a script would
+        // have been given a row that runs it through Python.
+        val target = File(nativeLibDir, "libnode-with-a-shebang.so")
+        target.writeText("#!${filesDir.absolutePath}/usr/bin/python3\nprint(1)\n")
+        Files.createSymbolicLink(File(pipBin(), "node").toPath(), target.toPath())
+
+        regenerate()
+
+        assertEquals(
+            emptyList<String>(),
+            tableLines().filter { it.startsWith("node\t") },
+            "a bundled tool was given a row, which would run an ELF through Python",
+        )
+    }
+
+    /**
+     * Only a Python shebang. Handing anything else to Python turns a command that
+     * does not start into one that starts and does the wrong thing.
+     */
+    @Test
+    fun `a script naming another interpreter gets no row`() {
+        stateFile.writeText("[]")
+        File(pipBin(), "somesh").writeText("#!/bin/sh\necho hi\n")
+
+        regenerate()
+
+        assertEquals(
+            emptyList<String>(),
+            tableLines().filter { it.startsWith("somesh\t") },
+            "a shell script was routed through the Python interpreter",
+        )
+    }
+
+    /**
+     * A name that would tear the record gets no row.
+     *
+     * The trampoline splits a row on its tabs, so a tab in a command name would be
+     * read as the row's next field: a path the user never chose. The toolchain rows
+     * above come from a manifest this app ships, but anyone can write a file into
+     * `usr/bin`, so the name has to be checked here.
+     */
+    @Test
+    fun `a command name the table cannot carry gets no row`() {
+        stateFile.writeText("[]")
+        val torn = File(pipBin(), "bad\tname")
+        // Some filesystems refuse the character outright, which is the same outcome
+        // by another route and leaves nothing to assert about.
+        val staged = try {
+            torn.writeText("#!${filesDir.absolutePath}/usr/bin/python3\nprint(1)\n"); torn.isFile
+        } catch (_: Exception) {
+            false
+        }
+        org.junit.jupiter.api.Assumptions.assumeTrue(staged, "the filesystem would not stage the name")
+
+        regenerate()
+
+        assertFalse(
+            execTable.readText().contains("bad\tname"),
+            "a torn record reached the table:\n" + execTable.readText(),
+        )
+    }
+
+    /**
+     * A toolchain owns its own names. pip writing a script of the same name must
+     * not take a toolchain's command away from it.
+     */
+    @Test
+    fun `a toolchain keeps a name pip also installed`() {
+        elf("usr/opt/ruby/bin/black")
+        stateFile.writeText(
+            """[{"name":"ruby","installRoot":"usr/opt/ruby",""" +
+                """"binaries":["usr/opt/ruby/bin/black"]}]"""
+        )
+        File(pipBin(), "black").writeText("#!${filesDir.absolutePath}/usr/bin/python3\nprint(1)\n")
+
+        regenerate()
+
+        assertEquals(
+            listOf("black\t${filesDir.absolutePath}/usr/opt/ruby/bin/black"),
+            tableLines().filter { it.startsWith("black\t") },
+            "the pip script displaced the toolchain's own command",
+        )
+    }
+
+    /**
+     * What `gem install rubocop` leaves behind: a Ruby-shebang script in
+     * `$GEM_HOME/bin`, which is on no PATH and cannot be execve'd, so the command
+     * reported success and was then not found. It gets a row through the Ruby the
+     * manifest ships, and a script there naming another interpreter does not.
+     */
+    @Test
+    fun `a command gem installed gets a row that runs it through Ruby`() {
+        elf("usr/bin/ruby")
+        stateFile.writeText(
+            """[{"name":"ruby","binaries":["usr/bin/ruby"],""" +
+                """"env":{"GEM_HOME":"${'$'}HOME/.gem/ruby"}}]"""
+        )
+        val gemBin = File(filesDir, "home/.gem/ruby/bin").apply { mkdirs() }
+        File(gemBin, "rubocop").writeText("#!${filesDir.absolutePath}/usr/bin/ruby\nload 'x'\n")
+        File(gemBin, "notruby").writeText("#!/bin/sh\necho hi\n")
+
+        regenerate()
+
+        assertEquals(
+            listOf(
+                "rubocop\t${filesDir.absolutePath}/usr/bin/ruby" +
+                    "\t${filesDir.absolutePath}/home/.gem/ruby/bin/rubocop"
+            ),
+            tableLines().filter { it.startsWith("rubocop\t") },
+            "nothing runs `rubocop`, so a gem's command is still not found:\n" + execTable.readText(),
+        )
+        assertEquals(
+            emptyList<String>(),
+            tableLines().filter { it.startsWith("notruby\t") },
+            "a shell script in the gem bin directory was routed through Ruby",
+        )
+    }
+
+    // The git extension's helper scripts. It names them by absolute path, as
+    // GIT_ASKPASS, SSH_ASKPASS and GIT_EDITOR, and each is a `#!/bin/sh` file in
+    // the server tree under filesDir, so the kernel refuses to execve it and every
+    // credential prompt git raises from the terminal or from Source Control died
+    // on "cannot exec ... askpass.sh: Permission denied". Measured on an API 33
+    // emulator: with askpass.sh a link to the trampoline and a row naming the
+    // shell and the script, `git ls-remote` of a private URL raised the GitHub
+    // sign-in and then the Username box in the workbench instead.
+
+    private val gitDist get() = File(filesDir, "server/vscode-reh/extensions/git/dist")
+
+    private fun gitHelper(name: String, body: String = "#!/bin/sh\necho '$name'\n") =
+        File(gitDist, name).apply {
+            parentFile?.mkdirs()
+            writeText(body)
+        }
+
+    private val trampoline get() = File(nativeLibDir, "libexec-trampoline.so").absolutePath
+
+    @Test
+    fun `the git extension's askpass runs through the trampoline`() {
+        gitHelper("askpass.sh", "#!/bin/sh\nshipped\n")
+
+        regenerate()
+
+        val link = File(gitDist, "askpass.sh")
+        assertTrue(Files.isSymbolicLink(link.toPath()), "askpass.sh is still a script git cannot exec")
+        assertEquals(trampoline, Files.readSymbolicLink(link.toPath()).toString())
+        val kept = File(gitDist, "askpass.sh.script")
+        assertEquals("#!/bin/sh\nshipped\n", kept.readText(), "the shipped script was not kept")
+        assertTrue(
+            tableLines().contains("askpass.sh\t/system/bin/sh\t${kept.absolutePath}"),
+            "no row runs the kept script through the shell:\n" + execTable.readText(),
+        )
+    }
+
+    @Test
+    fun `a script an update wrote over the link replaces the kept copy`() {
+        gitHelper("ssh-askpass.sh", "old\n")
+        regenerate()
+        // Extraction writes the file through a temporary name and a rename, which
+        // replaces the link with a regular file carrying the new version.
+        File(gitDist, "ssh-askpass.sh").delete()
+        gitHelper("ssh-askpass.sh", "new\n")
+
+        regenerate()
+
+        assertEquals("new\n", File(gitDist, "ssh-askpass.sh.script").readText())
+        assertTrue(Files.isSymbolicLink(File(gitDist, "ssh-askpass.sh").toPath()))
+    }
+
+    @Test
+    fun `a link into an earlier install's library directory is repointed`() {
+        gitHelper("git-editor.sh")
+        regenerate()
+        val link = File(gitDist, "git-editor.sh").toPath()
+        Files.delete(link)
+        Files.createSymbolicLink(link, Path.of("/data/app/gone/lib/arm64/libexec-trampoline.so"))
+
+        regenerate()
+
+        assertEquals(trampoline, Files.readSymbolicLink(link).toString())
+    }
+
+    @Test
+    fun `helper scripts are not put on PATH`() {
+        gitHelper("askpass.sh")
+
+        regenerate()
+
+        assertFalse(
+            File(filesDir, "usr/libexec/tcbin/askpass.sh").exists() ||
+                Files.isSymbolicLink(File(filesDir, "usr/libexec/tcbin/askpass.sh").toPath()),
+            "askpass.sh became a command in every terminal",
+        )
+    }
+
+    // The server's command-line client, first on every terminal's PATH. It is a
+    // `#!/usr/bin/env sh` file under filesDir like the git helpers, so bash
+    // answered "Permission denied", and its last line runs `$ROOT/node`, which the
+    // build prunes from the tree.
+
+    private val remoteCliDir get() = File(filesDir, "server/vscode-reh/bin/remote-cli")
+
+    private fun remoteCli(body: String = "#!/usr/bin/env sh\nshipped\n") =
+        File(remoteCliDir, "vscodroid").apply {
+            parentFile?.mkdirs()
+            writeText(body)
+        }
+
+    @Test
+    fun `the remote CLI runs through the trampoline beside its kept script`() {
+        remoteCli()
+
+        regenerate()
+
+        val link = File(remoteCliDir, "vscodroid")
+        assertEquals(trampoline, Files.readSymbolicLink(link.toPath()).toString())
+        // Beside the link and nowhere else: the script finds the server tree
+        // from three dirnames of its own path.
+        val kept = File(remoteCliDir, "vscodroid.script")
+        assertEquals("#!/usr/bin/env sh\nshipped\n", kept.readText(), "the shipped script was not kept")
+        assertTrue(
+            tableLines().contains("vscodroid\t/system/bin/sh\t${kept.absolutePath}"),
+            "no row runs the kept script through the shell:\n" + execTable.readText(),
+        )
+        assertFalse(
+            Files.exists(File(filesDir, "usr/libexec/tcbin/vscodroid").toPath(), LinkOption.NOFOLLOW_LINKS),
+            "vscodroid was put on PATH a second time",
+        )
+    }
+
+    @Test
+    fun `the server tree's node is the app's Node, repointed after a reinstall`() {
+        remoteCli()
+        val node = File(filesDir, "server/vscode-reh/node").toPath()
+
+        regenerate()
+        assertEquals(File(nativeLibDir, "libnode.so").absolutePath, Files.readSymbolicLink(node).toString())
+
+        // A reinstall hands out a new nativeLibraryDir and leaves the link dangling.
+        nativeLibDir = File(filesDir, "nativeLib-reinstalled").apply { mkdirs() }
+        File(nativeLibDir, "libnode.so").writeText("elf")
+        regenerate()
+
+        assertEquals(File(nativeLibDir, "libnode.so").absolutePath, Files.readSymbolicLink(node).toString())
+    }
+
+    // npm and npx. In bash both are functions, because npm's CLI is a `#!` script
+    // under filesDir, and a function does not exist for a program that looks the
+    // name up on PATH itself. Measured in the app's terminal: create-vite's
+    // `spawnSync("npm", ["install"])` failed with ENOENT, and `timeout 20 npm
+    // --version` with "exec npm: No such file or directory".
+
+    private val npmBin get() = File(filesDir, "usr/lib/node_modules/npm/bin")
+
+    private fun extractNpm() {
+        npmBin.mkdirs()
+        File(npmBin, "npm-cli.js").writeText("#!/usr/bin/env node\n")
+        File(npmBin, "npx-cli.js").writeText("#!/usr/bin/env node\n")
+    }
+
+    private fun launcher(command: String) = File(filesDir, "home/.vscodroid/$command.sh")
+
+    @Test
+    fun `npm and npx are commands a program can start by name`() {
+        stateFile.writeText("[]")
+        extractNpm()
+
+        regenerate()
+
+        for (command in listOf("npm", "npx")) {
+            assertTrue(
+                tableLines().contains("$command\t/system/bin/sh\t${launcher(command).absolutePath}"),
+                "no row starts $command, so a program spawning it gets ENOENT:\n" + execTable.readText(),
+            )
+            val link = File(filesDir, "usr/libexec/tcbin/$command").toPath()
+            assertTrue(Files.isSymbolicLink(link), "$command is not on PATH")
+            assertEquals(trampoline, Files.readSymbolicLink(link).toString())
+        }
+    }
+
+    /**
+     * What the launcher runs, read off a stand-in for Node that prints what it was
+     * given. It has to be the command the npm() function runs: the same script,
+     * `--prefer-offline` for npm and not for npx, VSCODROID_PLATFORM_FIX for that
+     * one process, and the platform-fix preload put back for a caller whose
+     * environment lacks it, which is what a spawn from the extension host has.
+     */
+    @Test
+    fun `the launcher runs what the npm function runs`() {
+        assumeTrue(File("/bin/sh").canExecute(), "no /bin/sh on this host to run the launcher")
+        stateFile.writeText("[]")
+        extractNpm()
+        File(nativeLibDir, "libnode.so").apply {
+            writeText(
+                "#!/bin/sh\nfor a in \"\$@\"; do echo \"arg=\$a\"; done\n" +
+                    "echo \"fix=\$VSCODROID_PLATFORM_FIX\"\necho \"options=\$NODE_OPTIONS\"\n"
+            )
+            setExecutable(true)
+        }
+
+        regenerate()
+
+        fun run(command: String, nodeOptions: String?, vararg args: String): List<String> {
+            val builder = ProcessBuilder(listOf("/bin/sh", launcher(command).path) + args)
+                .redirectErrorStream(true)
+            builder.environment().apply {
+                remove("VSCODROID_PLATFORM_FIX")
+                remove("NODE_OPTIONS")
+                if (nodeOptions != null) put("NODE_OPTIONS", nodeOptions)
+            }
+            val result = finishTestProcess(builder.start())
+            val out = result.second.reader().readLines()
+            assertEquals(0, result.first, result.second)
+            return out
+        }
+        val preload = "--require=${filesDir.absolutePath}/server/platform-fix.js"
+
+        assertEquals(
+            listOf(
+                "arg=${npmBin.absolutePath}/npm-cli.js", "arg=--prefer-offline",
+                "arg=install", "arg=a b", "fix=1", "options=$preload",
+            ),
+            run("npm", null, "install", "a b"),
+        )
+        assertEquals(
+            listOf("arg=${npmBin.absolutePath}/npx-cli.js", "arg=--version", "fix=1", "options=$preload"),
+            run("npx", null, "--version"),
+        )
+        // A terminal's environment already carries the preload, and keeps it once.
+        assertEquals("options=$preload", run("npm", preload).last())
+        assertEquals(
+            "options=$preload --max-old-space-size=512",
+            run("npm", "--max-old-space-size=512").last(),
+            "the caller's own option was lost, or the preload was not put in front of it",
+        )
+    }
+
+    /**
+     * Before setup has extracted npm, which is when the first launch pass of a
+     * fresh install runs, the name stays unknown: a row would be a command that
+     * always fails.
+     */
+    @Test
+    fun `no npm on disk, no npm command`() {
+        stateFile.writeText("[]")
+
+        regenerate()
+
+        assertTrue(tableLines().none { it.startsWith("npm\t") || it.startsWith("npx\t") }, execTable.readText())
+        assertFalse(
+            Files.exists(File(filesDir, "usr/libexec/tcbin/npm").toPath(), LinkOption.NOFOLLOW_LINKS),
+            "npm is on PATH with nothing behind it",
+        )
+    }
+
+    @Test
+    fun `a toolchain that ships npm keeps the name`() {
+        extractNpm()
+        elf("usr/opt/node/bin/npm")
+        stateFile.writeText(
+            """[{"name":"node","installRoot":"usr/opt/node",""" +
+                """"binaries":["usr/opt/node/bin/npm"]}]"""
+        )
+
+        regenerate()
+
+        assertEquals(
+            listOf("npm\t${filesDir.absolutePath}/usr/opt/node/bin/npm"),
+            tableLines().filter { it.startsWith("npm\t") },
+            "the app's npm displaced a toolchain's own",
+        )
+    }
+
+    /** A reinstall moves nativeLibraryDir, and the launcher names Node there. */
+    @Test
+    fun `the launcher follows Node to a new library directory`() {
+        stateFile.writeText("[]")
+        extractNpm()
+        regenerate()
+
+        nativeLibDir = File(filesDir, "nativeLib-reinstalled").apply { mkdirs() }
+        File(nativeLibDir, "libnode.so").writeText("elf")
+        regenerate()
+
+        val text = launcher("npm").readText()
+        assertTrue("'${nativeLibDir.absolutePath}/libnode.so'" in text, text)
+        assertFalse("${filesDir.absolutePath}/nativeLib/" in text, "the launcher still names the old directory")
+    }
+
+    // -- a toolchain that starts only through the preloaded exec --------------
+
+    /**
+     * `"preloadOnly": true` keeps a toolchain out of the table altogether.
+     *
+     * A row starts a program as `linker64 <file>` through the trampoline, and
+     * the loader then reports itself as the program's own path. clang locates
+     * its resource directory and its sysroot from that path, so started that
+     * way it looks in the loader's directory and finds neither. The compiler is
+     * found through PATH instead and started by the exec of whatever runs it,
+     * which a terminal preloads.
+     *
+     * The control is the same record without the flag: it gets its row, so the
+     * assertion below is about the flag and not about a toolchain that was
+     * never going to have one.
+     */
+    @Test
+    fun `a preloadOnly toolchain gets no command row and no trampoline link`() {
+        elf("usr/bin/clang-21")
+        stateFile.writeText(
+            """[{"name":"cpp","preloadOnly":true,"binaries":["usr/bin/clang-21"],""" +
+                """"env":{},"pathDirs":["usr/bin"]}]"""
+        )
+
+        regenerate()
+
+        assertEquals(
+            emptyList<String>(), toolchainLines(),
+            "a toolchain that must not be started through the loader by hand got a " +
+                "row:\n" + execTable.readText(),
+        )
+        assertFalse(
+            Files.exists(
+                File(filesDir, "usr/libexec/tcbin/clang-21").toPath(), LinkOption.NOFOLLOW_LINKS,
+            ),
+            "a link in tcbin would put the loader-by-hand start ahead of the real command",
+        )
+    }
+
+    @Test
+    fun `the same record without the flag gets its row`() {
+        elf("usr/bin/clang-21")
+        stateFile.writeText(
+            """[{"name":"cpp","binaries":["usr/bin/clang-21"],"env":{}}]"""
+        )
+
+        regenerate()
+
+        assertEquals(
+            listOf("clang-21\t${filesDir.absolutePath}/usr/bin/clang-21"), toolchainLines(),
+            "the control: without the flag the binary is a row like any other",
+        )
+    }
+
+    /**
+     * What the flag does not take away: the variables a manifest exports still
+     * reach a start through the trampoline, because a preloadOnly toolchain's
+     * own environment is read by the same programs as any other's, and they
+     * are not the programs the flag is about.
+     */
+    @Test
+    fun `a preloadOnly toolchain still exports its environment`() {
+        elf("usr/bin/clang-21")
+        stateFile.writeText(
+            """[{"name":"cpp","preloadOnly":true,"binaries":["usr/bin/clang-21"],""" +
+                """"env":{"CPP_HOME":"${'$'}FILESDIR/usr"}}]"""
+        )
+
+        regenerate()
+
+        assertEquals(
+            listOf("\tCPP_HOME\t${filesDir.absolutePath}/usr"), toolchainLines(),
+            "the flag took the environment along with the rows:\n" + execTable.readText(),
+        )
+    }
+
+    /**
+     * Scripts too. A script row is an interpreter row with a script after it,
+     * and the interpreter is started by hand through the loader exactly as a
+     * binary row's program is.
+     */
+    @Test
+    fun `a preloadOnly toolchain gets no script row either`() {
+        elf("usr/bin/interp")
+        script("usr/bin/tool")
+        stateFile.writeText(
+            """[{"name":"x","preloadOnly":true,"binaries":["usr/bin/interp","usr/bin/tool"],""" +
+                """"env":{},"scriptWrappers":{"interpreter":"interp",""" +
+                """"scripts":{"tool":"usr/bin/tool"}}}]"""
+        )
+
+        regenerate()
+
+        assertEquals(emptyList<String>(), toolchainLines(), execTable.readText())
+    }
+
+    // -- the programs of a preloadOnly toolchain that a client starts itself ---
+
+    private val resourceDirArg = "--resource-dir=${'$'}FILESDIR/usr/lib/clang/21"
+
+    private fun cppRecord(launchers: String, flag: String = """"preloadOnly":true,""") =
+        """[{"name":"cpp",$flag"binaries":["usr/bin/clang-21","usr/bin/clangd"],""" +
+            """"env":{},"pathDirs":["usr/bin"],"launchers":$launchers}]"""
+
+    /**
+     * clangd is started by a language client with no terminal, and so no exec
+     * interceptor, which leaves it without the row the rest of a preloadOnly
+     * toolchain goes without. The row carries the one argument that stands in for
+     * what the loader's path hides from it, and the compiler beside it still gets
+     * nothing: a `clang` link in tcbin would be the driver clangd finds first on
+     * PATH, and the sysroot it takes from that driver would be `usr/libexec`.
+     */
+    @Test
+    fun `a launcher of a preloadOnly toolchain gets a row with its arguments, and the compiler none`() {
+        elf("usr/bin/clang-21")
+        elf("usr/bin/clangd")
+        stateFile.writeText(cppRecord("""{"usr/bin/clangd":["$resourceDirArg"]}"""))
+
+        regenerate()
+
+        val root = filesDir.absolutePath
+        assertEquals(
+            listOf("clangd\t$root/usr/bin/clangd\t--resource-dir=$root/usr/lib/clang/21"),
+            toolchainLines(),
+            "the launcher's row is not what a language client needs:\n" + execTable.readText(),
+        )
+        val link = File(filesDir, "usr/libexec/tcbin/clangd").toPath()
+        assertTrue(Files.isSymbolicLink(link), "clangd is not on PATH ahead of the file the kernel refuses")
+        assertEquals(trampoline, Files.readSymbolicLink(link).toString())
+        for (compiler in listOf("clang-21", "clang")) {
+            assertFalse(
+                Files.exists(File(filesDir, "usr/libexec/tcbin/$compiler").toPath(), LinkOption.NOFOLLOW_LINKS),
+                "a link named $compiler in tcbin would be the driver clangd finds, and its sysroot would be usr/libexec",
+            )
+        }
+    }
+
+    @Test
+    fun `a launcher is also a row where the toolchain is not preloadOnly, with its arguments`() {
+        elf("usr/bin/clang-21")
+        elf("usr/bin/clangd")
+        stateFile.writeText(cppRecord("""{"usr/bin/clangd":["$resourceDirArg"]}""", flag = ""))
+
+        regenerate()
+
+        val root = filesDir.absolutePath
+        assertEquals(
+            listOf(
+                "clang-21\t$root/usr/bin/clang-21",
+                "clangd\t$root/usr/bin/clangd\t--resource-dir=$root/usr/lib/clang/21",
+            ),
+            toolchainLines(),
+            "the control: the plain rows stay and the launcher's arguments replace the plain one",
+        )
+    }
+
+    /** The manifest's own `binaries` are the only files a launcher can name. */
+    @Test
+    fun `a launcher that is not one of the manifest's binaries gets no row`() {
+        elf("usr/bin/clangd")
+        stateFile.writeText(
+            """[{"name":"cpp","preloadOnly":true,"binaries":["usr/bin/clang-21"],""" +
+                """"env":{},"launchers":{"usr/bin/clangd":["--x"]}}]"""
+        )
+
+        regenerate()
+
+        assertEquals(emptyList<String>(), toolchainLines(), execTable.readText())
+    }
+
+    @Test
+    fun `a launcher whose file is missing or is not an ELF gets no row`() {
+        stateFile.writeText(cppRecord("""{"usr/bin/clangd":["--x"]}"""))
+        regenerate()
+        assertEquals(emptyList<String>(), toolchainLines(), "a row names a file that is not there:\n" + execTable.readText())
+
+        script("usr/bin/clangd")
+        regenerate()
+        assertEquals(emptyList<String>(), toolchainLines(), "a row starts a script as a program:\n" + execTable.readText())
+
+        elf("usr/bin/clangd")
+        regenerate()
+        assertEquals(1, toolchainLines().size, "the control: the same record with an ELF gets its row")
+    }
+
+    /**
+     * What the trampoline's row cannot carry: a tab is a field of its own, a line
+     * break a record of its own, and a ninth argument makes it refuse the whole
+     * row when the command runs, naming nothing the user chose. Each is declined
+     * here, where it can be logged, and the launcher is the only thing lost.
+     */
+    @Test
+    fun `a launcher whose arguments the table cannot carry gets no row`() {
+        elf("usr/bin/clangd")
+        val tooMany = (1..ToolchainManager.MAX_ROW_ARGS + 1).joinToString(",") { "\"--a$it\"" }
+        val atTheLimit = (1..ToolchainManager.MAX_ROW_ARGS).joinToString(",") { "\"--a$it\"" }
+        val refused = mapOf(
+            "a tab" to """{"usr/bin/clangd":["--a\tb"]}""",
+            "a line break" to """{"usr/bin/clangd":["--a\nb"]}""",
+            "one argument too many" to """{"usr/bin/clangd":[$tooMany]}""",
+            "a string where a list belongs" to """{"usr/bin/clangd":"--x"}""",
+        )
+        for ((why, launchers) in refused) {
+            stateFile.writeText(cppRecord(launchers))
+            regenerate()
+            assertEquals(emptyList<String>(), toolchainLines(), "a row was written with $why:\n" + execTable.readText())
+        }
+
+        stateFile.writeText(cppRecord("""{"usr/bin/clangd":[$atTheLimit]}"""))
+        regenerate()
+        assertEquals(
+            ToolchainManager.MAX_ROW_ARGS + 2, toolchainLines().single().split('\t').size,
+            "the control: a row at the limit is written whole",
+        )
+    }
+
+    @Test
+    fun `removing the toolchain removes the launcher's row and its link`() {
+        elf("usr/bin/clangd")
+        stateFile.writeText(cppRecord("""{"usr/bin/clangd":["$resourceDirArg"]}"""))
+        regenerate()
+        val link = File(filesDir, "usr/libexec/tcbin/clangd").toPath()
+        assertTrue(Files.isSymbolicLink(link), "control: the launcher never got its link")
+
+        stateFile.writeText("[]")
+        regenerate()
+
+        assertEquals(emptyList<String>(), toolchainLines(), "the row outlived the toolchain")
+        assertFalse(Files.exists(link, LinkOption.NOFOLLOW_LINKS), "the link outlived the toolchain")
+    }
+
+    private fun jdkRecord(flags: String) =
+        """[{"name":"java","installRoot":"usr/lib/jvm/jdk",$flags""" +
+            """"binaries":["usr/lib/jvm/jdk/bin/java","usr/lib/jvm/jdk/bin/javac",""" +
+            """"usr/lib/jvm/jdk/bin/keytool","usr/lib/jvm/jdk/bin/jshell",""" +
+            """"usr/lib/jvm/jdk/lib/jspawnhelper"]}]"""
+
+    private fun jdkElfs() {
+        for (b in listOf("bin/java", "bin/javac", "bin/keytool", "bin/jshell", "lib/jspawnhelper")) {
+            elf("usr/lib/jvm/jdk/$b")
+        }
+    }
+
+    /**
+     * A JDK launcher reached through the trampoline starts the way its shell function
+     * does. A `make` recipe, a `process` task and a program's own `spawn("java")` do not
+     * go through bash, so without these a JVM warned about SVE on every start and took
+     * `user.home` and `java.io.tmpdir` from Termux's prefix, where nothing can be
+     * created: `File.createTempFile` failed under `make run`.
+     */
+    @Test
+    fun `a JDK launcher row carries the VM options its shell function has`() {
+        every { context.cacheDir } returns File(filesDir, "cache")
+        jdkElfs()
+        stateFile.writeText(jdkRecord(""""jvmFlags":["-XX:UseSVE=0"],"""))
+
+        regenerate()
+
+        val root = filesDir.absolutePath
+        val home = "$root/home"
+        val bin = "$root/usr/lib/jvm/jdk/bin"
+        assertEquals(
+            listOf(
+                "java\t$bin/java\t-XX:UseSVE=0\t-Duser.home=$home\t-Djava.io.tmpdir=$root/cache/tmp",
+                "javac\t$bin/javac\t-J-XX:UseSVE=0",
+                "keytool\t$bin/keytool\t-J-XX:UseSVE=0\t-J-Duser.home=$home",
+                "jshell\t$bin/jshell\t-J-XX:UseSVE=0\t-J-Djdk.lang.Process.launchMechanism=VFORK" +
+                    "\t-J-Duser.home=$home",
+            ),
+            toolchainLines().filter { !it.startsWith("\t") },
+            "a JDK launcher started through the trampoline lost its options:\n" + execTable.readText(),
+        )
+    }
+
+    @Test
+    fun `a JDK without jvmFlags still gets its home and temporary directory`() {
+        every { context.cacheDir } returns File(filesDir, "cache")
+        jdkElfs()
+        stateFile.writeText(jdkRecord(""))
+
+        regenerate()
+
+        val root = filesDir.absolutePath
+        assertTrue(
+            tableLines().contains(
+                "java\t$root/usr/lib/jvm/jdk/bin/java\t-Duser.home=$root/home\t-Djava.io.tmpdir=$root/cache/tmp",
+            ),
+            execTable.readText(),
+        )
+        assertTrue(
+            tableLines().contains("javac\t$root/usr/lib/jvm/jdk/bin/javac"),
+            "a tool with nothing to add gained arguments:\n" + execTable.readText(),
+        )
+    }
+
+    @Test
+    fun `a launcher kept in lib is not a command`() {
+        every { context.cacheDir } returns File(filesDir, "cache")
+        jdkElfs()
+        stateFile.writeText(jdkRecord(""))
+
+        regenerate()
+
+        assertFalse(
+            tableLines().any { it.startsWith("jspawnhelper\t") },
+            "the JVM's own helper became a PATH command:\n" + execTable.readText(),
+        )
+        assertFalse(envFile.readText().contains("jspawnhelper()"), "or a shell function")
+    }
+
+    @Test
+    fun `a row with options survives an unreadable record`() {
+        every { context.cacheDir } returns File(filesDir, "cache")
+        jdkElfs()
+        stateFile.writeText(jdkRecord(""""jvmFlags":["-XX:UseSVE=0"],"""))
+        regenerate()
+        val before = tableLines().first { it.startsWith("javac\t") }
+
+        stateFile.writeText("""[{"name":"java","installRo""")
+        regenerate()
+
+        assertTrue(
+            tableLines().contains(before),
+            "a row whose arguments are not paths was dropped as stale:\n" + execTable.readText(),
+        )
+    }
+}

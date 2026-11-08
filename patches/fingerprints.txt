@@ -1,0 +1,366 @@
+# How each patch is proven to have reached the packaged output.
+#
+# Applying a patch to the source proves nothing about the package: the file may
+# not be in this target's graph, or the build may inline an older copy. So each
+# patch leaves a fingerprint that survives minification, and the packaged tree is
+# searched for it.
+#
+# Format, one line per patch in patches/:
+#
+#   NNNN label|bundle|pattern      the bundle must contain the pattern
+#   NNNN label|bundle xN|pattern   the bundle must contain it at least N times
+#   NNNN label|-|why               no fingerprint is possible; how it is proven instead
+#
+# Every patch needs a line. A patch with no line fails the check rather than
+# passing silently, which is the whole point: an absent line used to be
+# indistinguishable from a forgotten one.
+#
+# Choosing a pattern: match something the patch introduces that minification
+# cannot rewrite -- a string literal, an HTML attribute, a comparison against a
+# literal. Never a variable name; those are mangled.
+#
+# Two things the checker now does with these rows, so that neither depends on
+# someone remembering:
+#
+#   * It matches tolerantly. A pattern is written the way one esbuild version
+#     happened to emit it -- `case"android"`, `==="/callback"` -- and the next
+#     version choosing single quotes or a space would have failed rows describing
+#     a tree that is still correct. Quote style and whitespace no longer matter.
+#
+#   * It requires the pattern to appear in what the patch itself ADDS. The rule
+#     here used to read "verify the pattern appears zero times in an unpatched
+#     bundle", which is the right rule and was advice to a human, because doing it
+#     needs a second full build, twelve to thirteen minutes on an arm64 runner.
+#     Checking provenance instead is the half that runs offline: a pattern the
+#     patch does not introduce cannot be evidence the patch arrived.
+#
+# That second check is necessary, not sufficient. It catches a pattern lifted from
+# surrounding code; it cannot prove the same text appears nowhere else in the
+# tree. Proving that still wants an unpatched build, and nothing here does it.
+#
+# A row proves the patch ARRIVED, not which version of it did, and that used to
+# be the trap this file was easiest to fall into. Editing a patch that already
+# has a row changes nothing a pattern can see: it still matches, so a published
+# server built before the edit passed, the APK was built from it, and the only
+# thing describing the new behaviour was a CHANGELOG line.
+#
+# That half is now covered by something other than a row. build-vscode-oss.sh
+# writes vscodroid-patches.json into the tree it produces, recording the sha256
+# of each patch's diff, and check-patch-fingerprints.py recomputes those hashes
+# from patches/ and compares. A tarball built from different patch text is
+# refused wherever that check runs, which includes the fetch and the Gradle
+# packaging gate. The prose above each diff is not hashed, because git apply
+# never reads it, so rewriting a patch's reasoning there is free.
+#
+# Everything from the first `diff --git` down IS hashed (or from the first
+# `---`/`+++` pair, in a bare unified diff such as 0010), comments in the added
+# code included. Editing one of those is a rebuild: the published server has to
+# be built again and refetched before any APK can be packaged, because until then
+# the manifest in the tree names the old text and the gate says so. Budget
+# twelve to thirteen minutes on an arm64 runner for a comment, and reach for the
+# header when the note can live there instead.
+#
+# Rows are therefore back to answering the question they are good at: did this
+# reach the packaged bundle at all. Moving one with a revision is still worth
+# doing where the revision introduces something durable of its own -- 0003 is the
+# worked example, its pattern moved from `__vsc_disconnect`, which its first
+# version already added, to the exit wait a later version added -- but it is no
+# longer the only thing standing between an edited patch and a stale server.
+
+# 0001's pattern names the isLinux widening, not the android comparison. Patch
+# 0001 adds two things that both compare against 'android': the widened _isLinux
+# and the _isAndroidPlatform export. `platform==="android"` therefore matches
+# either, and it occurs twice in the packaged bundle for that reason, so a patch
+# narrowed back to `_isLinux = (platform === 'linux')` while keeping the export
+# still satisfies it. Patch 0009's branch sits behind isLinux, so that narrowing
+# would leave 0009 unreachable with every row here still printing ok. The `||`
+# below appears only in the widening: introduced_by rejects the narrowed patch,
+# and the text occurs exactly once in the bundle.
+0001 platform|out/server-main.js|platform === 'linux' ||
+0002 userDataPath|out/vs/platform/terminal/node/ptyHostMain.js|case"android"
+0003 ptyHost worker|out/server-main.js|this._worker.once('exit'
+# 0003 again, for the half of it that is its own bundle. The row above is
+# satisfied entirely by workerAsChildProcess.ts, which the server pulls into
+# out/server-main.js; the process.send-over-parentPort bridge lives in
+# src/bootstrap-fork.ts and becomes out/bootstrap-fork.js, which no row named.
+# Without the bridge both Workers start with no IPC channel at all, so the file
+# not reaching the target's graph is exactly what a fingerprint is for.
+0003 ptyHost bridge|out/bootstrap-fork.js|__vsc_disconnect
+0004 extHost worker|out/server-main.js|worker_thread Extension Host
+0005 webview csp|out/vs/workbench/contrib/webview/browser/pre/index.html|script-src 'unsafe-inline'
+0006 callback relay|out/vs/code/browser/workbench/callback.html|intent://callback
+0006 callback URI decoding|out/vs/code/browser/workbench/callback.html|const path = params.get('vscode-path')
+0006 callback top-document check|out/vs/code/browser/workbench/callback.html|window.top === window.self
+0006 callback framing refusal|out/server-main.js|frame-ancestors 'none';
+0006 callback X-Frame-Options header|out/server-main.js|'X-Frame-Options': 'DENY'
+0008 activitybar height|out/vs/code/browser/workbench/workbench.js|.activitybar .composite-bar
+0008 activitybar first gap|out/vs/code/browser/workbench/workbench.js|.getPropertyValue('--activity-bar-action-gap')
+0009 alpine target|out/server-main.js|Android: requesting the alpine target platform
+0010 moduleignore keep|-|edits build/.moduleignore, so its proof is the file surviving into the tree; verify-server-tree.py requires that path
+0011 walkthrough brand|out/nls.messages.js|Get Started with VSCodroid
+0012 callback route|out/server-main.js|==="/callback"
+0013 level grace|out/server-main.js|while another client is connected
+# 0014 gates on the CLAMPED change flags. The pattern is the negated pair the
+# guard compiles to; measured in the pre-patch bundle it occurs zero times
+# (the positive control `scrollTopChanged` occurs 41 times), and an esbuild
+# minify of the new handler emits `!n.scrollTopChanged&&!n.scrollLeftChanged`,
+# so the token survives and only this patch introduces it.
+#
+# The bundle it names used to be out/vs/workbench/workbench.web.main.internal.js,
+# which workbench.html does not load and which the Prune stage now deletes: the
+# row was proving the patch reached the copy nobody runs. The pattern occurs
+# exactly once in each, so repointing it changes nothing but which claim is made.
+0014 menu submenu scroll dismiss|out/vs/code/browser/workbench/workbench.js|scrollTopChanged&&!
+# 0015 gates on the width comparison the guard needs. Measured in the packaged
+# pre-patch bundles, `innerWidth===` occurs zero times in both workbench.js and
+# workbench.web.main.internal.js, while the positive control `innerWidth` occurs
+# 16 times in each, so the operator is what makes it unique and the row cannot
+# pass on surrounding code. A minifier mangles `lastWidth` but not the property
+# read or the operator, so the token survives.
+#
+# This row therefore constrains the patch's shape, which is not obvious from
+# either file alone: hoisting `mainWindow.innerWidth` into a local, the tidier
+# way to write that handler, deletes the token and the row starts failing on a
+# tree that is correct. The patch header says so at the call site too.
+0015 menubar keyboard resize|out/vs/code/browser/workbench/workbench.js|innerWidth===
+# 0016 gates on the comparison it introduces. Measured in the packaged pre-patch
+# workbench.js, `<this.centeredLayoutWidget.minimumWidth` occurs zero times while
+# the positive control `this.centeredLayoutWidget.minimumWidth` occurs once, so
+# the operator is what makes the token unique and the row cannot pass on the code
+# it replaces. Property names survive this bundle intact (the getter is emitted
+# with centeredLayoutWidget, layoutService and getMaximumEditorDimensions all
+# readable), so the token survives minification, and hoisting the read into a
+# local would delete it. The patch header says so at the call site too.
+0016 editor min width|out/vs/code/browser/workbench/workbench.js|<this.centeredLayoutWidget.minimumWidth
+# 0017 gates on the selector it introduces. Measured in the packaged pre-patch
+# workbench.js, `closest('.monaco-submenu')` occurs zero times while the class
+# name alone occurs three times, so the row cannot pass on the surrounding code
+# that creates the submenu. closest is a DOM method and the class is a string
+# literal, so neither is renamed.
+0017 menu pan ownership|out/vs/code/browser/workbench/workbench.js|closest('.monaco-submenu')
+0018 debug terminal env|out/vs/workbench/api/node/extensionHostProcess.js|unset ${
+0019 callback nonce|out/vs/code/browser/workbench/workbench.js|vscodroid-nonce=
+0019 callback issuance|out/vs/code/browser/workbench/workbench.js|registerAuthCallback
+0019 callback readiness|out/vs/code/browser/workbench/workbench.js|vscodroid-bridge-ready
+0019 callback document|out/vs/code/browser/workbench/workbench.js|__vscodroidCallbackDocumentId
+# 0020 gates on the log line it adds, the only text in its hunk a minifier keeps:
+# the cut itself compiles to `&&!` against a renamed binding. workbench.js is
+# where WebAgentHostEnablementService lands, through workbench.web.main.internal.
+0020 agent host off|out/vs/code/browser/workbench/workbench.js|Android: the agent host is not started on this device
+0021 terminal hint|out/vs/code/browser/workbench/workbench.js|_chatEntitlementService.sentiment.hidden||
+# 0022's rows, one per change it makes to nativeEditContext.ts, each failing
+# when that change is reverted, in the patch or in the bundle. The patterns are
+# property names, which this bundle keeps, as 0016 relies on; the arguments
+# between them are renamed, and that bounds what a row can see.
+#
+#  - buffer, buffer compared: the buffer is compared with the new line and
+#    replaced whole, not over the length last written.
+#  - pre-edit text, x2: the text either side of the update range is copied from
+#    the line last written. Only the copy after the range carries the fix, as
+#    the edit cannot reach the text before it. The two differ in their
+#    arguments, and the text that tells the second apart starts with a renamed
+#    identifier (`substring(t.updateRangeEnd,` in this bundle), so no pattern
+#    names that copy alone and a single match let it be reverted unseen.
+#  - pre-edit text kept current, x2: that line is recorded on every call, not
+#    only when the buffer is rewritten. Inside the if, as upstream has it, it
+#    goes stale on every keystroke and the copies read old text. Both places
+#    compile to the same assignment, so the bundle only shows it was not
+#    dropped, the other match being the field's initializer; the patch shows
+#    the rest, since `git diff` adds the line only where the patch moves it.
+#  - caret: the caret is measured from where the typed text starts. That it is
+#    measured with the typed text's length, not the event's, is a renamed local
+#    in the bundle, and no row sees it.
+#
+# Every pattern but `_previousEditContextText=` occurs 0 times in a copy of the
+# shipped 1.139.1 workbench.js with the patch's edits reverted. Each row was
+# measured against copies with its one change reverted, and the 0022 patch
+# regenerated by `git diff` to match.
+0022 editcontext buffer|out/vs/code/browser/workbench/workbench.js|updateText(0,this._editContext.text.length,
+0022 editcontext buffer compared|out/vs/code/browser/workbench/workbench.js|!==this._editContext.text
+0022 editcontext caret|out/vs/code/browser/workbench/workbench.js|updateRangeStart)+
+0022 editcontext pre-edit text|out/vs/code/browser/workbench/workbench.js x2|_previousEditContextText.substring(
+0022 editcontext pre-edit text kept current|out/vs/code/browser/workbench/workbench.js x2|_previousEditContextText=
+# 0023 gates on the early return it adds. Its condition is lost to minification
+# (`undefined` becomes `void 0` and the enum member a number), and the cancel
+# call alone also occurs once in cancel(), so the row needs the statement
+# boundary before `return`, which this bundle keeps (the early exit above it
+# compiles to `{this.cancel();return}`). Against the shipped 1.139.1
+# workbench.js the pattern occurs 0 times, and once in a tree built with the
+# patch. Folding the block into the else-if chain below it deletes the token;
+# the patch header says so at the call site too.
+0023 suggest caret move|out/vs/code/browser/workbench/workbench.js|this._triggerQuickSuggest.cancel();return
+# 0024's rows name what it adds. Property names survive this bundle, as 0016
+# and 0022 rely on, so each row is a name the patch introduces. Against the
+# shipped 1.139.1 workbench.js (the 0023 build) every pattern occurs 0 times
+# but restart by focus, which upstream's one pause matches there.
+#
+#  - window start: the buffer's start is re-decided on every cursor change.
+#  - start kept at a line end: an edit of the keyboard's that leaves the caret
+#    at the end of its line keeps the start, which only the 20 line limit
+#    moves. Moved there too, the start left the keyboard's copy of the text
+#    before the caret without the indentation the editor had added.
+#  - keyboard caret, x6: the caret offset the keyboard expects is set before
+#    and cleared after each of its two edits, its textupdate and its Enter, and
+#    read where the start is decided and where the lines after the selection
+#    are dropped, each in a `===void 0` the pattern matches as well. Dropping
+#    any one of the six, the clear after the textupdate's edit among them,
+#    fails the row.
+#  - composition across lines, x2: CompositionOperation's walk back over line
+#    breaks, called from the window and from the replace. With the replace
+#    back at its column-1 clamp only the window's call is left.
+#  - composition forward across lines: the walk forward over line breaks,
+#    called from the replace alone. The bundle's other positionAfter names
+#    are properties, never called. Clamped at the end of the caret's line
+#    again, a range the keyboard replaced past it was inserted in front of
+#    the lines it covered.
+#  - offsets as positions, x5: the selection the keyboard sets, at both of its
+#    ends, the composition underline and the character bounds all map a buffer
+#    offset through the window's own start. Without the selection's two, a
+#    selection on an earlier line of the window was refused at column 1.
+#  - selection without an edit: the test that sends a textupdate changing no
+#    text, a selection the keyboard set, to a caret move of its own instead of
+#    typing the text before the caret again.
+#  - selection as a cursor key: that move is made from source 'keyboard' with
+#    reason Explicit, as a cursor key makes one, so an open suggest list is
+#    refiltered at the new caret. Made as compositionType makes it, with the
+#    reason typing has, it left the list open for Enter to accept at the new
+#    caret. No other call in this bundle reaches setCursorStates through a
+#    `viewModel.` property.
+#  - selection keeps the start, x6: the flag that keeps the window as it is
+#    while that caret move is applied, initialised, set and cleared around the
+#    move, and read where the start is decided, where the lines after the
+#    selection are dropped and where a rewrite of the window decides whether to
+#    restart input. Without the first read, the window moves to the caret's
+#    line under the keyboard's selection.
+#  - lines after the selection, x7: how many lines the window holds after the
+#    selection's, which a selection the keyboard sets on an earlier line makes
+#    more than none, so the window keeps its end too. Initialised, read where a
+#    change decides whether to rewrite the window, dropped on any cursor change
+#    that is not the keyboard's and when the start is reset, set by the
+#    selection (two in one statement) and read where the window is built.
+#    Without it a swipe back to the right stops at the end of the earlier line.
+#  - selection start read first: that read is the first thing the start
+#    decision does, ahead of the reason test, which the Explicit move fails.
+#    The test compiles into one conditional expression with the rest, so a
+#    read placed after it no longer opens a block. It reads the Backspace key's
+#    flag beside it.
+#  - input restarted: the call that asks for an input restart after a rewrite
+#    of the window, which restarts input at the end of the task if the text
+#    then differs from what the keyboard knew and the selection does not, as
+#    Android passes the keyboard a selection that changed and nothing else.
+#    Without it Gboard went on offering the words of the text it had, and a
+#    pick wrote over the new text.
+#  - what the keyboard knew, x4: the text and selection kept from the first
+#    rewrite of a task, read and set there, and read and cleared at its end,
+#    so that the rewrites of one task restart input once.
+#  - restart only for an unmoved selection, x2: the selection compared with the
+#    one before, where a rewrite is noted and at the end of the task. Without
+#    the second, accepting a suggestion, which rewrites the window before it
+#    moves the caret, restarted input with the keyboard told of the move.
+#  - restart by focus, x2: the blur and focus that restart input run with the
+#    editor's focus tracker paused, beside upstream's one pause, where the IME
+#    textarea takes focus. The shipped bundle has 1.
+#  - own edits restart nothing, x3: the flag set and cleared around the
+#    keyboard's own edit, and initialised. The keyboard's copy holds that edit
+#    already, and a restart in the middle of its typing ends the word it is
+#    composing.
+#  - Backspace key keeps the window, x5: the flag set at a Backspace key press
+#    and cleared at its release, initialised, and read where the start is
+#    decided and where the lines after the selection are dropped. Gboard 17.7
+#    and 18.4 send their Backspace as a key press and count the character in
+#    their own copy; without the second read the window dropped the lines a
+#    swipe into the line above had kept, and the word the keyboard picked for
+#    the next line was written over the line above.
+0024 editcontext window start|out/vs/code/browser/workbench/workbench.js|_editContextStart=this._editContextStartAfter(
+0024 editcontext start kept at line end|out/vs/code/browser/workbench/workbench.js|startLineNumber - this._editContextStart.lineNumber >
+0024 editcontext keyboard caret|out/vs/code/browser/workbench/workbench.js x6|_expectedCaretOffset=
+0024 composition across lines|out/vs/code/browser/workbench/workbench.js x3|.positionBefore(
+0024 composition forward across lines|out/vs/code/browser/workbench/workbench.js x2|.positionAfter(
+0024 editcontext offsets as positions|out/vs/code/browser/workbench/workbench.js x5|this._modelPositionAt(
+0024 editcontext selection without an edit|out/vs/code/browser/workbench/workbench.js|.updateRangeStart===
+0024 editcontext selection as a cursor key|out/vs/code/browser/workbench/workbench.js|viewModel.setCursorStates("keyboard",
+0024 editcontext selection keeps the start|out/vs/code/browser/workbench/workbench.js x6|this._keepEditContextStart
+0024 editcontext lines after the selection|out/vs/code/browser/workbench/workbench.js x7|this._editContextLinesAfter
+0024 editcontext selection start read first|out/vs/code/browser/workbench/workbench.js|{if(this._keepEditContextStart||this._deletingByKey)
+0024 editcontext input restarted|out/vs/code/browser/workbench/workbench.js|this._restartInputIfUnheard(
+0024 editcontext what the keyboard knew|out/vs/code/browser/workbench/workbench.js x4|this._beforeRewrite
+0024 editcontext restart only for an unmoved selection|out/vs/code/browser/workbench/workbench.js x2|this._previousEditContextSelection.equals(
+0024 editcontext restart by focus|out/vs/code/browser/workbench/workbench.js x2|this._focusTracker.pause()
+0024 editcontext own edits restart nothing|out/vs/code/browser/workbench/workbench.js x3|_applyingInputMethodEdit=
+0024 editcontext Backspace key keeps the window|out/vs/code/browser/workbench/workbench.js x5|this._deletingByKey
+# 0025's rows: a composition that typed nothing arms no quick suggestion and
+# checks no trigger character, and on Android a touch outside the editor ends
+# the session. Property names, as for 0024, each 0 times in the shipped
+# bundle. The trigger character gate compiles to `&&` inside an arrow body
+# with braces, so the row is the braced listener the patch writes; upstream's
+# was `()=>e()`.
+#
+#  - touch elsewhere: the overflow widgets test in the pointerdown listener
+#    that ends the session on a touch outside the editor, emitted as written.
+0025 suggest composition typed|out/vs/code/browser/workbench/workbench.js|_onCompositionEnd(this._typedWhileComposing)
+0025 suggest trigger characters|out/vs/code/browser/workbench/workbench.js|_triggerCharacterListener.add(this._editor.onDidCompositionEnd(() => {
+0025 suggest touch elsewhere|out/vs/code/browser/workbench/workbench.js|this._editor.getOverflowWidgetsDomNode() ?? null
+# 0026 gates on the reparse it redirects. Property names survive this bundle
+# (folderConfiguration and cachedFolderConfiguration are emitted readable), so
+# the new field and the `??` beside the old one make a token only this patch
+# introduces; hoisting the expression into a local would delete it, and the
+# patch header says so at the call site too. Against the shipped 1.139.1
+# workbench.js `loadedFolderConfiguration` occurs 0 times.
+0026 folder settings kept until read|out/vs/code/browser/workbench/workbench.js|(this.loadedFolderConfiguration??this.folderConfiguration).reparse(
+# 0027 gates on the one read of the option it adds. Property names survive this
+# bundle, so `options?.initialWorkspaceSettings` is a token only this patch
+# introduces; reading the option anywhere else first, or into a local, deletes
+# it, and the patch header says so too. Against the shipped 1.139.1
+# workbench.js `initialWorkspaceSettings` occurs 0 times.
+0027 workspace settings from the page|out/vs/code/browser/workbench/workbench.js|options?.initialWorkspaceSettings
+# 0028's row: the editor's width kept from its last layout, set where the
+# controller is built, compared and updated at each layout change, a property
+# name as for 0024, 0 times in the shipped bundle. On Android a change of height
+# alone, the keyboard going down as the list takes focus, no longer closes the
+# Code Action list; without the compare it closed at every layout change again.
+0028 code action list at a height change|out/vs/code/browser/workbench/workbench.js x3|this._editorLayoutWidth
+# 0029's row: the private method that decides a commit is a paste, defined once
+# and called once from _onType, so `_isPastedByInputMethod` twice. Methods keep
+# their names in this bundle as _onType and _getNewEditContextState do, and the
+# name is 0 times in the shipped 1.139.1 workbench.js. Without it a keyboard's
+# paste is typed a character at a time again: indented at every line break and,
+# for a few thousand characters, a freeze of seconds.
+0029 input method commit as paste|out/vs/code/browser/workbench/workbench.js x2|_isPastedByInputMethod
+
+# 0030's pattern is the media query it adds. The literal is 0 times in the shipped
+# 1.139.1 workbench.js, so a match means the patch arrived. It cannot tell a patch
+# that kept the query and dropped the floor; the manifest hash covers an edited patch.
+0030 activitybar touch item size|out/vs/code/browser/workbench/workbench.js x2|(pointer: coarse)
+
+# 0031's pattern is the command id it adds. The literal is 0 times in the shipped
+# 1.139.1 workbench.js, so a match means the patch arrived. It cannot tell a patch
+# that kept the id and dropped the prompt; the manifest hash covers an edited patch.
+0031 open folder offers the system picker|out/vs/code/browser/workbench/workbench.js|vscodroid.openFolderFromDevice
+
+# 0032's pattern is the name of the constant it adds. Member names survive the bundler
+# (0029 relies on the same), and the literal is 0 times in the shipped 1.139.1 workbench.js.
+0032 settings list and modal shrink to a phone|out/vs/code/browser/workbench/workbench.js x3|LIST_MIN_WIDTH
+
+# 0033's pattern is the name of the flag it adds. Member names survive the bundler (0029 and
+# 0032 rely on the same), and the literal is 0 times in the shipped 1.139.1 workbench.js.
+0033 short window hides title and status bar|out/vs/code/browser/workbench/workbench.js x3|shortWindow
+
+# 0034's pattern is the name of the flag it adds. Member names survive the bundler (0029, 0032 and
+# 0033 rely on the same), and the literal is 0 times in the shipped 1.139.1 workbench.js.
+0034 short window yields the panel|out/vs/code/browser/workbench/workbench.js x11|panelYielded
+
+# The same patch's second flag, the height a panel that stayed in a short window had before it.
+0034 short window panel height is remembered|out/vs/code/browser/workbench/workbench.js x10|panelHeightBeforeShort
+0035 mirror usage acknowledgement|out/vs/code/browser/workbench/workbench.js|claimWorkspacePaths
+0035 initial claim caught|out/vs/code/browser/workbench/workbench.js|Could not claim initial workspace paths
+0035 update claim caught|out/vs/code/browser/workbench/workbench.js|.uri)).catch(
+0036 editor bind failure exits|out/server-main.js|Editor failed to bind its port
+0037 current startup state|out/vs/code/browser/workbench/workbench.js x3|loadedConfigurationGeneration
+0038 workspace resource publication|out/vs/code/browser/workbench/workbench.js x2|publishWorkspaceRoots
+0038 workspace publication caught|out/vs/code/browser/workbench/workbench.js x2|Could not publish workspace resource roots
+0039 editor listener run proof|out/server-main.js|vscodroid-server-proof
+0040 wrapped terminal link row end|out/vs/code/browser/workbench/workbench.js|end.x : this._terminal.cols
+0041 narrow horizontal panel width|out/vs/code/browser/workbench/workbench.js|getMaximumEditorDimensions(this.layoutService.mainContainer).width
+0042 workspace folders list check|out/vs/code/browser/workbench/workbench.js x2|Array.isArray(this.workspaceConfiguration.getFolders())
+0042 workspace folders kept on reload|out/vs/code/browser/workbench/workbench.js|this.workspace.configuration, this.uriIdentityService.extUri) : this.workspace.folders
+0043 regular-file check in serveFile|out/server-main.js|Not a regular file:
