@@ -1,0 +1,55 @@
+name: Sign APK
+
+# Re-signs the APK the Build workflow made with the keystore secrets, so every
+# build carries the same key and installs over the last one.
+on:
+  workflow_run:
+    workflows: [Build]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  sign:
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download debug APK
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+        run: |
+          if [ -z "$RUN_ID" ]; then
+            RUN_ID=$(gh run list -R "$GITHUB_REPOSITORY" -w Build -b main -s success -L 1 --json databaseId -q '.[0].databaseId')
+          fi
+          gh run download "$RUN_ID" -R "$GITHUB_REPOSITORY" -n debug-apk -D in
+
+      - name: Sign
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          printf '%s' "$KEYSTORE_BASE64" | base64 -d > ks.jks
+          [ -s ks.jks ] || { echo "::error::KEYSTORE_BASE64 is unset or empty"; exit 1; }
+          APKSIGNER="$(ls -d "$ANDROID_HOME"/build-tools/*/ | sort -V | tail -1)apksigner"
+          mkdir out
+          for f in in/*.apk; do
+            "$APKSIGNER" sign --ks ks.jks --ks-key-alias "$KEY_ALIAS" \
+              --ks-pass env:KEYSTORE_PASSWORD --key-pass env:KEY_PASSWORD \
+              --out "out/$(basename "$f" .apk)-signed.apk" "$f"
+          done
+          "$APKSIGNER" verify --print-certs out/*.apk | head -3
+          rm ks.jks
+
+      - name: Upload signed APK
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: signed-apk
+          path: out/*.apk
+          retention-days: 14
