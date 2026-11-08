@@ -1,0 +1,21 @@
+name: Kick release
+
+# A push that touches .github/kick-release.txt starts the Release workflow in its
+# dry-run (dispatch) form: it signs with the keystore secrets and publishes nothing.
+on:
+  push:
+    branches: [main]
+    paths: [.github/kick-release.txt]
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Start the Release dry run
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run release.yml -R "$GITHUB_REPOSITORY" --ref main
