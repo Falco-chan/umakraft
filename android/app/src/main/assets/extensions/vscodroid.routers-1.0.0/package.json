@@ -1,0 +1,34 @@
+{
+  "name": "routers",
+  "displayName": "Routers",
+  "description": "Use OpenAI-compatible routers (URL + API key) as models in Chat and agent mode.",
+  "version": "1.0.0",
+  "publisher": "vscodroid",
+  "engines": { "vscode": "^1.104.0" },
+  "categories": ["AI", "Chat"],
+  "activationEvents": ["onLanguageModelChatProvider:routers"],
+  "main": "./extension.js",
+  "contributes": {
+    "languageModelChatProviders": [
+      { "vendor": "routers", "displayName": "Routers", "managementCommand": "routers.setKey" }
+    ],
+    "commands": [
+      { "command": "routers.setKey", "title": "Routers: Set API Key" }
+    ],
+    "configuration": {
+      "title": "Routers",
+      "properties": {
+        "routers.endpoints": {
+          "type": "array",
+          "default": [],
+          "description": "OpenAI-compatible routers. url is the base that /models and /chat/completions hang off, e.g. https://host/v1. name must not contain a slash.",
+          "items": {
+            "type": "object",
+            "required": ["name", "url"],
+            "properties": { "name": { "type": "string" }, "url": { "type": "string" } }
+          }
+        }
+      }
+    }
+  }
+}
