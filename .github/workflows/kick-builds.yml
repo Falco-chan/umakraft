@@ -1,0 +1,36 @@
+name: Kick builds
+
+# Starts the two builds a first release needs, so nothing has to be tapped by hand:
+# a push that touches .github/kick-server.txt starts the server build, and when that
+# build succeeds the Release workflow is started in its dry-run (dispatch) form,
+# which signs but publishes nothing.
+on:
+  push:
+    branches: [main]
+    paths: [.github/kick-server.txt]
+  workflow_run:
+    workflows: [Build Code - OSS server]
+    types: [completed]
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  server:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Start the server build
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run build-vscode-oss.yml -R "$GITHUB_REPOSITORY" --ref main
+
+  release:
+    if: github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Start the Release dry run
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run release.yml -R "$GITHUB_REPOSITORY" --ref main
