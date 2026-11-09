@@ -20,7 +20,10 @@
       "properties": {
         "routers.endpoints": {
           "type": "array",
-          "default": [],
+          "default": [
+            { "name": "freellmapi", "url": "https://freellmapi-eqcl.onrender.com/v1" },
+            { "name": "ninerouter", "url": "https://ninerouter-ios5.onrender.com/v1" }
+          ],
           "description": "OpenAI-compatible routers. url is the base that /models and /chat/completions hang off, e.g. https://host/v1. name must not contain a slash.",
           "items": {
             "type": "object",
