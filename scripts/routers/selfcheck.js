@@ -17,7 +17,7 @@ const vscode = {
 const load = Module._load;
 Module._load = (r, ...a) => (r === 'vscode' ? vscode : load(r, ...a));
 const { toOpenAI, sse } = require(path.join(__dirname,
-  '../../android/app/src/main/assets/extensions/vscodroid.routers-1.0.0/extension.js'));
+  '../../android/app/src/main/assets/extensions/vscodroid.routers-1.0.1/extension.js'));
 
 assert.deepStrictEqual(toOpenAI([
   { role: 1, content: [new Text('hi')] },
