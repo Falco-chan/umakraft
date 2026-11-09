@@ -832,4 +832,4 @@ For questions about licenses, trademarks, or legal notices:
 
 ---
 
-_This document was last updated on November 5, 2026._
+_This document was last updated on November 9, 2026._
