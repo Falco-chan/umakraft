@@ -99,7 +99,7 @@ get_sonames() {
         libresolv-wrapper) echo "libresolv_wrapper.so" ;;
         c-ares)            echo "libcares.so" ;;
         # libicudata is the 32 MB data blob the other two are useless without.
-        libicu)            echo "libicui18n.so.78 libicuuc.so.78 libicudata.so.78" ;;
+        libicu)            echo "libicui18n.so.79 libicuuc.so.79 libicudata.so.79" ;;
         libc++)            echo "libc++_shared.so" ;;
         libsqlite)         echo "libsqlite3.so" ;;
         *)                 echo "" ;;
