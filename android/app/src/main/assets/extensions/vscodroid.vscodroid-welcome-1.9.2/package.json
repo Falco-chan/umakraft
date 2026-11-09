@@ -65,7 +65,11 @@
       "breadcrumbs.enabled": false,
       "editor.stickyScroll.enabled": false,
       "workbench.layoutControl.enabled": false,
-      "terminal.integrated.fontSize": 13,
+      "terminal.integrated.fontSize": 15,
+      "editor.fontSize": 16,
+      "workbench.activityBar.location": "bottom",
+      "workbench.editor.showTabs": "single",
+      "workbench.panel.opensMaximized": "always",
       "terminal.integrated.stickyScroll.enabled": false
     },
     "commands": [
