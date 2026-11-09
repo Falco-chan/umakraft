@@ -288,12 +288,13 @@ M6 (Release)   → Play Store release
 4. **Pre-bundled extensions** (`FirstRunSetup.extractBundledExtensions`)
    - [x] 4 marketplace extensions bundled offline in `assets/extensions/`:
      - ESLint, Prettier, Python, Tailwind CSS
-   - [x] 5 custom VSCodroid extensions:
+   - [x] 6 custom VSCodroid extensions:
      - `vscodroid.vscodroid-welcome-1.9.2`, welcome tab with quick actions
      - `vscodroid.vscodroid-saf-bridge-1.12.3`, SAF storage integration
      - `vscodroid.vscodroid-process-monitor-1.4.0`, phantom process monitoring
      - `vscodroid.vscodroid-serve-network-1.3.0`, serve a dev server on the LAN
      - `vscodroid.vscodroid-editor-menus-1.0.0`, Select All in the editor context menu, declared without code so Ctrl+A never waits on an extension host
+     - `vscodroid.routers-1.0.0`, OpenAI-compatible routers (URL and API key each) as models in Chat and agent mode
    - [x] `extensions.json` manifest auto-generated on first run
 
 5. **First-run experience** (`SplashActivity.kt`, `FirstRunSetup.kt`)
