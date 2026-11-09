@@ -592,7 +592,7 @@ termux_copy_notices "$ASSETS_DIR/usr" "${REQUIRED_PACKAGES[@]}"
 # ICU arrives as 78.3-1. That is the same LICENSE, so an exact string test would
 # fail every build over a repackaging and send the reader to release-78.3-1, a
 # tag unicode-org/icu does not have.
-ICU_NOTICE_VERSION="78.3"
+ICU_NOTICE_VERSION="79.1"
 ICU_INDEX_VERSION="$(termux_pkg_version libicu)"
 case "$ICU_INDEX_VERSION" in
     "$ICU_NOTICE_VERSION"|"$ICU_NOTICE_VERSION"-*) ;;
